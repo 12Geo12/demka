@@ -97,6 +97,12 @@ echo ""
 echo "Установка BIND..."
 apt-get update && apt-get install bind -y
 
+echo "Остановка BIND..."
+systemctl stop bind 2>/dev/null
+
+echo "Создание директорий..."
+mkdir -p /var/lib/bind/etc/zone
+
 echo "Настройка options.conf..."
 cat > /var/lib/bind/etc/options.conf <<EOF
 listen-on { $DNS_IP; 127.0.0.1; };
@@ -106,8 +112,8 @@ allow-query { any; };
 recursion yes;
 EOF
 
-echo "Настройка зон..."
-cat >> /var/lib/bind/etc/rfc1912.conf <<EOF
+echo "Настройка зон в rfc1912.conf..."
+cat > /var/lib/bind/etc/rfc1912.conf <<EOF
 zone "$DOMAIN" {
     type master;
     file "zone/$DOMAIN";
@@ -118,8 +124,6 @@ zone "$REVERSE_ZONE" {
     file "zone/$REVERSE_ZONE";
 };
 EOF
-
-mkdir -p /var/lib/bind/etc/zone
 
 echo "Создание прямой зоны..."
 SERIAL=$(date +%Y%m%d01)
@@ -171,14 +175,17 @@ while read octet fqdn; do
 done <<< "$PTR_RECORDS"
 
 echo "Генерация rndc.key..."
+mkdir -p /etc/bind
 rndc-confgen > /etc/bind/rndc.key
 sed -i '6,$d' /etc/bind/rndc.key
 
-chown named:named /var/lib/bind/etc/zone/*
+echo "Установка прав..."
+chown -R named:named /var/lib/bind/etc/zone
 
 echo "Проверка конфигурации..."
-named-checkconf
-named-checkconf -z
+named-checkconf 2>&1
+named-checkzone $DOMAIN /var/lib/bind/etc/zone/$DOMAIN 2>&1
+named-checkzone $REVERSE_ZONE /var/lib/bind/etc/zone/$REVERSE_ZONE 2>&1
 
 echo "Запуск BIND..."
 systemctl enable --now bind
