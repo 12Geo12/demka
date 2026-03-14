@@ -51,8 +51,7 @@ APACHE_USER="apache2" # Пользователь для ALT Linux
 # --- 2. УСТАНОВКА ЗАВИСИМОСТЕЙ ---
 echo -e "\n\033[33m[1/8] Установка пакетов...\033[0m"
 apt-get update
-apt-get install -y apache2 php8.2 apache2-mods apache2-mod_php8.2 mariadb-server httpd2
-wget
+apt-get install -y apache2 php8.2 apache2-mods apache2-mod_php8.2 mariadb-server httpd2 wget
 
 echo -e "\n\033[33m[2/8] Установка PHP модулей...\033[0m"
 apt-get install -y php8.2-opcache php8.2-curl php8.2-gd php8.2-intl \
