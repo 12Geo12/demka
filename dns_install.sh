@@ -4,7 +4,11 @@
 echo "=== Настройка DNS сервера ==="
 echo ""
 
-read -p "IP адрес DNS сервера: " DNS_IP
+# Автоматическое определение IP адреса
+DNS_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
+echo "Определён IP адрес: $DNS_IP"
+echo ""
+
 read -p "Имя домена: " DOMAIN
 read -p "Forwarder DNS 1: " FORWARDER1
 read -p "Forwarder DNS 2: " FORWARDER2
