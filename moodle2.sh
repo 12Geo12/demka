@@ -106,7 +106,6 @@ get_user_input() {
 update_system() {
     log "Обновление системы..."
     apt-get update -y >> "$LOG_FILE" 2>&1
-    apt-get upgrade -y >> "$LOG_FILE" 2>&1
     apt-get install -y curl wget unzip git software-properties-common >> "$LOG_FILE" 2>&1
 }
 
