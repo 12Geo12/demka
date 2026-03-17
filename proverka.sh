@@ -753,49 +753,127 @@ configure_ospf() {
     print_warning "Важно: оба маршрутизатора должны иметь одинаковый тип сети OSPF!"
     echo ""
     
-    # Сначала настраиваем интерфейс
+    # ==========================================
+    # ВАЖНО: Сначала настраиваем интерфейс GRE
+    # ==========================================
     print_info "Настройка OSPF на интерфейсе $GRE_INTERFACE..."
     
-    vtysh -c "configure terminal" \
-          -c "interface $GRE_INTERFACE" \
-          -c "ip ospf authentication" \
-          -c "ip ospf authentication-key $OSPF_PASSWORD" \
-          -c "ip ospf network $OSPF_NETWORK_TYPE" \
-          -c "no ip ospf passive" \
-          -c "exit" \
-          -c "exit"
+    # Проверяем текущее состояние passive
+    local current_passive=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null | grep -i "passive")
+    if [[ -n "$current_passive" ]]; then
+        print_warning "Обнаружен режим PASSIVE на интерфейсе! Будет отключён..."
+    fi
     
+    # Настраиваем интерфейс - ВАЖНО: no ip ospf passive должен быть ПЕРВЫМ!
+    vtysh << EOF
+configure terminal
+interface $GRE_INTERFACE
+no ip ospf passive
+ip ospf authentication
+ip ospf authentication-key $OSPF_PASSWORD
+ip ospf network $OSPF_NETWORK_TYPE
+exit
+exit
+EOF
+    
+    # ==========================================
     # Настраиваем router OSPF
-    print_info "Настройка OSPF процесса..."
+    # ==========================================
+    print_info "Настройка OSPF процесса (Router ID: $ROUTER_ID)..."
     
-    vtysh -c "configure terminal" \
-          -c "router ospf" \
-          -c "ospf router-id $ROUTER_ID" \
-          -c "area 0 authentication"
+    vtysh << EOF
+configure terminal
+router ospf
+ospf router-id $ROUTER_ID
+area 0 authentication
+exit
+exit
+EOF
     
-    # Добавляем сети
+    # Добавляем сети в OSPF
     for net in "${NETWORKS[@]}"; do
         print_info "Добавление сети $net в area 0..."
-        vtysh -c "configure terminal" \
-              -c "router ospf" \
-              -c "network $net area 0"
+        vtysh -c "configure terminal" -c "router ospf" -c "network $net area 0" -c "exit" -c "exit"
     done
     
+    # ==========================================
+    # КРИТИЧНО: Повторно убеждаемся что passive отключён
+    # ==========================================
+    print_info "Проверка и отключение passive режима..."
+    
+    vtysh << EOF
+configure terminal
+interface $GRE_INTERFACE
+no ip ospf passive
+exit
+exit
+EOF
+    
     # Сохраняем конфигурацию
+    vtysh -c "write memory"
     vtysh -c "write"
     
-    # Показываем результат
+    # ==========================================
+    # Проверка применения конфигурации
+    # ==========================================
     echo ""
     print_info "Проверка применения конфигурации..."
     
     # Проверяем OSPF на интерфейсе
-    local ospf_intf=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
-    if [[ -n "$ospf_intf" ]]; then
-        print_success "OSPF активирован на $GRE_INTERFACE"
-        echo "$ospf_intf" | grep -E "Network Type|Hello|Dead|State"
-    else
+    local ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
+    
+    if [[ -z "$ospf_intf_output" ]]; then
         print_error "OSPF НЕ активирован на $GRE_INTERFACE!"
-        print_warning "Возможно интерфейс не UP или сеть не добавлена в OSPF"
+        print_warning "Сеть интерфейса не добавлена в OSPF"
+        
+        # Пробуем добавить сеть принудительно
+        local gre_net=$(get_interface_network "$GRE_INTERFACE")
+        if [[ -n "$gre_net" ]]; then
+            print_info "Принудительное добавление сети $gre_net..."
+            vtysh -c "configure terminal" -c "router ospf" -c "network $gre_net area 0" -c "exit" -c "exit"
+            vtysh -c "write"
+            sleep 2
+            ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
+        fi
+    fi
+    
+    if [[ -n "$ospf_intf_output" ]]; then
+        print_success "OSPF активирован на $GRE_INTERFACE"
+        echo ""
+        
+        # Показываем ключевые параметры
+        echo "  Параметры OSPF на интерфейсе:"
+        echo "$ospf_intf_output" | while read line; do
+            if echo "$line" | grep -qE "Network Type|Hello|Dead|State|Passive|Enabled"; then
+                echo "    $line"
+            fi
+        done
+        echo ""
+        
+        # КРИТИЧНАЯ ПРОВЕРКА: Passive режим
+        if echo "$ospf_intf_output" | grep -qi "passive interface"; then
+            print_error "═══════════════════════════════════════════════════════════════"
+            print_error "  ВНИМАНИЕ: Интерфейс всё ещё в режиме PASSIVE!"
+            print_error "  OSPF НЕ БУДЕТ отправлять Hello пакеты!"
+            print_error "═══════════════════════════════════════════════════════════════"
+            
+            print_info "Принудительное отключение passive..."
+            vtysh -c "configure terminal" -c "interface $GRE_INTERFACE" -c "no ip ospf passive" -c "end"
+            vtysh -c "write"
+            sleep 1
+            
+            # Проверяем ещё раз
+            ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
+            if echo "$ospf_intf_output" | grep -qi "passive interface"; then
+                print_error "Не удалось отключить passive режим!"
+            else
+                print_success "Режим passive успешно отключён"
+            fi
+        else
+            print_success "Режим passive отключён - OSPF будет отправлять Hello пакеты"
+        fi
+    else
+        print_error "Не удалось активировать OSPF на интерфейсе!"
     fi
     
     log_message "OSPF настроен с Router ID: $ROUTER_ID, тип сети: $OSPF_NETWORK_TYPE"
@@ -891,31 +969,55 @@ verify_ospf() {
         echo ""
         
         # Показываем ключевые параметры
-        local net_type=$(echo "$ospf_intf_output" | grep -oP 'Network Type: \K[^\s,]+')
-        local hello_timer=$(echo "$ospf_intf_output" | grep -oP 'Hello: \K\d+')
-        local dead_timer=$(echo "$ospf_intf_output" | grep -oP 'Dead: \K\d+')
-        local state=$(echo "$ospf_intf_output" | grep -oP 'State: \K[^\s,]+')
-        local passive=$(echo "$ospf_intf_output" | grep -i "Passive" || echo "No")
-        
-        echo "  ├─ Network Type: $net_type"
-        echo "  ├─ Hello Timer: ${hello_timer}s"
-        echo "  ├─ Dead Timer: ${dead_timer}s"
-        echo "  ├─ State: $state"
-        echo "  └─ Passive: $passive"
+        echo "$ospf_intf_output"
         echo ""
         
-        # Проверяем тип сети
-        if [[ "$net_type" != "$OSPF_NETWORK_TYPE" ]] && [[ "$net_type" != "POINT_TO_POINT" ]] && [[ "$OSPF_NETWORK_TYPE" == "point-to-point" ]]; then
-            print_warning "Тип сети может отличаться от ожидаемого!"
-            print_warning "Ожидается: $OSPF_NETWORK_TYPE, обнаружено: $net_type"
-        fi
-        
-        # Проверяем passive
-        if echo "$ospf_intf_output" | grep -qi "Passive interface"; then
-            print_error "Интерфейс в режиме PASSIVE! OSPF не будет отправлять Hello!"
-            print_info "Исправляем..."
-            vtysh -c "configure terminal" -c "interface $GRE_INTERFACE" -c "no ip ospf passive"
-            print_success "Режим passive отключён"
+        # КРИТИЧНАЯ ПРОВЕРКА: Passive режим
+        if echo "$ospf_intf_output" | grep -qi "passive interface"; then
+            print_error "═══════════════════════════════════════════════════════════════"
+            print_error "  КРИТИЧНО: Интерфейс в режиме PASSIVE!"
+            print_error "  OSPF НЕ БУДЕТ отправлять Hello пакеты!"
+            print_error "═══════════════════════════════════════════════════════════════"
+            
+            print_info "Принудительное отключение passive режима..."
+            
+            # Отключаем passive на интерфейсе
+            vtysh << EOF
+configure terminal
+interface $GRE_INTERFACE
+no ip ospf passive
+end
+EOF
+            vtysh -c "write"
+            
+            # Проверяем, есть ли глобальный passive-interface в router ospf
+            local global_passive=$(vtysh -c "show running-config" 2>/dev/null | grep -A 20 "router ospf" | grep -i "passive-interface")
+            if [[ -n "$global_passive" ]]; then
+                print_warning "Обнаружен глобальный passive-interface в router ospf:"
+                echo "$global_passive"
+                print_info "Удаление глобального passive-interface для $GRE_INTERFACE..."
+                vtysh << EOF
+configure terminal
+router ospf
+no passive-interface $GRE_INTERFACE
+end
+EOF
+                vtysh -c "write"
+            fi
+            
+            sleep 2
+            
+            # Проверяем результат
+            ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
+            if echo "$ospf_intf_output" | grep -qi "passive interface"; then
+                print_error "НЕ УДАЛОСЬ отключить passive режим!"
+                print_error "Выполните вручную:"
+                echo "  vtysh -c 'configure terminal' -c 'interface $GRE_INTERFACE' -c 'no ip ospf passive'"
+            else
+                print_success "Режим passive успешно отключён!"
+            fi
+        else
+            print_success "Режим passive отключён - OSPF отправляет Hello пакеты"
         fi
     fi
     
@@ -935,6 +1037,7 @@ verify_ospf() {
     
     print_info "Ожидание появления соседей (макс. 60 секунд)..."
     print_warning "Убедитесь, что второй маршрутизатор тоже настроен!"
+    print_warning "На втором роутере тоже должен быть отключён passive режим!"
     
     local max_attempts=30
     local attempt=0
@@ -980,9 +1083,10 @@ verify_ospf() {
         echo "  2. Пароль OSPF должен быть: $OSPF_PASSWORD"
         echo "     Команда: vtysh -c 'show run' | grep authentication"
         echo ""
-        echo "  3. Интерфейс НЕ должен быть passive"
+        echo "  3. ИНТЕРФЕЙС НЕ ДОЛЖЕН БЫТЬ PASSIVE!"
         echo "     Команда проверки: vtysh -c 'show ip ospf interface $GRE_INTERFACE'"
-        echo "     Не должно быть строки: 'Passive interface'"
+        echo "     НЕ должно быть: 'Passive interface'"
+        echo "     Исправить: vtysh -c 'conf t' -c 'int $GRE_INTERFACE' -c 'no ip ospf passive'"
         echo ""
         echo "  4. GRE туннель должен работать"
         echo "     Команда: ping <IP_другой_стороны_туннеля>"
@@ -992,7 +1096,13 @@ verify_ospf() {
         echo "     BR-RTR: 172.16.2.1"
         echo ""
         
+        # Показываем текущий статус passive
+        echo ""
+        print_info "Текущий статус OSPF на интерфейсе:"
+        vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null | grep -i "passive\|network\|hello\|dead" || echo "  Нет данных"
+        
         # Показываем лог OSPF
+        echo ""
         print_info "Последние сообщения OSPF из лога:"
         echo "────────────────────────────────────────────────────────────────────"
         tail -30 /var/log/frr/frr.log 2>/dev/null | grep -i "ospf\|hello\|neighbor\|nsm" | tail -15
