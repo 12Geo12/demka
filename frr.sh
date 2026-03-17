@@ -1,51 +1,45 @@
-#!/bin/bash
+#!/bin/sh
 
 # ==============================================================================
 # Скрипт автоматической настройки OSPF для FRR (ALT Linux)
-# Версия 3.0: Работа без предустановленных туннелей + оптимизация
+# Версия 4.0: POSIX-совместимый (работает с sh)
 # ==============================================================================
 
-set -e
-
 REPORT_FILE="ospf_report_$(hostname)_$(date +%F_%H-%M).txt"
-FRR_CONFIG="/etc/frr/frr.conf"
 
-# Цвета для вывода (можно отключить)
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# ==============================================================================
+# ФУНКЦИИ
+# ==============================================================================
 
 print_header() {
-    echo -e "${BLUE}==============================================================================${NC}"
-    echo -e "${BLUE}  $1${NC}"
-    echo -e "${BLUE}==============================================================================${NC}"
+    echo "=============================================================================="
+    echo "  $1"
+    echo "=============================================================================="
 }
 
 print_info() {
-    echo -e "${GREEN}[*]${NC} $1"
+    echo "[*] $1"
 }
 
 print_warn() {
-    echo -e "${YELLOW}[!]${NC} $1"
+    echo "[!] $1"
 }
 
 print_error() {
-    echo -e "${RED}[!]${NC} $1"
+    echo "[!] $1"
 }
 
 print_success() {
-    echo -e "${GREEN}[+]${NC} $1"
+    echo "[+] $1"
 }
 
 # ------------------------------------------------------------------------------
-# Функция: Проверка и установка FRR
+# Проверка и установка FRR
 # ------------------------------------------------------------------------------
 check_install_frr() {
     print_info "Проверка FRR..."
     
-    if ! command -v vtysh &>/dev/null; then
+    if ! command -v vtysh >/dev/null 2>&1; then
         print_info "FRR не найден. Установка..."
         apt-get update -qq >/dev/null 2>&1
         apt-get install -y -qq frr >/dev/null 2>&1
@@ -69,7 +63,7 @@ check_install_frr() {
 }
 
 # ------------------------------------------------------------------------------
-# Функция: Показать существующие интерфейсы
+# Показать существующие интерфейсы
 # ------------------------------------------------------------------------------
 show_interfaces() {
     echo ""
@@ -84,32 +78,46 @@ show_interfaces() {
 }
 
 # ------------------------------------------------------------------------------
-# Функция: Создание GRE туннеля
+# Создание GRE туннеля
 # ------------------------------------------------------------------------------
 create_gre_tunnel() {
     print_header "НАСТРОЙКА GRE ТУННЕЛЯ"
     
     echo ""
     print_info "GRE туннель не найден. Создать новый?"
-    read -p "Создать GRE туннель? (y/n): " CREATE_TUNNEL
+    printf "Создать GRE туннель? (y/n): "
+    read CREATE_TUNNEL
     
-    if [[ ! "$CREATE_TUNNEL" =~ ^[Yy]$ ]]; then
-        print_warn "Без туннеля OSPF между офисами работать не будет!"
-        read -p "Продолжить без туннеля? (y/n): " CONTINUE
-        if [[ "$CONTINUE" =~ ^[Yy]$ ]]; then
-            TUNNEL_IF=""
-            return 0
-        else
-            exit 1
-        fi
-    fi
+    case "$CREATE_TUNNEL" in
+        [Yy]*)
+            ;;
+        *)
+            print_warn "Без туннеля OSPF между офисами работать не будет!"
+            printf "Продолжить без туннеля? (y/n): "
+            read CONTINUE
+            case "$CONTINUE" in
+                [Yy]*)
+                    TUNNEL_IF=""
+                    return 0
+                    ;;
+                *)
+                    exit 1
+                    ;;
+            esac
+            ;;
+    esac
     
     # Параметры для создания туннеля
-    read -p "Введите локальный IP (внешний интерфейс): " LOCAL_IP
-    read -p "Введите удаленный IP (внешний IP другого офиса): " REMOTE_IP
-    read -p "Введите IP для этого конца туннеля (например, 10.10.0.1): " TUNNEL_LOCAL_IP
-    read -p "Введите IP для удаленного конца туннеля (например, 10.10.0.2): " TUNNEL_REMOTE_IP
-    read -p "Введите имя интерфейса туннеля (gre1): " TUNNEL_IF
+    printf "Введите локальный IP (внешний интерфейс): "
+    read LOCAL_IP
+    printf "Введите удаленный IP (внешний IP другого офиса): "
+    read REMOTE_IP
+    printf "Введите IP для этого конца туннеля (например, 10.10.0.1): "
+    read TUNNEL_LOCAL_IP
+    printf "Введите IP для удаленного конца туннеля (например, 10.10.0.2): "
+    read TUNNEL_REMOTE_IP
+    printf "Введите имя интерфейса туннеля (gre1): "
+    read TUNNEL_IF
     TUNNEL_IF=${TUNNEL_IF:-gre1}
     
     print_info "Создание GRE туннеля $TUNNEL_IF..."
@@ -131,7 +139,7 @@ create_gre_tunnel() {
 }
 
 # ------------------------------------------------------------------------------
-# Функция: Выбор или создание туннеля
+# Выбор или создание туннеля
 # ------------------------------------------------------------------------------
 select_tunnel_interface() {
     print_header "ВЫБОР ТУННЕЛЬНОГО ИНТЕРФЕЙСА"
@@ -150,18 +158,23 @@ select_tunnel_interface() {
             TUNNEL_NET="${IP_PART%.*}.0/30"
         fi
         
-        read -p "Использовать этот туннель? (y/n): " USE_EXISTING
-        if [[ ! "$USE_EXISTING" =~ ^[Yy]$ ]]; then
-            TUNNEL_IF=""
-            create_gre_tunnel
-        fi
+        printf "Использовать этот туннель? (y/n): "
+        read USE_EXISTING
+        case "$USE_EXISTING" in
+            [Yy]*)
+                ;;
+            *)
+                TUNNEL_IF=""
+                create_gre_tunnel
+                ;;
+        esac
     else
         create_gre_tunnel
     fi
 }
 
 # ------------------------------------------------------------------------------
-# Функция: Получение Router-ID
+# Получение Router-ID
 # ------------------------------------------------------------------------------
 get_router_id() {
     print_header "НАСТРОЙКА OSPF ПАРАМЕТРОВ"
@@ -176,77 +189,92 @@ get_router_id() {
     fi
     
     if [ -n "$DEFAULT_RID" ]; then
-        read -p "Введите OSPF Router-ID (по умолчанию: $DEFAULT_RID): " ROUTER_ID
+        printf "Введите OSPF Router-ID (по умолчанию: $DEFAULT_RID): "
+        read ROUTER_ID
         ROUTER_ID=${ROUTER_ID:-$DEFAULT_RID}
     else
-        read -p "Введите OSPF Router-ID: " ROUTER_ID
+        printf "Введите OSPF Router-ID: "
+        read ROUTER_ID
     fi
     
     print_success "Router-ID установлен: $ROUTER_ID"
 }
 
 # ------------------------------------------------------------------------------
-# Функция: Сбор локальных сетей
+# Сбор локальных сетей
 # ------------------------------------------------------------------------------
 get_local_networks() {
     echo ""
     print_info "Поиск локальных сетей для анонсирования..."
     
-    LOCAL_NETS=()
+    LOCAL_NETS=""
+    TMP_IFACES=$(mktemp)
     
     # Собираем все сети кроме туннеля и loopback
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        
-        IFACE=$(echo "$line" | awk '{print $1}')
-        IP=$(echo "$line" | awk '{print $2}')
-        
+    ip -o addr show 2>/dev/null | awk '$2 != "lo" && NF >= 4 {print $2, $4}' > "$TMP_IFACES"
+    
+    while read -r IFACE IP; do
         # Пропускаем туннель и loopback
-        [[ "$IFACE" == "$TUNNEL_IF" ]] && continue
-        [[ "$IFACE" == "lo" ]] && continue
-        [[ -z "$IP" ]] && continue
+        if [ "$IFACE" = "$TUNNEL_IF" ]; then
+            continue
+        fi
+        if [ "$IFACE" = "lo" ]; then
+            continue
+        fi
+        if [ -z "$IP" ]; then
+            continue
+        fi
         
         # Извлекаем сеть из IP/маски
         NET_IP=$(echo "$IP" | cut -d'/' -f1)
         MASK=$(echo "$IP" | cut -d'/' -f2)
         
         # Вычисляем адрес сети
-        case "$MASK" in
-            24) NETWORK=$(echo "$NET_IP" | sed 's/\.[0-9]*$/\.0/') ;;
-            25) NETWORK=$(echo "$NET_IP" | sed 's/\.[0-9]*$/\.0/') ;;
-            26) NETWORK=$(echo "$NET_IP" | sed 's/\.[0-9]*$/\.0/') ;;
-            27) NETWORK=$(echo "$NET_IP" | sed 's/\.[0-9]*$/\.0/') ;;
-            28) NETWORK=$(echo "$NET_IP" | sed 's/\.[0-9]*$/\.0/') ;;
-            29) NETWORK=$(echo "$NET_IP" | sed 's/\.[0-9]*$/\.0/') ;;
-            30) NETWORK=$(echo "$NET_IP" | sed 's/\.[0-9]*$/\.0/') ;;
-            *) NETWORK=$(echo "$NET_IP" | sed 's/\.[0-9]*$/\.0/') ;;
-        esac
+        NETWORK=$(echo "$NET_IP" | sed 's/\.[0-9]*$/\.0/')
         
-        LOCAL_NETS+=("${NETWORK}/${MASK}")
+        if [ -z "$LOCAL_NETS" ]; then
+            LOCAL_NETS="${NETWORK}/${MASK}"
+        else
+            LOCAL_NETS="$LOCAL_NETS ${NETWORK}/${MASK}"
+        fi
+        
         echo "    Найдена сеть: ${NETWORK}/${MASK} ($IFACE)"
         
-    done < <(ip -o addr show 2>/dev/null | awk '$2 != "lo" && NF >= 4 {print $2, $4}')
+    done < "$TMP_IFACES"
     
-    if [ ${#LOCAL_NETS[@]} -eq 0 ]; then
+    rm -f "$TMP_IFACES"
+    
+    if [ -z "$LOCAL_NETS" ]; then
         print_warn "Локальные сети не найдены"
-        read -p "Введите сети вручную (через пробел): " -a LOCAL_NETS
+        printf "Введите сети вручную (через пробел): "
+        read LOCAL_NETS
     else
         echo ""
-        read -p "Использовать найденные сети? (y/n): " USE_FOUND
-        if [[ ! "$USE_FOUND" =~ ^[Yy]$ ]]; then
-            read -p "Введите сети вручную (через пробел): " -a LOCAL_NETS
-        fi
+        printf "Использовать найденные сети? (y/n): "
+        read USE_FOUND
+        case "$USE_FOUND" in
+            [Yy]*)
+                ;;
+            *)
+                printf "Введите сети вручную (через пробел): "
+                read LOCAL_NETS
+                ;;
+        esac
     fi
 }
 
 # ------------------------------------------------------------------------------
-# Функция: Настройка OSPF
+# Настройка OSPF
 # ------------------------------------------------------------------------------
 configure_ospf() {
     print_header "ПРИМЕНЕНИЕ КОНФИГУРАЦИИ OSPF"
     
     echo ""
-    read -p "Введите пароль для OSPF аутентификации: " -s OSPF_PASS
+    printf "Введите пароль для OSPF аутентификации: "
+    # Отключаем эхо для пароля
+    stty -echo
+    read OSPF_PASS
+    stty echo
     echo ""
     
     if [ -z "$OSPF_PASS" ]; then
@@ -260,37 +288,49 @@ configure_ospf() {
     vtysh -c "conf t" -c "no router ospf" 2>/dev/null || true
     
     # Создаем новую конфигурацию
-    {
-        echo "configure terminal"
-        echo "router ospf"
-        echo " ospf router-id $ROUTER_ID"
-        
-        # Добавляем сеть туннеля если есть
-        if [ -n "$TUNNEL_NET" ]; then
-            echo " network $TUNNEL_NET area 0"
+    TMP_CONFIG=$(mktemp)
+    
+    cat > "$TMP_CONFIG" << EOFCONFIG
+configure terminal
+router ospf
+ ospf router-id $ROUTER_ID
+EOFCONFIG
+    
+    # Добавляем сеть туннеля если есть
+    if [ -n "$TUNNEL_NET" ]; then
+        echo " network $TUNNEL_NET area 0" >> "$TMP_CONFIG"
+    fi
+    
+    # Добавляем локальные сети
+    for NET in $LOCAL_NETS; do
+        if [ -n "$NET" ]; then
+            echo " network $NET area 0" >> "$TMP_CONFIG"
         fi
-        
-        # Добавляем локальные сети
-        for NET in "${LOCAL_NETS[@]}"; do
-            [ -n "$NET" ] && echo " network $NET area 0"
-        done
-        
-        echo " area 0 authentication"
-        echo "exit"
-        
-        # Настраиваем туннельный интерфейс
-        if [ -n "$TUNNEL_IF" ]; then
-            echo "interface $TUNNEL_IF"
-            echo " no ip ospf passive"
-            echo " ip ospf network broadcast"
-            echo " ip ospf authentication"
-            echo " ip ospf authentication-key $OSPF_PASS"
-            echo "exit"
-        fi
-        
-        echo "exit"
-        echo "write"
-    } | vtysh
+    done
+    
+    cat >> "$TMP_CONFIG" << EOFCONFIG
+ area 0 authentication
+exit
+EOFCONFIG
+    
+    # Настраиваем туннельный интерфейс
+    if [ -n "$TUNNEL_IF" ]; then
+        cat >> "$TMP_CONFIG" << EOFCONFIG
+interface $TUNNEL_IF
+ no ip ospf passive
+ ip ospf network broadcast
+ ip ospf authentication
+ ip ospf authentication-key $OSPF_PASS
+exit
+EOFCONFIG
+    fi
+    
+    echo "exit" >> "$TMP_CONFIG"
+    echo "write" >> "$TMP_CONFIG"
+    
+    vtysh < "$TMP_CONFIG"
+    
+    rm -f "$TMP_CONFIG"
     
     print_success "OSPF настроен"
     
@@ -298,13 +338,17 @@ configure_ospf() {
     echo ""
     print_info "Конфигурация OSPF:"
     echo "  Router-ID: $ROUTER_ID"
-    [ -n "$TUNNEL_IF" ] && echo "  Туннель: $TUNNEL_IF"
-    [ -n "$TUNNEL_NET" ] && echo "  Сеть туннеля: $TUNNEL_NET"
-    echo "  Локальные сети: ${LOCAL_NETS[*]}"
+    if [ -n "$TUNNEL_IF" ]; then
+        echo "  Туннель: $TUNNEL_IF"
+    fi
+    if [ -n "$TUNNEL_NET" ]; then
+        echo "  Сеть туннеля: $TUNNEL_NET"
+    fi
+    echo "  Локальные сети: ${LOCAL_NETS:-нет}"
 }
 
 # ------------------------------------------------------------------------------
-# Функция: Генерация отчета
+# Генерация отчета
 # ------------------------------------------------------------------------------
 generate_report() {
     echo ""
@@ -320,9 +364,13 @@ generate_report() {
         echo "1. ПАРАМЕТРЫ НАСТРОЙКИ:"
         echo "--------------------------------------------------------------------------------"
         echo "Router-ID:      ${ROUTER_ID}"
-        [ -n "$TUNNEL_IF" ] && echo "Туннель:        ${TUNNEL_IF}"
-        [ -n "$TUNNEL_NET" ] && echo "Сеть туннеля:   ${TUNNEL_NET}"
-        echo "Локальные сети: ${LOCAL_NETS[*]:-нет}"
+        if [ -n "$TUNNEL_IF" ]; then
+            echo "Туннель:        ${TUNNEL_IF}"
+        fi
+        if [ -n "$TUNNEL_NET" ]; then
+            echo "Сеть туннеля:   ${TUNNEL_NET}"
+        fi
+        echo "Локальные сети: ${LOCAL_NETS:-нет}"
         echo ""
         echo "2. ТЕКУЩАЯ КОНФИГУРАЦИЯ (show run):"
         echo "--------------------------------------------------------------------------------"
@@ -349,7 +397,7 @@ generate_report() {
 }
 
 # ------------------------------------------------------------------------------
-# Функция: Проверка работоспособности
+# Проверка работоспособности
 # ------------------------------------------------------------------------------
 check_status() {
     echo ""
