@@ -882,7 +882,9 @@ EOF
 verify_ospf() {
     print_section "Проверка OSPF"
     
+    # ==========================================
     # 1. Проверка состояния интерфейса GRE
+    # ==========================================
     echo ""
     print_info "═══════════════════════════════════════════════════════════════"
     print_info "  1. ПРОВЕРКА GRE ИНТЕРФЕЙСА"
@@ -905,7 +907,9 @@ verify_ospf() {
         print_success "GRE интерфейс UP"
     fi
     
+    # ==========================================
     # 2. Проверка связности через GRE
+    # ==========================================
     echo ""
     print_info "═══════════════════════════════════════════════════════════════"
     print_info "  2. ПРОВЕРКА СВЯЗНОСТИ GRE ТУННЕЛЯ"
@@ -919,125 +923,221 @@ verify_ospf() {
     
     if [[ -n "$remote_gre_ip" ]]; then
         print_info "Пинг удалённой стороны GRE ($remote_gre_ip)..."
-        if ping -c 3 -W 2 "$remote_gre_ip" &>/dev/null; then
+        
+        # Детальный пинг
+        ping -c 3 -W 2 "$remote_gre_ip"
+        local ping_result=$?
+        
+        if [[ $ping_result -eq 0 ]]; then
             print_success "GRE туннель работает! Ping успешен."
         else
-            print_error "GRE туннель НЕ РАБОТАЕТ!"
-            print_error "Ping на $remote_gre_ip не прошёл"
+            print_error "═══════════════════════════════════════════════════════════════"
+            print_error "  GRE ТУННЕЛЬ НЕ РАБОТАЕТ! PING НЕ ПРОШЁЛ!"
+            print_error "═══════════════════════════════════════════════════════════════"
             echo ""
-            print_warning "═══════════════════════════════════════════════════════════════"
-            print_warning "  ВНИМАНИЕ: Без работающего GRE туннеля OSPF работать НЕ БУДЕТ!"
-            print_warning "═══════════════════════════════════════════════════════════════"
+            print_error "ОСНОВНАЯ ПРИЧИНА: Без работающего GRE туннеля OSPF НЕ БУДЕТ работать!"
             echo ""
-            print_info "Проверьте на втором маршрутизаторе:"
-            print_info "  1. GRE туннель создан и UP"
-            print_info "  2. IP адрес туннеля: ${remote_gre_ip}"
-            print_info "  3. Правильные local/remote адреса"
+            print_info "Проверьте на обоих роутерах:"
+            echo "  1. GRE туннель создан: ip tunnel show"
+            echo "  2. Интерфейс UP: ip link show $GRE_INTERFACE"
+            echo "  3. Local/Remote IP правильные"
+            echo ""
             
-            read -p "Продолжить настройку OSPF? (y/n): " continue_ospf
+            # Показываем текущую конфигурацию GRE
+            print_info "Текущая конфигурация GRE туннеля:"
+            ip tunnel show "$GRE_INTERFACE" 2>/dev/null || echo "  Туннель не найден"
+            
+            read -p "Продолжить диагностику OSPF? (y/n): " continue_ospf
             [[ "$continue_ospf" != "y" ]] && return 1
         fi
     fi
     
-    # 3. Проверка OSPF на интерфейсе
+    # ==========================================
+    # 3. Проверка OSPF процесса
+    # ==========================================
     echo ""
     print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  3. ПРОВЕРКА OSPF НА ИНТЕРФЕЙСЕ"
+    print_info "  3. ПРОВЕРКА OSPF ПРОЦЕССА"
+    print_info "═══════════════════════════════════════════════════════════════"
+    
+    # Проверяем, запущен ли ospfd
+    if ! vtysh -c "show ip ospf" &>/dev/null; then
+        print_error "OSPF процесс НЕ ЗАПУЩЕН!"
+        print_info "Проверка службы FRR..."
+        systemctl status frr --no-pager | head -10
+        
+        print_info "Попытка перезапуска FRR..."
+        systemctl restart frr
+        sleep 3
+        
+        if vtysh -c "show ip ospf" &>/dev/null; then
+            print_success "OSPF запущен после перезапуска"
+        else
+            print_error "Не удалось запустить OSPF!"
+            return 1
+        fi
+    fi
+    
+    vtysh -c "show ip ospf" 2>/dev/null
+    
+    # ==========================================
+    # 4. Проверка OSPF на интерфейсе
+    # ==========================================
+    echo ""
+    print_info "═══════════════════════════════════════════════════════════════"
+    print_info "  4. ПРОВЕРКА OSPF НА ИНТЕРФЕЙСЕ $GRE_INTERFACE"
     print_info "═══════════════════════════════════════════════════════════════"
     
     local ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
     
     if [[ -z "$ospf_intf_output" ]]; then
         print_error "OSPF НЕ активен на интерфейсе $GRE_INTERFACE!"
-        print_warning "Возможные причины:"
-        echo "  • Сеть интерфейса не добавлена в OSPF"
-        echo "  • Интерфейс в режиме passive"
-        echo "  • OSPF демон не запущен"
+        print_warning "Сеть интерфейса не добавлена в OSPF или интерфейс DOWN"
         
         echo ""
-        print_info "Попробуем добавить сеть вручную..."
+        print_info "Принудительное добавление сети в OSPF..."
         local gre_network=$(get_interface_network "$GRE_INTERFACE")
+        
         if [[ -n "$gre_network" ]]; then
-            vtysh -c "configure terminal" -c "router ospf" -c "network $gre_network area 0"
+            print_info "Добавляем сеть $gre_network в area 0..."
+            vtysh << EOF
+configure terminal
+router ospf
+network $gre_network area 0
+end
+EOF
+            vtysh -c "write"
             sleep 2
+            
+            # Проверяем ещё раз
             ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
+            
+            if [[ -z "$ospf_intf_output" ]]; then
+                print_error "Не удалось активировать OSPF на интерфейсе!"
+                
+                # Проверяем все интерфейсы OSPF
+                print_info "Список всех интерфейсов в OSPF:"
+                vtysh -c "show ip ospf interface" 2>/dev/null
+                return 1
+            fi
         fi
     fi
     
-    if [[ -n "$ospf_intf_output" ]]; then
-        print_success "OSPF активен на $GRE_INTERFACE"
+    # Показываем OSPF интерфейс
+    echo "$ospf_intf_output"
+    echo ""
+    
+    # ==========================================
+    # 5. КРИТИЧНЫЕ ПРОВЕРКИ
+    # ==========================================
+    echo ""
+    print_info "═══════════════════════════════════════════════════════════════"
+    print_info "  5. КРИТИЧНЫЕ ПРОВЕРКИ"
+    print_info "═══════════════════════════════════════════════════════════════"
+    
+    # Проверка Passive
+    local is_passive=false
+    if echo "$ospf_intf_output" | grep -qi "passive interface"; then
+        is_passive=true
+        print_error "❌ PASSIVE: Интерфейс в режиме PASSIVE!"
+    else
+        print_success "✓ PASSIVE: Режим отключён"
+    fi
+    
+    # Проверка Network Type
+    local net_type=$(echo "$ospf_intf_output" | grep -oP 'Network Type: \K[^\s,]+' | head -1)
+    if [[ -n "$net_type" ]]; then
+        if [[ "$net_type" == "POINT_TO_POINT" ]] || [[ "$net_type" == "POINT-TO-POINT" ]]; then
+            print_success "✓ Network Type: $net_type (корректно для GRE)"
+        else
+            print_warning "⚠ Network Type: $net_type"
+            print_warning "  Рекомендуется POINT_TO_POINT для GRE туннелей"
+        fi
+    fi
+    
+    # Проверка Hello/Dead таймеров
+    local hello_timer=$(echo "$ospf_intf_output" | grep -oP 'Hello: \K\d+')
+    local dead_timer=$(echo "$ospf_intf_output" | grep -oP 'Dead: \K\d+')
+    echo "  Hello Timer: ${hello_timer}s"
+    echo "  Dead Timer: ${dead_timer}s"
+    
+    # ==========================================
+    # 6. ИСПРАВЛЕНИЕ PASSIVE РЕЖИМА
+    # ==========================================
+    if [[ "$is_passive" == true ]]; then
         echo ""
+        print_error "═══════════════════════════════════════════════════════════════"
+        print_error "  ИСПРАВЛЕНИЕ PASSIVE РЕЖИМА"
+        print_error "═══════════════════════════════════════════════════════════════"
         
-        # Показываем ключевые параметры
-        echo "$ospf_intf_output"
-        echo ""
-        
-        # КРИТИЧНАЯ ПРОВЕРКА: Passive режим
-        if echo "$ospf_intf_output" | grep -qi "passive interface"; then
-            print_error "═══════════════════════════════════════════════════════════════"
-            print_error "  КРИТИЧНО: Интерфейс в режиме PASSIVE!"
-            print_error "  OSPF НЕ БУДЕТ отправлять Hello пакеты!"
-            print_error "═══════════════════════════════════════════════════════════════"
-            
-            print_info "Принудительное отключение passive режима..."
-            
-            # Отключаем passive на интерфейсе
-            vtysh << EOF
+        print_info "Отключение passive на интерфейсе..."
+        vtysh << EOF
 configure terminal
 interface $GRE_INTERFACE
 no ip ospf passive
 end
 EOF
-            vtysh -c "write"
+        
+        # Проверяем глобальный passive
+        local global_passive=$(vtysh -c "show running-config" 2>/dev/null | grep -A 30 "router ospf" | grep -i "passive-interface default\|passive-interface $GRE_INTERFACE")
+        
+        if [[ -n "$global_passive" ]]; then
+            print_warning "Обнаружен глобальный passive-interface:"
+            echo "$global_passive"
             
-            # Проверяем, есть ли глобальный passive-interface в router ospf
-            local global_passive=$(vtysh -c "show running-config" 2>/dev/null | grep -A 20 "router ospf" | grep -i "passive-interface")
-            if [[ -n "$global_passive" ]]; then
-                print_warning "Обнаружен глобальный passive-interface в router ospf:"
-                echo "$global_passive"
-                print_info "Удаление глобального passive-interface для $GRE_INTERFACE..."
+            # Если passive-interface default - нужно отключить для gre1
+            if echo "$global_passive" | grep -q "passive-interface default"; then
+                print_info "Обнаружен 'passive-interface default', отключаем для $GRE_INTERFACE..."
                 vtysh << EOF
 configure terminal
 router ospf
 no passive-interface $GRE_INTERFACE
 end
 EOF
-                vtysh -c "write"
             fi
             
-            sleep 2
-            
-            # Проверяем результат
-            ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
-            if echo "$ospf_intf_output" | grep -qi "passive interface"; then
-                print_error "НЕ УДАЛОСЬ отключить passive режим!"
-                print_error "Выполните вручную:"
-                echo "  vtysh -c 'configure terminal' -c 'interface $GRE_INTERFACE' -c 'no ip ospf passive'"
-            else
-                print_success "Режим passive успешно отключён!"
-            fi
+            # Удаляем конкретный passive-interface
+            vtysh << EOF
+configure terminal
+router ospf
+no passive-interface $GRE_INTERFACE
+end
+EOF
+        fi
+        
+        vtysh -c "write"
+        sleep 2
+        
+        # Проверяем результат
+        ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
+        if echo "$ospf_intf_output" | grep -qi "passive interface"; then
+            print_error "НЕ УДАЛОСЬ отключить passive! Выполните вручную:"
+            echo "  vtysh"
+            echo "  conf t"
+            echo "  int $GRE_INTERFACE"
+            echo "  no ip ospf passive"
+            echo "  end"
+            echo "  wr"
         else
-            print_success "Режим passive отключён - OSPF отправляет Hello пакеты"
+            print_success "Passive режим успешно отключён!"
         fi
     fi
     
-    # 4. Проверка OSPF процесса
+    # ==========================================
+    # 7. Ожидание соседей
+    # ==========================================
     echo ""
     print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  4. ПРОВЕРКА OSPF ПРОЦЕССА"
+    print_info "  6. ПОИСК СОСЕДЕЙ OSPF"
     print_info "═══════════════════════════════════════════════════════════════"
     
-    vtysh -c "show ip ospf" 2>/dev/null
+    # Показываем текущих соседей
+    print_info "Текущие соседи OSPF:"
+    vtysh -c "show ip ospf neighbor" 2>/dev/null
     
-    # 5. Ожидание и проверка соседей
     echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  5. ПОИСК СОСЕДЕЙ OSPF"
-    print_info "═══════════════════════════════════════════════════════════════"
-    
     print_info "Ожидание появления соседей (макс. 60 секунд)..."
-    print_warning "Убедитесь, что второй маршрутизатор тоже настроен!"
-    print_warning "На втором роутере тоже должен быть отключён passive режим!"
+    print_warning "Убедитесь, что ВТОРОЙ маршрутизатор тоже настроен!"
     
     local max_attempts=30
     local attempt=0
@@ -1046,7 +1146,6 @@ EOF
     while [[ $attempt -lt $max_attempts ]]; do
         local neighbor_output=$(vtysh -c "show ip ospf neighbor" 2>/dev/null)
         
-        # Проверяем наличие соседа в любом состоянии
         if echo "$neighbor_output" | grep -qE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"; then
             neighbors_found=true
             print_success "Обнаружен сосед OSPF!"
@@ -1059,93 +1158,126 @@ EOF
     done
     echo ""
     
-    # Показываем соседей
+    # ==========================================
+    # 8. Результат
+    # ==========================================
+    echo ""
+    print_info "═══════════════════════════════════════════════════════════════"
+    print_info "  РЕЗУЛЬТАТ"
+    print_info "═══════════════════════════════════════════════════════════════"
+    
     echo ""
     print_info "Таблица соседей OSPF:"
-    echo "────────────────────────────────────────────────────────────────────"
     vtysh -c "show ip ospf neighbor" 2>/dev/null
-    echo "────────────────────────────────────────────────────────────────────"
     
-    # Если соседи не найдены - детальная диагностика
-    if [[ "$neighbors_found" == false ]]; then
+    if [[ "$neighbors_found" == true ]]; then
+        echo ""
+        print_success "═══════════════════════════════════════════════════════════════"
+        print_success "  OSPF СОСЕДИ НАЙДЕНЫ!"
+        print_success "═══════════════════════════════════════════════════════════════"
+        
+        echo ""
+        print_info "Маршруты OSPF:"
+        vtysh -c "show ip route ospf" 2>/dev/null
+    else
         echo ""
         print_error "═══════════════════════════════════════════════════════════════"
         print_error "  СОСЕДИ OSPF НЕ ОБНАРУЖЕНЫ"
         print_error "═══════════════════════════════════════════════════════════════"
         
-        echo ""
-        print_warning "ПРОВЕРЬТЕ НА ВТОРОМ МАРШРУТИЗАТОРЕ:"
-        echo ""
-        echo "  1. Тип сети OSPF должен быть: $OSPF_NETWORK_TYPE"
-        echo "     Команда: vtysh -c 'show ip ospf interface $GRE_INTERFACE'"
-        echo "     Должно быть: Network Type: ${OSPF_NETWORK_TYPE^^}"
-        echo ""
-        echo "  2. Пароль OSPF должен быть: $OSPF_PASSWORD"
-        echo "     Команда: vtysh -c 'show run' | grep authentication"
-        echo ""
-        echo "  3. ИНТЕРФЕЙС НЕ ДОЛЖЕН БЫТЬ PASSIVE!"
-        echo "     Команда проверки: vtysh -c 'show ip ospf interface $GRE_INTERFACE'"
-        echo "     НЕ должно быть: 'Passive interface'"
-        echo "     Исправить: vtysh -c 'conf t' -c 'int $GRE_INTERFACE' -c 'no ip ospf passive'"
-        echo ""
-        echo "  4. GRE туннель должен работать"
-        echo "     Команда: ping <IP_другой_стороны_туннеля>"
-        echo ""
-        echo "  5. Router ID должен быть уникальным"
-        echo "     HQ-RTR: 172.16.1.1"
-        echo "     BR-RTR: 172.16.2.1"
-        echo ""
-        
-        # Показываем текущий статус passive
-        echo ""
-        print_info "Текущий статус OSPF на интерфейсе:"
-        vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null | grep -i "passive\|network\|hello\|dead" || echo "  Нет данных"
-        
-        # Показываем лог OSPF
-        echo ""
-        print_info "Последние сообщения OSPF из лога:"
-        echo "────────────────────────────────────────────────────────────────────"
-        tail -30 /var/log/frr/frr.log 2>/dev/null | grep -i "ospf\|hello\|neighbor\|nsm" | tail -15
-        echo "────────────────────────────────────────────────────────────────────"
-        
-        # Предлагаем отладку
-        echo ""
-        read -p "Запустить отладку OSPF Hello пакетов? (y/n): " run_debug
-        if [[ "$run_debug" == "y" ]]; then
-            print_info "Отладка OSPF Hello (10 секунд)..."
-            print_info "Отправьте на второй роутер ping чтобы инициировать Hello..."
-            vtysh -c "terminal monitor" 2>/dev/null
-            vtysh -c "debug ospf packet hello send" 2>/dev/null
-            vtysh -c "debug ospf packet hello recv" 2>/dev/null
-            
-            sleep 10
-            
-            vtysh -c "no debug ospf packet hello send" 2>/dev/null
-            vtysh -c "no debug ospf packet hello recv" 2>/dev/null
-            print_info "Отладка завершена"
-        fi
+        # Показываем чек-лист для проверки
+        show_ospf_troubleshooting
     fi
-    
-    # 6. Маршруты OSPF
+}
+
+show_ospf_troubleshooting() {
     echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  6. МАРШРУТЫ OSPF"
-    print_info "═══════════════════════════════════════════════════════════════"
-    
-    print_info "Маршруты OSPF:"
-    vtysh -c "show ip ospf route" 2>/dev/null || echo "  Нет маршрутов"
+    print_warning "═══════════════════════════════════════════════════════════════"
+    print_warning "  ДИАГНОСТИКА - ПРОВЕРЬТЕ НА ОБЕИХ РОУТЕРАХ"
+    print_warning "═══════════════════════════════════════════════════════════════"
     
     echo ""
-    print_info "Маршруты OSPF в таблице маршрутизации:"
-    vtysh -c "show ip route ospf" 2>/dev/null || echo "  Нет маршрутов"
-    
-    # 7. Текущая конфигурация
+    echo "Выполните эти команды на ОБЕИХ маршрутизаторах и сравните:"
     echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  7. ТЕКУЩАЯ КОНФИГУРАЦИЯ FRR"
-    print_info "═══════════════════════════════════════════════════════════════"
     
-    vtysh -c "show running-config" 2>/dev/null
+    # Генерируем команды для второго роутера
+    echo "┌─────────────────────────────────────────────────────────────────┐"
+    echo "│ КОМАНДЫ ДЛЯ ПРОВЕРКИ (выполнить на обоих роутерах):            │"
+    echo "├─────────────────────────────────────────────────────────────────┤"
+    echo "│ 1. Проверка GRE:                                                │"
+    echo "│    ping 10.10.0.1   (с BR-RTR)                                 │"
+    echo "│    ping 10.10.0.2   (с HQ-RTR)                                 │"
+    echo "│                                                                 │"
+    echo "│ 2. Проверка OSPF на интерфейсе:                                 │"
+    echo "│    vtysh -c 'show ip ospf interface $GRE_INTERFACE'            │"
+    echo "│                                                                 │"
+    echo "│ 3. Проверка passive (НЕ должно быть!):                          │"
+    echo "│    vtysh -c 'show ip ospf interface $GRE_INTERFACE' | grep -i passive │"
+    echo "│                                                                 │"
+    echo "│ 4. Проверка типа сети (должен быть одинаковый):                 │"
+    echo "│    vtysh -c 'show ip ospf interface $GRE_INTERFACE' | grep -i network │"
+    echo "│                                                                 │"
+    echo "│ 5. Проверка аутентификации:                                     │"
+    echo "│    vtysh -c 'show run' | grep -A5 'interface $GRE_INTERFACE'   │"
+    echo "└─────────────────────────────────────────────────────────────────┘"
+    
+    echo ""
+    print_warning "ВАЖНО - Параметры должны совпадать:"
+    echo ""
+    echo "  ┌────────────────────┬─────────────────┬─────────────────┐"
+    echo "  │ Параметр           │ HQ-RTR          │ BR-RTR          │"
+    echo "  ├────────────────────┼─────────────────┼─────────────────┤"
+    echo "  │ Network Type       │ POINT_TO_POINT  │ POINT_TO_POINT  │"
+    echo "  │ Passive            │ NO              │ NO              │"
+    echo "  │ Hello Timer        │ 10              │ 10              │"
+    echo "  │ Dead Timer         │ 40              │ 40              │"
+    echo "  │ Password           │ $OSPF_PASSWORD"
+    echo "  │ Router ID          │ 172.16.1.1      │ 172.16.2.1      │"
+    echo "  │ GRE IP             │ 10.10.0.1/30    │ 10.10.0.2/30    │"
+    echo "  └────────────────────┴─────────────────┴─────────────────┘"
+    
+    echo ""
+    print_info "Текущая конфигурация OSPF на этом роутере:"
+    echo "────────────────────────────────────────────────────────────────────"
+    vtysh -c "show running-config" 2>/dev/null | grep -A 50 "router ospf" | head -30
+    echo "────────────────────────────────────────────────────────────────────"
+    
+    # Показываем логи
+    echo ""
+    print_info "Последние ошибки OSPF из лога:"
+    echo "────────────────────────────────────────────────────────────────────"
+    tail -50 /var/log/frr/frr.log 2>/dev/null | grep -i "error\|warn\|fail\|mismatch\|auth" | tail -10
+    echo "────────────────────────────────────────────────────────────────────"
+    
+    # Предлагаем отладку
+    echo ""
+    read -p "Запустить отладку OSPF Hello пакетов? (y/n): " run_debug
+    if [[ "$run_debug" == "y" ]]; then
+        print_info "═══════════════════════════════════════════════════════════════"
+        print_info "  ОТЛАДКА OSPF HELLO ПАКЕТОВ"
+        print_info "═══════════════════════════════════════════════════════════════"
+        print_info "Будут отображаться отправленные и полученные Hello пакеты..."
+        print_info "Если пакеты отправляются, но не получаются - проблема в GRE или втором роутере"
+        echo ""
+        
+        vtysh << EOF
+terminal monitor
+debug ospf nsm
+debug ospf packet hello send detail
+debug ospf packet hello recv detail
+EOF
+        
+        print_info "Отладка запущена на 15 секунд. Проверьте второй роутер..."
+        sleep 15
+        
+        vtysh << EOF
+no debug ospf nsm
+no debug ospf packet hello send detail
+no debug ospf packet hello recv detail
+EOF
+        
+        print_info "Отладка завершена"
+    fi
 }
 
 #===============================================================================
