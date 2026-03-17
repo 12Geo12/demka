@@ -2,6 +2,7 @@
 #===============================================================================
 # Скрипт настройки OSPF динамической маршрутизации для ALT Linux
 # Задание 7: Обеспечение динамической маршрутизации между офисами
+# Включает: создание GRE туннеля (если не существует) + настройка OSPF
 #===============================================================================
 
 # Цвета для вывода
@@ -10,11 +11,13 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
 
 # Файлы
 LOG_FILE="/var/log/ospf-setup.log"
 REPORT_FILE="/root/ospf-config-report.txt"
+INTERFACES_FILE="/etc/net/interfaces"
 
 # Глобальные переменные
 ROUTER_ROLE=""
@@ -22,8 +25,12 @@ ROUTER_ID=""
 GRE_INTERFACE=""
 GRE_IP=""
 GRE_NETWORK=""
+GRE_REMOTE_IP=""
+GRE_LOCAL_IP=""
+GRE_KEY=""
 OSPF_PASSWORD=""
 NETWORKS=()
+CREATE_GRE=false
 
 #===============================================================================
 # Функции вывода
@@ -34,6 +41,12 @@ print_header() {
     echo "╔══════════════════════════════════════════════════════════════════════╗"
     echo "║     НАСТРОЙКА OSPF ДИНАМИЧЕСКОЙ МАРШРУТИЗАЦИИ - ALT LINUX           ║"
     echo "║                  Задание 7: Link State Protocol                      ║"
+    echo "║                                                                      ║"
+    echo "║   Функции скрипта:                                                   ║"
+    echo "║   • Создание GRE туннеля (если не существует)                        ║"
+    echo "║   • Настройка OSPF с аутентификацией                                 ║"
+    echo "║   • Автоматическое определение сетей                                 ║"
+    echo "║   • Генерация отчёта                                                 ║"
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -58,6 +71,10 @@ print_info() {
 
 print_warning() {
     echo -e "${YELLOW}[!]${NC} $1"
+}
+
+print_menu() {
+    echo -e "${MAGENTA}►${NC} $1"
 }
 
 log_message() {
@@ -101,8 +118,16 @@ get_hostname() {
 #===============================================================================
 
 get_all_interfaces() {
-    # Получаем все сетевые интерфейсы, исключая lo
     ls /sys/class/net/ | grep -v "^lo$"
+}
+
+get_external_interfaces() {
+    # Возвращаем интерфейсы, которые НЕ являются GRE/TUN
+    for iface in $(get_all_interfaces); do
+        if [[ ! "$iface" =~ ^gre[0-9]+$ ]] && [[ ! "$iface" =~ ^tun[0-9]+$ ]]; then
+            echo "$iface"
+        fi
+    done
 }
 
 get_interface_ip() {
@@ -134,7 +159,6 @@ get_interface_mask() {
 }
 
 find_gre_interface() {
-    # Ищем GRE туннели
     for iface in $(get_all_interfaces); do
         if [[ "$iface" =~ ^gre[0-9]+$ ]] || [[ "$iface" =~ ^tun[0-9]+$ ]]; then
             echo "$iface"
@@ -142,6 +166,12 @@ find_gre_interface() {
         fi
     done
     return 1
+}
+
+check_gre_exists() {
+    local iface=$1
+    ip link show "$iface" &>/dev/null
+    return $?
 }
 
 list_interfaces_with_details() {
@@ -153,10 +183,307 @@ list_interfaces_with_details() {
         local ip=$(get_interface_ip "$iface")
         local network=$(get_interface_network "$iface")
         if [[ -n "$ip" ]]; then
-            printf "%-12s\t%-16s\t%s\n" "$iface" "$ip" "$network"
+            local iface_type=""
+            if [[ "$iface" =~ ^gre[0-9]+$ ]]; then
+                iface_type=" (GRE)"
+            elif [[ "$iface" =~ ^tun[0-9]+$ ]]; then
+                iface_type=" (TUN)"
+            fi
+            printf "%-12s\t%-16s\t%s%s\n" "$iface" "$ip" "$network" "$iface_type"
         fi
     done
     echo ""
+}
+
+#===============================================================================
+# Функции создания GRE туннеля
+#===============================================================================
+
+create_gre_tunnel_interactive() {
+    print_section "Создание GRE туннеля"
+    
+    echo -e "${YELLOW}GRE туннель не обнаружен. Необходимо его создать.${NC}"
+    echo ""
+    
+    # Имя интерфейса
+    local default_iface="gre1"
+    print_menu "Шаг 1: Имя интерфейса GRE туннеля"
+    echo "  Рекомендуемое имя: $default_iface"
+    read -p "  Имя интерфейса [$default_iface]: " input_iface
+    GRE_INTERFACE="${input_iface:-$default_iface}"
+    
+    # Проверяем, не существует ли уже такой интерфейс
+    if check_gre_exists "$GRE_INTERFACE"; then
+        print_error "Интерфейс $GRE_INTERFACE уже существует!"
+        return 1
+    fi
+    
+    echo ""
+    print_menu "Шаг 2: Локальный внешний IP-адрес"
+    echo "  Доступные внешние интерфейсы:"
+    local i=1
+    declare -A iface_map
+    for iface in $(get_external_interfaces); do
+        local ip=$(get_interface_ip "$iface")
+        if [[ -n "$ip" ]]; then
+            echo "    $i) $iface - $ip"
+            iface_map[$i]="$ip|$iface"
+            ((i++))
+        fi
+    done
+    
+    local default_local_ip=""
+    if [[ ${#iface_map[@]} -gt 0 ]]; then
+        default_local_ip=$(echo "${iface_map[1]}" | cut -d'|' -f1)
+    fi
+    
+    read -p "  Локальный внешний IP [$default_local_ip]: " input_local
+    GRE_LOCAL_IP="${input_local:-$default_local_ip}"
+    
+    echo ""
+    print_menu "Шаг 3: Удалённый внешний IP-адрес (маршрутизатор другого офиса)"
+    
+    # Предлагаем типичные IP в зависимости от роли
+    local suggested_remote=""
+    case $ROUTER_ROLE in
+        "HQ-RTR")
+            suggested_remote="172.16.2.1"
+            echo "  Подсказка: Для HQ-RTR удалённый IP обычно BR-RTR (например: 172.16.2.1)"
+            ;;
+        "BR-RTR")
+            suggested_remote="172.16.1.1"
+            echo "  Подсказка: Для BR-RTR удалённый IP обычно HQ-RTR (например: 172.16.1.1)"
+            ;;
+    esac
+    
+    read -p "  Удалённый внешний IP [$suggested_remote]: " input_remote
+    GRE_REMOTE_IP="${input_remote:-$suggested_remote}"
+    
+    echo ""
+    print_menu "Шаг 4: Внутренний IP-адрес GRE туннеля"
+    
+    # Предлагаем IP на основе роли
+    local suggested_gre_ip=""
+    local suggested_gre_network=""
+    case $ROUTER_ROLE in
+        "HQ-RTR")
+            suggested_gre_ip="10.10.0.1/30"
+            suggested_gre_network="10.10.0.0/30"
+            echo "  Подсказка: Для HQ-RTR обычно используется 10.10.0.1/30"
+            ;;
+        "BR-RTR")
+            suggested_gre_ip="10.10.0.2/30"
+            suggested_gre_network="10.10.0.0/30"
+            echo "  Подсказка: Для BR-RTR обычно используется 10.10.0.2/30"
+            ;;
+    esac
+    
+    read -p "  Внутренний IP GRE туннеля [$suggested_gre_ip]: " input_gre_ip
+    GRE_IP="${input_gre_ip:-$suggested_gre_ip}"
+    
+    # Извлекаем сеть из IP
+    if [[ "$GRE_IP" =~ / ]]; then
+        GRE_NETWORK=$(echo "$GRE_IP" | sed 's/\([0-9]*\)\.\([0-9]*\)\.\([0-9]*\)\..*/\1.\2.\3.0\/30/')
+    else
+        GRE_NETWORK="${suggested_gre_network}"
+    fi
+    
+    echo ""
+    print_menu "Шаг 5: Ключ GRE туннеля (опционально)"
+    echo "  Ключ обеспечивает дополнительную защиту туннеля"
+    read -p "  Ключ туннеля (оставьте пустым если не требуется): " GRE_KEY
+    
+    # Подтверждение
+    echo ""
+    print_section "Параметры GRE туннеля"
+    echo -e "${CYAN}"
+    echo "┌─────────────────────────────────────────────────────────────────┐"
+    echo "│                    КОНФИГУРАЦИЯ GRE ТУННЕЛЯ                     │"
+    echo "├─────────────────────────────────────────────────────────────────┤"
+    printf "│ %-30s │ %-30s │\n" "Имя интерфейса" "$GRE_INTERFACE"
+    printf "│ %-30s │ %-30s │\n" "Локальный внешний IP" "$GRE_LOCAL_IP"
+    printf "│ %-30s │ %-30s │\n" "Удалённый внешний IP" "$GRE_REMOTE_IP"
+    printf "│ %-30s │ %-30s │\n" "Внутренний IP туннеля" "$GRE_IP"
+    printf "│ %-30s │ %-30s │\n" "Ключ туннеля" "${GRE_KEY:-не задан}"
+    echo "└─────────────────────────────────────────────────────────────────┘"
+    echo -e "${NC}"
+    
+    read -p "Создать GRE туннель с этими параметрами? (y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        print_warning "Создание GRE туннеля отменено"
+        return 1
+    fi
+    
+    # Создание туннеля
+    create_gre_tunnel
+    
+    return $?
+}
+
+create_gre_tunnel() {
+    print_section "Создание GRE туннеля"
+    
+    print_info "Создание интерфейса $GRE_INTERFACE..."
+    
+    # Метод 1: Через ip command (временно, до перезагрузки)
+    local ip_cmd="ip tunnel add $GRE_INTERFACE mode gre local $GRE_LOCAL_IP remote $GRE_REMOTE_IP"
+    if [[ -n "$GRE_KEY" ]]; then
+        ip_cmd+=" key $GRE_KEY"
+    fi
+    
+    if eval "$ip_cmd"; then
+        print_success "GRE интерфейс создан"
+    else
+        print_error "Не удалось создать GRE интерфейс"
+        return 1
+    fi
+    
+    # Устанавливаем IP адрес
+    print_info "Настройка IP адреса..."
+    ip addr add "$GRE_IP" dev "$GRE_INTERFACE"
+    ip link set "$GRE_INTERFACE" up
+    
+    if check_gre_exists "$GRE_INTERFACE"; then
+        print_success "GRE туннель активирован"
+        
+        # Показать статус
+        ip addr show "$GRE_INTERFACE"
+    else
+        print_error "Не удалось активировать GRE туннель"
+        return 1
+    fi
+    
+    # Метод 2: Постоянная конфигурация через /etc/net/interfaces
+    print_info "Создание постоянной конфигурации..."
+    create_gre_permanent_config
+    
+    log_message "GRE туннель создан: $GRE_INTERFACE"
+    CREATE_GRE=true
+    
+    return 0
+}
+
+create_gre_permanent_config() {
+    # Резервное копирование
+    cp "$INTERFACES_FILE" "${INTERFACES_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+    
+    # Формируем конфигурацию для ALT Linux /etc/net/interfaces
+    local gre_config="
+# GRE Tunnel - added by ospf-setup script
+iface $GRE_INTERFACE inet static
+    address ${GRE_IP%/*}
+    netmask 255.255.255.252
+    pre-up ip tunnel add $GRE_INTERFACE mode gre local $GRE_LOCAL_IP remote $GRE_REMOTE_IP"
+    
+    if [[ -n "$GRE_KEY" ]]; then
+        gre_config+=" key $GRE_KEY"
+    fi
+    
+    gre_config+="
+    post-down ip tunnel del $GRE_INTERFACE
+"
+    
+    # Добавляем в файл
+    echo "$gre_config" >> "$INTERFACES_FILE"
+    
+    print_success "Постоянная конфигурация добавлена в $INTERFACES_FILE"
+    
+    # Также создаём systemd сервис для восстановления после перезагрузки
+    create_gre_systemd_service
+}
+
+create_gre_systemd_service() {
+    local service_file="/etc/systemd/system/gre-tunnel.service"
+    
+    cat > "$service_file" << EOF
+[Unit]
+Description=GRE Tunnel $GRE_INTERFACE
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/ip tunnel add $GRE_INTERFACE mode gre local $GRE_LOCAL_IP remote $GRE_REMOTE_IP ${GRE_KEY:+key $GRE_KEY}
+ExecStart=/usr/bin/ip addr add $GRE_IP dev $GRE_INTERFACE
+ExecStart=/usr/bin/ip link set $GRE_INTERFACE up
+ExecStop=/usr/bin/ip tunnel del $GRE_INTERFACE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable gre-tunnel.service
+    
+    print_success "Systemd сервис для GRE туннеля создан и включён"
+}
+
+select_gre_interface() {
+    print_section "Выбор GRE туннеля"
+    
+    # Автоматический поиск GRE интерфейса
+    local auto_gre=$(find_gre_interface)
+    
+    if [[ -n "$auto_gre" ]]; then
+        print_success "Обнаружен существующий GRE интерфейс: $auto_gre"
+        GRE_INTERFACE="$auto_gre"
+        GRE_IP=$(get_interface_ip "$GRE_INTERFACE")
+        GRE_NETWORK=$(get_interface_network "$GRE_INTERFACE")
+        
+        echo -e "\nДетали GRE туннеля:"
+        echo "  Интерфейс: $GRE_INTERFACE"
+        echo "  IP-адрес: $GRE_IP"
+        echo "  Сеть: $GRE_NETWORK"
+        
+        read -p "Использовать этот интерфейс? (y/n) [y]: " use_auto
+        [[ "$use_auto" == "" ]] && use_auto="y"
+        
+        if [[ "$use_auto" == "y" || "$use_auto" == "Y" ]]; then
+            print_success "Выбран GRE интерфейс: $GRE_INTERFACE"
+            CREATE_GRE=false
+            return 0
+        fi
+    fi
+    
+    # GRE не найден - предлагаем создать
+    print_warning "GRE интерфейс не обнаружен"
+    echo ""
+    echo "Доступные действия:"
+    echo "  1) Создать новый GRE туннель"
+    echo "  2) Указать имя существующего интерфейса вручную"
+    echo "  3) Отмена"
+    echo ""
+    
+    read -p "Выберите действие [1]: " action
+    [[ "$action" == "" ]] && action="1"
+    
+    case $action in
+        1)
+            create_gre_tunnel_interactive
+            return $?
+            ;;
+        2)
+            read -p "Введите имя интерфейса (например, gre1): " GRE_INTERFACE
+            if check_gre_exists "$GRE_INTERFACE"; then
+                GRE_IP=$(get_interface_ip "$GRE_INTERFACE")
+                GRE_NETWORK=$(get_interface_network "$GRE_INTERFACE")
+                print_success "Выбран интерфейс: $GRE_INTERFACE"
+                CREATE_GRE=false
+                return 0
+            else
+                print_error "Интерфейс $GRE_INTERFACE не существует"
+                return 1
+            fi
+            ;;
+        3)
+            print_warning "Отмена настройки"
+            exit 0
+            ;;
+        *)
+            print_error "Неверный выбор"
+            return 1
+            ;;
+    esac
 }
 
 #===============================================================================
@@ -173,7 +500,9 @@ select_router_role() {
     
     local valid_choice=false
     while [[ "$valid_choice" == false ]]; do
-        read -p "Ваш выбор [1/2]: " role_choice
+        read -p "Ваш выбор [1]: " role_choice
+        [[ "$role_choice" == "" ]] && role_choice="1"
+        
         case $role_choice in
             1)
                 ROUTER_ROLE="HQ-RTR"
@@ -193,56 +522,6 @@ select_router_role() {
     log_message "Выбрана роль: $ROUTER_ROLE"
 }
 
-select_gre_interface() {
-    print_section "Выбор GRE туннеля"
-    
-    # Автоматический поиск GRE интерфейса
-    local auto_gre=$(find_gre_interface)
-    
-    if [[ -n "$auto_gre" ]]; then
-        print_info "Автоматически обнаружен GRE интерфейс: $auto_gre"
-        GRE_INTERFACE="$auto_gre"
-        GRE_IP=$(get_interface_ip "$GRE_INTERFACE")
-        GRE_NETWORK=$(get_interface_network "$GRE_INTERFACE")
-        
-        echo -e "\nДетали GRE туннеля:"
-        echo "  Интерфейс: $GRE_INTERFACE"
-        echo "  IP-адрес: $GRE_IP"
-        echo "  Сеть: $GRE_NETWORK"
-        
-        read -p "Использовать этот интерфейс? (y/n) [y]: " use_auto
-        [[ "$use_auto" == "" ]] && use_auto="y"
-        
-        if [[ "$use_auto" == "y" || "$use_auto" == "Y" ]]; then
-            print_success "Выбран GRE интерфейс: $GRE_INTERFACE"
-            return 0
-        fi
-    fi
-    
-    # Ручной выбор
-    print_info "Доступные интерфейсы:"
-    local interfaces=($(get_all_interfaces))
-    local i=1
-    for iface in "${interfaces[@]}"; do
-        local ip=$(get_interface_ip "$iface")
-        [[ -n "$ip" ]] && echo "  $i) $iface ($ip)"
-        ((i++))
-    done
-    
-    echo ""
-    read -p "Введите имя GRE интерфейса (например, gre1): " GRE_INTERFACE
-    
-    GRE_IP=$(get_interface_ip "$GRE_INTERFACE")
-    GRE_NETWORK=$(get_interface_network "$GRE_INTERFACE")
-    
-    if [[ -z "$GRE_IP" ]]; then
-        print_error "Не удалось получить IP для интерфейса $GRE_INTERFACE"
-        return 1
-    fi
-    
-    print_success "Выбран GRE интерфейс: $GRE_INTERFACE ($GRE_IP)"
-}
-
 select_networks() {
     print_section "Выбор сетей для OSPF"
     print_info "Выберите сети, которые будут анонсироваться через OSPF"
@@ -252,7 +531,6 @@ select_networks() {
     NETWORKS=()
     local interfaces=($(get_all_interfaces))
     
-    # Автоматически определяем сети на основе роли
     echo "Доступные сети:"
     echo "────────────────────────────────────────────────────────────────────"
     
@@ -282,8 +560,6 @@ select_networks() {
         # Автоматически выбираем все сети кроме внешних
         for net_info in "${network_list[@]}"; do
             local network=$(echo "$net_info" | cut -d'|' -f1)
-            # Исключаем сети 172.16.0.0/12 и 10.0.0.0/8 если это внешние
-            # Но включаем внутренние сети
             NETWORKS+=("$network")
         done
         print_success "Автоматически выбраны сети: ${NETWORKS[*]}"
@@ -322,9 +598,8 @@ select_networks() {
 select_router_id() {
     print_section "Настройка Router ID"
     
-    # Предлагаем IP GRE туннеля как Router ID
-    local suggested_id=$(echo "$GRE_IP" | awk -F. '{print $1"."$2"."$3"."1}')
-    
+    # Предлагаем IP на основе роли
+    local suggested_id=""
     case $ROUTER_ROLE in
         "HQ-RTR")
             suggested_id="172.16.1.1"
@@ -356,7 +631,7 @@ select_ospf_password() {
 }
 
 #===============================================================================
-# Функции установки и настройки
+# Функции установки и настройки FRR
 #===============================================================================
 
 install_frr() {
@@ -527,6 +802,10 @@ Router ID: $ROUTER_ID
 Интерфейс GRE: $GRE_INTERFACE
 IP-адрес GRE: $GRE_IP
 Сеть GRE туннеля: $GRE_NETWORK
+Локальный внешний IP: ${GRE_LOCAL_IP:-N/A}
+Удалённый внешний IP: ${GRE_REMOTE_IP:-N/A}
+Ключ туннеля: ${GRE_KEY:-не задан}
+GRE создан скриптом: $CREATE_GRE
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 3. НАСТРОЙКА OSPF
@@ -749,6 +1028,12 @@ generate_html_report() {
             <div class="info-value">$GRE_IP</div>
             <div class="info-label">Сеть туннеля:</div>
             <div class="info-value">$GRE_NETWORK</div>
+            <div class="info-label">Локальный внешний IP:</div>
+            <div class="info-value">${GRE_LOCAL_IP:-N/A}</div>
+            <div class="info-label">Удалённый внешний IP:</div>
+            <div class="info-value">${GRE_REMOTE_IP:-N/A}</div>
+            <div class="info-label">Ключ туннеля:</div>
+            <div class="info-value">${GRE_KEY:-не задан}</div>
         </div>
     </div>
     
@@ -826,7 +1111,7 @@ EOF
 }
 
 #===============================================================================
-# Основная функция
+# Отображение сводки
 #===============================================================================
 
 show_summary() {
@@ -840,6 +1125,9 @@ show_summary() {
     printf "│ %-30s │ %-30s │\n" "Router ID" "$ROUTER_ID"
     printf "│ %-30s │ %-30s │\n" "GRE интерфейс" "$GRE_INTERFACE"
     printf "│ %-30s │ %-30s │\n" "GRE IP-адрес" "$GRE_IP"
+    printf "│ %-30s │ %-30s │\n" "Локальный внешний IP" "${GRE_LOCAL_IP:-существует}"
+    printf "│ %-30s │ %-30s │\n" "Удалённый внешний IP" "${GRE_REMOTE_IP:-существует}"
+    printf "│ %-30s │ %-30s │\n" "Ключ GRE туннеля" "${GRE_KEY:-не задан}"
     printf "│ %-30s │ %-30s │\n" "Пароль OSPF" "$OSPF_PASSWORD"
     printf "│ %-30s │ %-30s │\n" "Количество сетей" "${#NETWORKS[@]}"
     echo "├─────────────────────────────────────────────────────────────────┤"
@@ -861,6 +1149,10 @@ confirm_and_apply() {
     fi
 }
 
+#===============================================================================
+# Основная функция
+#===============================================================================
+
 main() {
     # Инициализация
     print_header
@@ -872,7 +1164,7 @@ main() {
     
     # Интерактивный выбор параметров
     select_router_role
-    select_gre_interface
+    select_gre_interface  # Включает создание GRE если не существует
     select_networks
     select_router_id
     select_ospf_password
@@ -915,6 +1207,7 @@ main() {
     echo "  vtysh -c 'show ip ospf neighbor'   # Соседи OSPF"
     echo "  vtysh -c 'show ip ospf route'      # Маршруты OSPF"
     echo "  vtysh -c 'show ip route ospf'      # Таблица маршрутизации"
+    echo "  ip tunnel show                     # Статус GRE туннеля"
 }
 
 #===============================================================================
@@ -922,3 +1215,4 @@ main() {
 #===============================================================================
 
 main "$@"
+
