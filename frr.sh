@@ -2,612 +2,509 @@
 
 #==============================================================================
 # Скрипт для настройки OSPF на GRE туннеле
-# Оптимизирован для ALT Linux
-# Версия: 2.0
+# Для ALT Linux
+# Версия: 2.1
 #==============================================================================
 
-set -o pipefail
-
-#--- Конфигурация -------------------------------------------------------------
+# Файл отчета
 REPORT_FILE="/root/ospf_setup_report_$(date +%Y%m%d_%H%M%S).txt"
-LOG_FILE="/var/log/ospf_setup.log"
-FRR_DAEMONS_FILE="/etc/frr/daemons"
-FRR_CONF_FILE="/etc/frr/frr.conf"
 
-# Цветовые коды для вывода
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly CYAN='\033[0;36m'
-readonly NC='\033[0m' # No Color
-readonly BOLD='\033[1m'
-
-#--- Функции ------------------------------------------------------------------
-
-# Вывод с цветом и запись в отчет
-log() {
-    local level="$1"
-    shift
-    local message="$*"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
-    case "$level" in
-        INFO)  echo -e "${GREEN}[INFO]${NC} $message" ;;
-        WARN)  echo -e "${YELLOW}[WARN]${NC} $message" ;;
-        ERROR) echo -e "${RED}[ERROR]${NC} $message" ;;
-        STEP)  echo -e "\n${BOLD}${BLUE}=== $message ===${NC}" ;;
-        *)     echo -e "$message" ;;
-    esac
-    
-    # Запись в отчет (без цветовых кодов)
-    echo "[$timestamp] [$level] $message" >> "$REPORT_FILE"
-}
-
-# Вывод разделителя
-print_separator() {
-    echo "----------------------------------------" | tee -a "$REPORT_FILE"
-}
-
-# Проверка успешности выполнения команды
-check_command() {
-    if [ $? -ne 0 ]; then
-        log ERROR "$1"
-        return 1
-    fi
-    return 0
-}
-
-# Безопасное получение IP адреса интерфейса
-get_interface_ip() {
-    local iface="$1"
-    local ip=""
-    
-    # Метод 1: через ip command (стандартный)
-    ip=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1 | head -1)
-    
-    if [ -n "$ip" ]; then
-        echo "$ip"
-        return 0
-    fi
-    
-    # Метод 2: через ifconfig (альтернатива)
-    if command -v ifconfig &>/dev/null; then
-        ip=$(ifconfig "$iface" 2>/dev/null | awk '/inet / {print $2}' | head -1)
-        if [ -n "$ip" ]; then
-            echo "$ip"
-            return 0
-        fi
-    fi
-    
-    return 1
-}
-
-# Получение основного IP адреса системы
-get_main_ip() {
-    local ip=""
-    
-    # Список интерфейсов для проверки (приоритетный порядок)
-    local interfaces=("ens33" "ens192" "eth0" "enp0s3" "enp1s0" "ens3" "ens4")
-    
-    for iface in "${interfaces[@]}"; do
-        ip=$(get_interface_ip "$iface")
-        if [ -n "$ip" ]; then
-            echo "$ip:$iface"
-            return 0
-        fi
-    done
-    
-    # Если ни один из известных интерфейсов не найден, ищем любой с IP
-    ip=$(ip -4 addr show | awk '/inet / && !/127.0.0.1/ {print $2}' | cut -d'/' -f1 | head -1)
-    local iface=$(ip -4 addr show | awk '/inet / && !/127.0.0.1/ {print $NF}' | head -1)
-    
-    if [ -n "$ip" ]; then
-        echo "$ip:$iface"
-        return 0
-    fi
-    
-    return 1
-}
-
-# Проверка существования интерфейса
-interface_exists() {
-    ip link show "$1" &>/dev/null
-}
-
-# Определение дистрибутива Linux
-detect_distro() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "$ID"
-    elif [ -f /etc/altlinux-release ]; then
-        echo "altlinux"
-    elif [ -f /etc/redhat-release ]; then
-        echo "rhel"
-    elif [ -f /etc/debian_version ]; then
-        echo "debian"
-    else
-        echo "unknown"
-    fi
-}
-
-# Установка пакета в зависимости от дистрибутива
-install_package() {
-    local package="$1"
-    local distro=$(detect_distro)
-    
-    log INFO "Установка пакета $package (дистрибутив: $distro)"
-    
-    case "$distro" in
-        altlinux|alt)
-            apt-get update >> "$REPORT_FILE" 2>&1
-            apt-get install -y "$package" >> "$REPORT_FILE" 2>&1
-            ;;
-        debian|ubuntu)
-            apt-get update >> "$REPORT_FILE" 2>&1
-            apt-get install -y "$package" >> "$REPORT_FILE" 2>&1
-            ;;
-        rhel|centos|fedora)
-            yum install -y "$package" >> "$REPORT_FILE" 2>&1
-            ;;
-        *)
-            log WARN "Неизвестный дистрибутив, пробуем apt-get"
-            apt-get update >> "$REPORT_FILE" 2>&1
-            apt-get install -y "$package" >> "$REPORT_FILE" 2>&1
-            ;;
-    esac
-    
-    return $?
-}
-
-# Проверка и создание директории
-ensure_directory() {
-    local dir="$1"
-    if [ ! -d "$dir" ]; then
-        mkdir -p "$dir"
-        log INFO "Создана директория: $dir"
-    fi
-}
-
-# Валидация IP адреса
-validate_ip() {
-    local ip="$1"
-    local regex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-    
-    if [[ $ip =~ $regex ]]; then
-        local IFS='.'
-        read -ra octets <<< "$ip"
-        for octet in "${octets[@]}"; do
-            if [ "$octet" -gt 255 ]; then
-                return 1
-            fi
-        done
-        return 0
-    fi
-    return 1
-}
-
-# Валидация сети (CIDR)
-validate_network() {
-    local network="$1"
-    local regex='^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
-    
-    if [[ $network =~ $regex ]]; then
-        local ip="${network%/*}"
-        local prefix="${network#*/}"
-        
-        if validate_ip "$ip" && [ "$prefix" -le 32 ]; then
-            return 0
-        fi
-    fi
-    return 1
-}
-
-# Ввод пароля с подтверждением
-read_password() {
-    local prompt="$1"
-    local var_name="$2"
-    local password=""
-    local confirm=""
-    
-    while true; do
-        read -s -p "$prompt" password
-        echo
-        read -s -p "Подтвердите пароль: " confirm
-        echo
-        
-        if [ "$password" = "$confirm" ]; then
-            if [ -z "$password" ]; then
-                echo -e "${YELLOW}ВНИМАНИЕ: Пароль пустой. Использовать пароль по умолчанию P@ssw0rd? (y/n)${NC}"
-                read -r use_default
-                if [ "$use_default" = "y" ] || [ "$use_default" = "Y" ]; then
-                    password="P@ssw0rd"
-                else
-                    continue
-                fi
-            fi
-            eval "$var_name='$password'"
-            return 0
-        else
-            echo -e "${RED}Пароли не совпадают. Попробуйте снова.${NC}"
-        fi
-    done
-}
-
-# Проверка статуса сервиса
-check_service_status() {
-    local service="$1"
-    local status
-    
-    if systemctl is-active --quiet "$service" 2>/dev/null; then
-        status="running"
-    else
-        status="stopped"
-    fi
-    
-    echo "$status"
-}
-
-# Перезапуск сервиса с проверкой
-restart_service() {
-    local service="$1"
-    
-    log INFO "Перезапуск сервиса $service..."
-    
-    systemctl enable "$service" >> "$REPORT_FILE" 2>&1
-    systemctl restart "$service" >> "$REPORT_FILE" 2>&1
-    
-    sleep 2
-    
-    if [ "$(check_service_status "$service")" = "running" ]; then
-        log INFO "Сервис $service успешно запущен"
-        return 0
-    else
-        log ERROR "Не удалось запустить сервис $service"
-        return 1
-    fi
-}
-
-#--- Основная логика ----------------------------------------------------------
-
-# Проверка прав root
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}ОШИБКА: Скрипт должен быть запущен от root${NC}"
-    exit 1
-fi
-
-# Инициализация отчета
+# Начало отчета
 {
     echo "============================================="
     echo "ОТЧЕТ ПО НАСТРОЙКЕ OSPF НА GRE ТУННЕЛЕ"
     echo "============================================="
     echo "Дата: $(date)"
     echo "Хост: $(hostname)"
-    echo "Дистрибутив: $(detect_distro)"
-    echo "Версия скрипта: 2.0"
     echo "============================================="
     echo ""
 } > "$REPORT_FILE"
 
-# Создаем директорию для логов
-ensure_directory "/var/log"
+# Функция для вывода и записи в отчет
+log() {
+    echo "$1"
+    echo "$1" >> "$REPORT_FILE"
+}
 
-log STEP "ШАГ 1: Определение сетевых параметров"
-print_separator
+# Функция для вывода команды и её результата
+run_cmd() {
+    local cmd="$1"
+    log ""
+    log "ВЫПОЛНЯЕТСЯ: $cmd"
+    log "----------------------------------------"
+    eval "$cmd" 2>&1 | tee -a "$REPORT_FILE"
+    local exit_code=${PIPESTATUS[0]}
+    if [ $exit_code -ne 0 ]; then
+        log "КОМАНДА ЗАВЕРШИЛАСЬ С ОШИБКОЙ (код: $exit_code)"
+    else
+        log "КОМАНДА ВЫПОЛНЕНА УСПЕШНО"
+    fi
+    return $exit_code
+}
 
-# Получаем основной IP
-MAIN_INFO=$(get_main_ip)
-if [ -z "$MAIN_INFO" ]; then
-    log ERROR "Не удалось определить основной IP адрес"
+# Проверка прав root
+if [ "$(id -u)" -ne 0 ]; then
+    log "ОШИБКА: Скрипт должен быть запущен от root"
     exit 1
 fi
 
-MAIN_IP="${MAIN_INFO%:*}"
-MAIN_IFACE="${MAIN_INFO#*:}"
-log INFO "Основной IP адрес: $MAIN_IP (интерфейс: $MAIN_IFACE)"
+log ""
+log "============================================="
+log "ШАГ 1: Определение сетевых параметров"
+log "============================================="
+log ""
+
+# Показываем все сетевые интерфейсы
+log "Доступные сетевые интерфейсы:"
+ip link show 2>&1 | tee -a "$REPORT_FILE"
+log ""
+
+# Показываем все IP адреса
+log "Все IP адреса в системе:"
+ip -4 addr show 2>&1 | tee -a "$REPORT_FILE"
+log ""
+
+# Получаем основной IP адрес
+MAIN_IP=""
+MAIN_IFACE=""
+
+# Пробуем разные интерфейсы
+for iface in ens33 ens192 eth0 enp0s3 enp1s0 ens3 ens4 eth1; do
+    if ip link show "$iface" &>/dev/null; then
+        IP_ADDR=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1 | head -1)
+        if [ -n "$IP_ADDR" ]; then
+            MAIN_IP="$IP_ADDR"
+            MAIN_IFACE="$iface"
+            break
+        fi
+    fi
+done
+
+# Если не нашли, берём первый ненулевой
+if [ -z "$MAIN_IP" ]; then
+    MAIN_IP=$(ip -4 addr show 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2}' | cut -d'/' -f1 | head -1)
+    MAIN_IFACE=$(ip -4 addr show 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $NF}' | head -1)
+fi
+
+if [ -z "$MAIN_IP" ]; then
+    log "ОШИБКА: Не удалось определить основной IP адрес"
+    log "Введите IP адрес вручную: "
+    read -r MAIN_IP
+    log "Введите имя интерфейса: "
+    read -r MAIN_IFACE
+fi
+
+log "Основной IP адрес: $MAIN_IP"
+log "Интерфейс: $MAIN_IFACE"
+log ""
 
 # Определяем роль роутера
-log INFO "Определение роли роутера..."
-if [[ $MAIN_IP == 172.16.4.* ]]; then
+log "Определение роли роутера по IP адресу..."
+
+if echo "$MAIN_IP" | grep -q "^172\.16\.4\."; then
     ROLE="HQ-RTR"
     ROUTER_ID="172.16.1.1"
-    REMOTE_NETWORK="192.168.30.0/27"
-    REMOTE_TEST_IP="192.168.30.1"
-    log INFO "Роль роутера: HQ-RTR (Главный офис)"
-elif [[ $MAIN_IP == 172.16.5.* ]]; then
+    log "Определена роль: HQ-RTR (Главный офис)"
+    log "Router ID: $ROUTER_ID"
+elif echo "$MAIN_IP" | grep -q "^172\.16\.5\."; then
     ROLE="BR-RTR"
     ROUTER_ID="172.16.2.1"
-    REMOTE_NETWORK="192.168.10.0/26"
-    REMOTE_TEST_IP="192.168.10.1"
-    log INFO "Роль роутера: BR-RTR (Филиал)"
+    log "Определена роль: BR-RTR (Филиал)"
+    log "Router ID: $ROUTER_ID"
 else
-    log WARN "Не удалось автоматически определить роль роутера"
-    echo -e "${CYAN}Доступные роли:${NC}"
-    echo "  1) HQ-RTR - Главный офис (Router ID: 172.16.1.1)"
-    echo "  2) BR-RTR - Филиал (Router ID: 172.16.2.1)"
-    echo ""
-    read -p "Выберите роль (1 или 2): " role_choice
+    log "Не удалось автоматически определить роль роутера"
+    log "IP адрес $MAIN_IP не соответствует ожидаемым подсетям (172.16.4.x или 172.16.5.x)"
+    log ""
+    log "Выберите роль:"
+    log "  1) HQ-RTR - Главный офис (Router ID: 172.16.1.1)"
+    log "  2) BR-RTR - Филиал (Router ID: 172.16.2.1)"
+    log ""
+    read -p "Введите номер (1 или 2): " role_choice
     
     case "$role_choice" in
         1)
             ROLE="HQ-RTR"
             ROUTER_ID="172.16.1.1"
-            REMOTE_NETWORK="192.168.30.0/27"
-            REMOTE_TEST_IP="192.168.30.1"
             ;;
         2)
             ROLE="BR-RTR"
             ROUTER_ID="172.16.2.1"
-            REMOTE_NETWORK="192.168.10.0/26"
-            REMOTE_TEST_IP="192.168.10.1"
             ;;
         *)
-            log ERROR "Неверный выбор роли"
+            log "ОШИБКА: Неверный выбор"
             exit 1
             ;;
     esac
+    log "Выбрана роль: $ROLE"
+    log "Router ID: $ROUTER_ID"
 fi
 
-log INFO "Router ID: $ROUTER_ID"
+log ""
+log "============================================="
+log "ШАГ 2: Проверка GRE туннеля"
+log "============================================="
+log ""
 
-# Получаем IP адрес туннеля
-log INFO "Проверка интерфейса GRE туннеля..."
+# Показываем все туннельные интерфейсы
+log "Поиск туннельных интерфейсов..."
+ip link show 2>&1 | grep -E "(gre|tun|tap)" | tee -a "$REPORT_FILE"
+log ""
 
-TUNNEL_IP=""
+# Ищем gre1 или другой туннель
 TUNNEL_IFACE=""
+TUNNEL_IP=""
 
-# Проверяем наличие gre1
-if interface_exists "gre1"; then
+# Проверяем gre1
+if ip link show gre1 &>/dev/null; then
     TUNNEL_IFACE="gre1"
-    TUNNEL_IP=$(get_interface_ip "gre1")
-    log INFO "Найден интерфейс gre1"
-elif interface_exists "tun0"; then
-    TUNNEL_IFACE="tun0"
-    TUNNEL_IP=$(get_interface_ip "tun0")
-    log INFO "Найден интерфейс tun0"
-else
-    log WARN "Интерфейс GRE туннеля не найден"
-    echo ""
-    echo -e "${CYAN}Доступные интерфейсы:${NC}"
-    ip link show | awk -F': ' '/^[0-9]/ {print "  " $2}'
-    echo ""
-    read -p "Введите имя интерфейса туннеля: " TUNNEL_IFACE
+    TUNNEL_IP=$(ip -4 addr show gre1 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1 | head -1)
+    log "Найден интерфейс gre1"
+fi
+
+# Если gre1 нет, проверяем другие
+if [ -z "$TUNNEL_IFACE" ]; then
+    for tiface in gre0 gre1 tun0 tun1 tap0; do
+        if ip link show "$tiface" &>/dev/null; then
+            IP_TMP=$(ip -4 addr show "$tiface" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1 | head -1)
+            if [ -n "$IP_TMP" ]; then
+                TUNNEL_IFACE="$tiface"
+                TUNNEL_IP="$IP_TMP"
+                log "Найден туннельный интерфейс: $TUNNEL_IFACE"
+                break
+            fi
+        fi
+    done
+fi
+
+# Показываем детали туннеля
+if [ -n "$TUNNEL_IFACE" ]; then
+    log ""
+    log "Детали интерфейса $TUNNEL_IFACE:"
+    ip addr show "$TUNNEL_IFACE" 2>&1 | tee -a "$REPORT_FILE"
+    log ""
+    log "Статистика интерфейса $TUNNEL_IFACE:"
+    ip -s link show "$TUNNEL_IFACE" 2>&1 | tee -a "$REPORT_FILE"
+fi
+
+if [ -z "$TUNNEL_IFACE" ]; then
+    log "ВНИМАНИЕ: Туннельный интерфейс не найден автоматически"
+    log ""
+    log "Список всех интерфейсов:"
+    ip link show 2>&1 | awk '/^[0-9]/ {print "  " $2}' | tr -d ':' | tee -a "$REPORT_FILE"
+    log ""
+    read -p "Введите имя туннельного интерфейса: " TUNNEL_IFACE
     
-    if ! interface_exists "$TUNNEL_IFACE"; then
-        log ERROR "Интерфейс $TUNNEL_IFACE не существует"
+    if ! ip link show "$TUNNEL_IFACE" &>/dev/null; then
+        log "ОШИБКА: Интерфейс $TUNNEL_IFACE не существует"
         exit 1
     fi
     
-    TUNNEL_IP=$(get_interface_ip "$TUNNEL_IFACE")
+    TUNNEL_IP=$(ip -4 addr show "$TUNNEL_IFACE" 2>/dev/null | awk '/inet / {print $2}' | cut -d'/' -f1 | head -1)
 fi
 
 if [ -z "$TUNNEL_IP" ]; then
-    log WARN "Не удалось автоматически определить IP туннеля"
+    log "ВНИМАНИЕ: Не удалось определить IP адрес туннеля"
     read -p "Введите IP адрес туннеля (например 10.10.0.1): " TUNNEL_IP
+fi
+
+log ""
+log "Интерфейс туннеля: $TUNNEL_IFACE"
+log "IP адрес туннеля: $TUNNEL_IP"
+
+log ""
+log "============================================="
+log "ШАГ 3: Определение сетей для анонсирования"
+log "============================================="
+log ""
+
+# Показываем таблицу маршрутизации
+log "Текущая таблица маршрутизации:"
+ip route show 2>&1 | tee -a "$REPORT_FILE"
+log ""
+
+# Определяем сети на основе роли
+declare -a NETWORKS
+
+if [ "$ROLE" = "HQ-RTR" ]; then
+    log "Поиск сетей главного офиса..."
     
-    if ! validate_ip "$TUNNEL_IP"; then
-        log ERROR "Неверный формат IP адреса"
-        exit 1
+    # Проверяем сети HQ-RTR
+    if ip route show | grep -q "192.168.10.0"; then
+        NETWORKS+=("192.168.10.0/26")
+        log "Найдена сеть: 192.168.10.0/26 (HQ-LAN-1)"
+    fi
+    if ip route show | grep -q "192.168.20.0"; then
+        NETWORKS+=("192.168.20.0/28")
+        log "Найдена сеть: 192.168.20.0/28 (HQ-LAN-2)"
+    fi
+    if ip route show | grep -q "192.168.100.0"; then
+        NETWORKS+=("192.168.100.0/24")
+        log "Найдена сеть: 192.168.100.0/24 (HQ-MGMT)"
+    fi
+else
+    log "Поиск сетей филиала..."
+    
+    # Проверяем сети BR-RTR
+    if ip route show | grep -q "192.168.30.0"; then
+        NETWORKS+=("192.168.30.0/27")
+        log "Найдена сеть: 192.168.30.0/27 (BR-LAN)"
+    fi
+    if ip route show | grep -q "192.168.200.0"; then
+        NETWORKS+=("192.168.200.0/24")
+        log "Найдена сеть: 192.168.200.0/24 (BR-MGMT)"
     fi
 fi
 
-log INFO "IP адрес туннеля ($TUNNEL_IFACE): $TUNNEL_IP"
-
-# Определяем сеть туннеля
-TUNNEL_NETWORK="10.10.0.0/30"
-
-log STEP "ШАГ 2: Определение локальных сетей"
-print_separator
-
-declare -a NETWORKS=()
-
-# Автоматическое определение сетей на основе роли
-if [ "$ROLE" = "HQ-RTR" ]; then
-    log INFO "Поиск сетей главного офиса..."
-    
-    # Список сетей для проверки
-    declare -a hq_networks=(
-        "192.168.10.0/26:Сеть HQ-LAN-1"
-        "192.168.20.0/28:Сеть HQ-LAN-2"
-        "192.168.100.0/24:Сеть HQ-MGMT"
-    )
-    
-    for net_info in "${hq_networks[@]}"; do
-        net="${net_info%:*}"
-        desc="${net_info#*:}"
-        if ip route show | grep -q "$net"; then
-            NETWORKS+=("$net")
-            log INFO "Найдена сеть: $net ($desc)"
-        fi
-    done
-else
-    log INFO "Поиск сетей филиала..."
-    
-    # Список сетей для проверки
-    declare -a br_networks=(
-        "192.168.30.0/27:Сеть BR-LAN"
-        "192.168.200.0/24:Сеть BR-MGMT"
-    )
-    
-    for net_info in "${br_networks[@]}"; do
-        net="${net_info%:*}"
-        desc="${net_info#*:}"
-        if ip route show | grep -q "$net"; then
-            NETWORKS+=("$net")
-            log INFO "Найдена сеть: $net ($desc)"
-        fi
-    done
-fi
-
 # Добавляем сеть туннеля
-NETWORKS+=("$TUNNEL_NETWORK")
-log INFO "Добавлена сеть туннеля: $TUNNEL_NETWORK"
+NETWORKS+=("10.10.0.0/30")
+log "Добавлена сеть туннеля: 10.10.0.0/30"
 
-# Показываем найденные сети
-echo ""
-log INFO "Найденные сети для анонсирования:"
+log ""
+log "Найденные сети для анонсирования:"
 for net in "${NETWORKS[@]}"; do
-    echo "  - $net"
+    log "  - $net"
 done
 
-# Запрос на изменение списка сетей
-echo ""
+log ""
 read -p "Хотите изменить список сетей? (y/n): " CHANGE_NETWORKS
 
 if [ "$CHANGE_NETWORKS" = "y" ] || [ "$CHANGE_NETWORKS" = "Y" ]; then
     NETWORKS=()
-    echo ""
-    echo -e "${CYAN}Введите сети для анонсирования (формат: 192.168.1.0/24)"
-    echo "Пустая строка для завершения ввода:${NC}"
+    log "Введите сети для анонсирования (формат: 192.168.1.0/24)"
+    log "Пустая строка для завершения ввода"
+    log ""
     
     while true; do
-        read -p "Сеть: " network
-        if [ -z "$network" ]; then
+        read -p "Сеть: " net
+        if [ -z "$net" ]; then
             break
         fi
-        
-        if validate_network "$network"; then
-            NETWORKS+=("$network")
-            log INFO "Добавлена сеть: $network"
-        else
-            log WARN "Неверный формат сети: $network (используйте формат CIDR, например 192.168.1.0/24)"
-        fi
+        NETWORKS+=("$net")
+        log "Добавлена сеть: $net"
     done
+fi
+
+if [ ${#NETWORKS[@]} -eq 0 ]; then
+    log "ОШИБКА: Список сетей пуст"
+    exit 1
+fi
+
+log ""
+log "Итоговый список сетей для анонсирования:"
+for net in "${NETWORKS[@]}"; do
+    log "  - $net"
+done
+
+log ""
+log "============================================="
+log "ШАГ 4: Настройка пароля OSPF"
+log "============================================="
+log ""
+
+read -s -p "Введите пароль для аутентификации OSPF: " OSPF_PASSWORD
+echo ""
+read -s -p "Подтвердите пароль: " OSPF_PASSWORD_CONFIRM
+echo ""
+
+if [ "$OSPF_PASSWORD" != "$OSPF_PASSWORD_CONFIRM" ]; then
+    log "ОШИБКА: Пароли не совпадают"
+    read -s -p "Введите пароль ещё раз: " OSPF_PASSWORD
+    echo ""
+    read -s -p "Подтвердите пароль: " OSPF_PASSWORD_CONFIRM
+    echo ""
     
-    if [ ${#NETWORKS[@]} -eq 0 ]; then
-        log ERROR "Список сетей пуст"
-        exit 1
+    if [ "$OSPF_PASSWORD" != "$OSPF_PASSWORD_CONFIRM" ]; then
+        log "ОШИБКА: Пароли снова не совпадают. Используется пароль по умолчанию P@ssw0rd"
+        OSPF_PASSWORD="P@ssw0rd"
     fi
 fi
 
-log INFO "Итоговый список сетей для анонсирования:"
-for net in "${NETWORKS[@]}"; do
-    echo "  - $net" | tee -a "$REPORT_FILE"
-done
+if [ -z "$OSPF_PASSWORD" ]; then
+    log "ВНИМАНИЕ: Пароль пустой. Используется пароль по умолчанию P@ssw0rd"
+    OSPF_PASSWORD="P@ssw0rd"
+fi
 
-log STEP "ШАГ 3: Настройка парольной защиты OSPF"
-print_separator
+log "Пароль OSPF установлен"
 
-read_password "Введите пароль для аутентификации OSPF: " OSPF_PASSWORD
-log INFO "Пароль OSPF установлен (значение скрыто для безопасности)"
+log ""
+log "============================================="
+log "ШАГ 5: Установка FRR"
+log "============================================="
+log ""
 
-log STEP "ШАГ 4: Установка и настройка FRR"
-print_separator
-
-# Проверка наличия FRR
-if ! command -v vtysh &>/dev/null; then
-    log INFO "FRR не установлен. Начинаю установку..."
+# Проверяем наличие FRR
+if command -v vtysh &>/dev/null; then
+    log "FRR уже установлен"
+    log "Версия FRR:"
+    vtysh --version 2>&1 | tee -a "$REPORT_FILE"
+else
+    log "FRR не установлен. Начинаю установку..."
     
-    # Определяем имя пакета в зависимости от дистрибутива
-    DISTRO=$(detect_distro)
+    # Определяем дистрибутив
+    if [ -f /etc/altlinux-release ]; then
+        DISTRO="altlinux"
+    elif [ -f /etc/debian_version ]; then
+        DISTRO="debian"
+    elif [ -f /etc/redhat-release ]; then
+        DISTRO="rhel"
+    else
+        DISTRO="unknown"
+    fi
+    
+    log "Определен дистрибутив: $DISTRO"
+    
+    # Установка в зависимости от дистрибутива
     case "$DISTRO" in
-        altlinux|alt)
-            FRR_PACKAGE="frr"
+        altlinux)
+            run_cmd "apt-get update"
+            run_cmd "apt-get install -y frr"
+            ;;
+        debian)
+            run_cmd "apt-get update"
+            run_cmd "apt-get install -y frr"
+            ;;
+        rhel)
+            run_cmd "yum install -y frr"
             ;;
         *)
-            FRR_PACKAGE="frr"
+            log "Неизвестный дистрибутив, пробуем apt-get"
+            run_cmd "apt-get update"
+            run_cmd "apt-get install -y frr"
             ;;
     esac
     
-    install_package "$FRR_PACKAGE"
-    
-    if ! check_command "Не удалось установить FRR"; then
-        log ERROR "Проверьте подключение к репозиториям и повторите попытку"
+    if ! command -v vtysh &>/dev/null; then
+        log "ОШИБКА: Не удалось установить FRR"
         exit 1
     fi
-else
-    log INFO "FRR уже установлен"
+    
+    log "FRR успешно установлен"
 fi
 
-# Проверка и создание файла daemons
-if [ ! -f "$FRR_DAEMONS_FILE" ]; then
-    log WARN "Файл $FRR_DAEMONS_FILE не найден"
-    
-    # Поиск альтернативных путей
-    for alt_path in "/etc/frr/daemons" "/usr/local/etc/frr/daemons" "/etc/daemons"; do
-        if [ -f "$alt_path" ]; then
-            FRR_DAEMONS_FILE="$alt_path"
-            log INFO "Найден файл daemons: $FRR_DAEMONS_FILE"
-            break
-        fi
-    done
-    
-    if [ ! -f "$FRR_DAEMONS_FILE" ]; then
-        log ERROR "Файл конфигурации daemons не найден"
-        exit 1
+log ""
+log "============================================="
+log "ШАГ 6: Настройка демонов FRR"
+log "============================================="
+log ""
+
+# Поиск файла daemons
+DAEMONS_FILE=""
+for f in /etc/frr/daemons /usr/local/etc/frr/daemons /etc/frr/daemons.conf; do
+    if [ -f "$f" ]; then
+        DAEMONS_FILE="$f"
+        break
     fi
+done
+
+if [ -z "$DAEMONS_FILE" ]; then
+    log "ОШИБКА: Файл конфигурации демонов FRR не найден"
+    log "Ищем в системе:"
+    find /etc -name "daemons" 2>/dev/null | tee -a "$REPORT_FILE"
+    find /usr -name "daemons" 2>/dev/null | tee -a "$REPORT_FILE"
+    exit 1
 fi
 
-# Включение ospfd
-log INFO "Включение ospfd в конфигурации FRR..."
+log "Найден файл демонов: $DAEMONS_FILE"
+
+# Показываем текущее содержимое
+log ""
+log "Текущее содержимое $DAEMONS_FILE (строки с ospfd и zebra):"
+grep -E "^(ospfd|zebra|#ospfd|#zebra)=" "$DAEMONS_FILE" 2>&1 | tee -a "$REPORT_FILE"
+log ""
 
 # Резервное копирование
-cp "$FRR_DAEMONS_FILE" "${FRR_DAEMONS_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-log INFO "Создана резервная копия: ${FRR_DAEMONS_FILE}.backup.*"
+BACKUP_FILE="${DAEMONS_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+cp "$DAEMONS_FILE" "$BACKUP_FILE"
+log "Создана резервная копия: $BACKUP_FILE"
 
-# Изменение конфигурации
-if grep -q "^ospfd=" "$FRR_DAEMONS_FILE"; then
-    sed -i 's/^ospfd=no/ospfd=yes/' "$FRR_DAEMONS_FILE"
-    sed -i 's/^ospfd=no/ospfd=yes/' "$FRR_DAEMONS_FILE"
-elif grep -q "^#ospfd=" "$FRR_DAEMONS_FILE"; then
-    sed -i 's/^#ospfd=no/ospfd=yes/' "$FRR_DAEMONS_FILE"
+# Включаем zebra (если выключен)
+if grep -q "^zebra=no" "$DAEMONS_FILE"; then
+    sed -i 's/^zebra=no/zebra=yes/' "$DAEMONS_FILE"
+    log "Включен zebra"
+elif grep -q "^#zebra=no" "$DAEMONS_FILE"; then
+    sed -i 's/^#zebra=no/zebra=yes/' "$DAEMONS_FILE"
+    log "Включен zebra"
+fi
+
+# Включаем ospfd
+if grep -q "^ospfd=no" "$DAEMONS_FILE"; then
+    sed -i 's/^ospfd=no/ospfd=yes/' "$DAEMONS_FILE"
+    log "Включен ospfd"
+elif grep -q "^#ospfd=no" "$DAEMONS_FILE"; then
+    sed -i 's/^#ospfd=no/ospfd=yes/' "$DAEMONS_FILE"
+    log "Включен ospfd"
+elif grep -q "^ospfd=yes" "$DAEMONS_FILE"; then
+    log "ospfd уже включен"
 else
-    echo "ospfd=yes" >> "$FRR_DAEMONS_FILE"
+    echo "ospfd=yes" >> "$DAEMONS_FILE"
+    log "Добавлена строка ospfd=yes"
 fi
 
-# Проверка изменений
-if grep -q "^ospfd=yes" "$FRR_DAEMONS_FILE"; then
-    log INFO "ospfd успешно включен"
-else
-    log ERROR "Не удалось включить ospfd"
-    exit 1
-fi
+# Показываем измененное содержимое
+log ""
+log "Содержимое $DAEMONS_FILE после изменений (строки с ospfd и zebra):"
+grep -E "^(ospfd|zebra)=" "$DAEMONS_FILE" 2>&1 | tee -a "$REPORT_FILE"
 
-# Запись в отчет
-{
-    echo ""
-    echo "--- КОНФИГУРАЦИЯ DAEMONS ---"
-    grep -E "^(ospfd|zebra)=" "$FRR_DAEMONS_FILE" 2>/dev/null || echo "Не удалось прочитать конфигурацию"
-} >> "$REPORT_FILE"
+log ""
+log "============================================="
+log "ШАГ 7: Запуск сервиса FRR"
+log "============================================="
+log ""
 
-# Запуск FRR
-if ! restart_service "frr"; then
-    log WARN "Пробуем альтернативное имя сервиса..."
-    if ! restart_service "frr.service"; then
-        log ERROR "Не удалось запустить FRR. Проверьте логи: journalctl -xe"
-        exit 1
-    fi
-fi
+# Проверяем статус сервиса
+log "Проверка сервиса FRR..."
+systemctl status frr 2>&1 | head -5 | tee -a "$REPORT_FILE"
 
-# Ожидание инициализации
-log INFO "Ожидание инициализации FRR..."
+log ""
+log "Включение и перезапуск сервиса FRR..."
+systemctl enable frr 2>&1 | tee -a "$REPORT_FILE"
+systemctl restart frr 2>&1 | tee -a "$REPORT_FILE"
+
 sleep 3
 
-log STEP "ШАГ 5: Настройка OSPF через vtysh"
-print_separator
+log ""
+log "Статус сервиса FRR после перезапуска:"
+systemctl status frr 2>&1 | tee -a "$REPORT_FILE"
 
-# Проверка доступности vtysh
-if ! command -v vtysh &>/dev/null; then
-    log ERROR "Команда vtysh не найдена"
-    exit 1
+if ! systemctl is-active --quiet frr; then
+    log "ВНИМАНИЕ: Сервис frr не активен"
+    log "Пробуем альтернативные имена..."
+    
+    for svc in frr.service frr-routing quagga; do
+        if systemctl list-unit-files | grep -q "$svc"; then
+            log "Найден сервис: $svc"
+            systemctl enable "$svc" 2>&1 | tee -a "$REPORT_FILE"
+            systemctl restart "$svc" 2>&1 | tee -a "$REPORT_FILE"
+            sleep 3
+            if systemctl is-active --quiet "$svc"; then
+                log "Сервис $svc успешно запущен"
+                break
+            fi
+        fi
+    done
 fi
 
-# Создаем временный файл с командами
-VTYSH_CMDS=$(mktemp)
-trap "rm -f $VTYSH_CMDS" EXIT
+log ""
+log "============================================="
+log "ШАГ 8: Применение конфигурации OSPF"
+log "============================================="
+log ""
 
-# Формируем команды для vtysh
+# Формируем команды vtysh
+log "Формирование конфигурации OSPF..."
+log ""
+
+VTYSH_CMDS=$(mktemp)
+
 {
     echo "configure terminal"
     echo " router ospf"
     echo "  ospf router-id $ROUTER_ID"
     
-    # Добавляем сети
     for net in "${NETWORKS[@]}"; do
         echo "  network $net area 0"
     done
     
-    # Добавляем аутентификацию
     echo "  area 0 authentication"
     echo " exit"
     echo " interface $TUNNEL_IFACE"
@@ -620,138 +517,158 @@ trap "rm -f $VTYSH_CMDS" EXIT
     echo " write memory"
 } > "$VTYSH_CMDS"
 
-log INFO "Применение конфигурации OSPF..."
+log "Команды для выполнения:"
+log "----------------------------------------"
+cat "$VTYSH_CMDS" | tee -a "$REPORT_FILE"
+log "----------------------------------------"
 
-# Применяем конфигурацию
-if vtysh -f "$VTYSH_CMDS" >> "$REPORT_FILE" 2>&1; then
-    log INFO "Конфигурация OSPF успешно применена"
+log ""
+log "Применение конфигурации через vtysh..."
+vtysh -f "$VTYSH_CMDS" 2>&1 | tee -a "$REPORT_FILE"
+VTYSH_RESULT=$?
+
+rm -f "$VTYSH_CMDS"
+
+if [ $VTYSH_RESULT -ne 0 ]; then
+    log "ОШИБКА: Не удалось применить конфигурацию OSPF"
 else
-    log ERROR "Ошибка при применении конфигурации OSPF"
-    cat "$VTYSH_CMDS" >> "$REPORT_FILE"
-    exit 1
+    log "Конфигурация OSPF успешно применена"
 fi
 
-# Запись конфигурации в отчет
-{
-    echo ""
-    echo "--- ПРИМЕНЕННАЯ КОНФИГУРАЦИЯ OSPF ---"
-    vtysh -c "show running-config" 2>/dev/null | grep -A50 "router ospf" | head -50
-} >> "$REPORT_FILE"
+log ""
+log "============================================="
+log "ШАГ 9: Проверка конфигурации"
+log "============================================="
+log ""
 
-log STEP "ШАГ 6: Проверка конфигурации"
-print_separator
+log "Полная конфигурация FRR (router ospf):"
+log "----------------------------------------"
+vtysh -c "show running-config" 2>&1 | grep -A100 "router ospf" | head -50 | tee -a "$REPORT_FILE"
 
-# Показываем конфигурацию OSPF (без пароля)
-log INFO "Текущая конфигурация OSPF:"
-vtysh -c "show running-config" 2>/dev/null | grep -A30 "router ospf" | grep -v "authentication-key" | while read -r line; do
-    [ -n "$line" ] && echo "  $line"
-done
+log ""
+log "Конфигурация интерфейса $TUNNEL_IFACE:"
+log "----------------------------------------"
+vtysh -c "show running-config" 2>&1 | grep -A20 "interface $TUNNEL_IFACE" | tee -a "$REPORT_FILE"
 
-log INFO "Конфигурация интерфейса $TUNNEL_IFACE:"
-vtysh -c "show running-config" 2>/dev/null | grep -A15 "interface $TUNNEL_IFACE" | grep -v "authentication-key" | while read -r line; do
-    [ -n "$line" ] && echo "  $line"
-done
+log ""
+log "Информация об интерфейсах OSPF:"
+log "----------------------------------------"
+vtysh -c "show ip ospf interface" 2>&1 | tee -a "$REPORT_FILE"
 
-log STEP "ШАГ 7: Проверка соседей OSPF"
-print_separator
+log ""
+log "Общая информация OSPF:"
+log "----------------------------------------"
+vtysh -c "show ip ospf" 2>&1 | tee -a "$REPORT_FILE"
 
-log INFO "Ожидание установки соседства (20 секунд)..."
-for i in {20..1}; do
-    printf "\r%s " "Осталось: $i сек..."
+log ""
+log "============================================="
+log "ШАГ 10: Проверка соседей OSPF"
+log "============================================="
+log ""
+
+log "Ожидание установки соседства (20 секунд)..."
+for i in $(seq 20 -1 1); do
+    printf "\rОсталось: %2d сек... " "$i"
     sleep 1
 done
 echo ""
+log ""
 
-# Проверяем соседей
-log INFO "Проверка соседей OSPF..."
-NEIGHBORS=$(vtysh -c "show ip ospf neighbor" 2>/dev/null)
+log "Список соседей OSPF:"
+log "----------------------------------------"
+vtysh -c "show ip ospf neighbor" 2>&1 | tee -a "$REPORT_FILE"
 
-if [ -n "$NEIGHBORS" ]; then
-    echo "$NEIGHBORS" >> "$REPORT_FILE"
-    
-    log INFO "Соседи OSPF:"
-    echo "$NEIGHBORS" | while read -r line; do
-        [ -n "$line" ] && echo "  $line"
-    done
-    
-    # Проверяем статус
-    if echo "$NEIGHBORS" | grep -q "Full"; then
-        log INFO "СТАТУС: Full/DR или Full/BDR - соседство установлено корректно"
-    else
-        log WARN "СТАТУС: Полное соседство еще не установлено"
-    fi
+log ""
+log "Детальная информация о соседях:"
+log "----------------------------------------"
+vtysh -c "show ip ospf neighbor detail" 2>&1 | tee -a "$REPORT_FILE"
+
+log ""
+log "============================================="
+log "ШАГ 11: Проверка маршрутов OSPF"
+log "============================================="
+log ""
+
+log "Маршруты OSPF:"
+log "----------------------------------------"
+vtysh -c "show ip route ospf" 2>&1 | tee -a "$REPORT_FILE"
+
+log ""
+log "Полная таблица маршрутизации:"
+log "----------------------------------------"
+vtysh -c "show ip route" 2>&1 | tee -a "$REPORT_FILE"
+
+log ""
+log "База данных OSPF:"
+log "----------------------------------------"
+vtysh -c "show ip ospf database" 2>&1 | tee -a "$REPORT_FILE"
+
+log ""
+log "============================================="
+log "ШАГ 12: Проверка связанности"
+log "============================================="
+log ""
+
+# Определяем IP для проверки связи
+if [ "$ROLE" = "HQ-RTR" ]; then
+    TEST_IP="192.168.30.1"
 else
-    log WARN "Соседи OSPF не обнаружены"
-    log INFO "Проверьте:"
-    log INFO "  1. Настроен ли OSPF на удаленном роутере"
-    log INFO "  2. Совпадают ли пароли аутентификации"
-    log INFO "  3. Доступен ли туннель (ping)"
+    TEST_IP="192.168.10.1"
 fi
 
-log STEP "ШАГ 8: Проверка маршрутов OSPF"
-print_separator
+log "Проверка связи с удаленной сетью ($TEST_IP):"
+log "----------------------------------------"
+ping -c 3 "$TEST_IP" 2>&1 | tee -a "$REPORT_FILE"
 
-log INFO "Маршруты OSPF:"
-OSPF_ROUTES=$(vtysh -c "show ip route ospf" 2>/dev/null)
-
-if [ -n "$OSPF_ROUTES" ]; then
-    echo "$OSPF_ROUTES" >> "$REPORT_FILE"
-    echo "$OSPF_ROUTES" | while read -r line; do
-        [ -n "$line" ] && echo "  $line"
-    done
+log ""
+log "Проверка связи через туннель:"
+log "----------------------------------------"
+# Получаем удаленный IP туннеля
+if [ "$TUNNEL_IP" = "10.10.0.1" ]; then
+    REMOTE_TUNNEL="10.10.0.2"
+elif [ "$TUNNEL_IP" = "10.10.0.2" ]; then
+    REMOTE_TUNNEL="10.10.0.1"
 else
-    log WARN "Маршруты OSPF не найдены"
+    REMOTE_TUNNEL="10.10.0.2"
 fi
 
-log STEP "ШАГ 9: Проверка связанности"
-print_separator
+ping -c 3 "$REMOTE_TUNNEL" 2>&1 | tee -a "$REPORT_FILE"
 
-if [ -n "$NEIGHBORS" ] && echo "$NEIGHBORS" | grep -q "Full"; then
-    log INFO "OSPF соседство установлено успешно"
-    
-    log INFO "Проверка связи с удаленной сетью ($REMOTE_TEST_IP)..."
-    
-    if ping -c 3 -W 3 "$REMOTE_TEST_IP" >> "$REPORT_FILE" 2>&1; then
-        log INFO "РЕЗУЛЬТАТ: Связь с $REMOTE_TEST_IP установлена"
-    else
-        log WARN "РЕЗУЛЬТАТ: Нет связи с $REMOTE_TEST_IP"
-        log INFO "Возможно, требуется время для обновления маршрутов"
-    fi
-else
-    log WARN "OSPF соседство не установлено, пропускаем проверку связи"
-fi
+log ""
+log "============================================="
+log "ЗАВЕРШЕНИЕ НАСТРОЙКИ"
+log "============================================="
+log ""
 
-#--- Финальный отчет ----------------------------------------------------------
+log "Итоговая конфигурация:"
+log "  Роль роутера: $ROLE"
+log "  Router ID: $ROUTER_ID"
+log "  Основной интерфейс: $MAIN_IFACE ($MAIN_IP)"
+log "  Интерфейс туннеля: $TUNNEL_IFACE ($TUNNEL_IP)"
+log "  Количество сетей для анонсирования: ${#NETWORKS[@]}"
+log ""
 
-log STEP "ЗАВЕРШЕНИЕ НАСТРОЙКИ"
-print_separator
+log "Сети для анонсирования:"
+for net in "${NETWORKS[@]}"; do
+    log "  - $net"
+done
+log ""
 
-{
-    echo ""
-    echo "============================================="
-    echo "НАСТРОЙКА OSPF ЗАВЕРШЕНА"
-    echo "============================================="
-    echo ""
-    echo "Параметры конфигурации:"
-    echo "  Роль роутера: $ROLE"
-    echo "  Router ID: $ROUTER_ID"
-    echo "  Интерфейс туннеля: $TUNNEL_IFACE"
-    echo "  IP туннеля: $TUNNEL_IP"
-    echo "  Количество сетей: ${#NETWORKS[@]}"
-    echo ""
-    echo "Полезные команды для проверки:"
-    echo "  vtysh -c 'show ip ospf neighbor'     # показать соседей"
-    echo "  vtysh -c 'show ip route ospf'        # показать маршруты OSPF"
-    echo "  vtysh -c 'show running-config'       # показать конфигурацию"
-    echo "  vtysh -c 'show ip ospf interface'    # показать интерфейсы OSPF"
-    echo "  vtysh -c 'show ip ospf database'     # показать базу данных OSPF"
-    echo ""
-    echo "Отчет сохранен в: $REPORT_FILE"
-    echo "============================================="
-} | tee -a "$REPORT_FILE"
+log "Отчет сохранен в: $REPORT_FILE"
+log ""
+
+log "Полезные команды для проверки:"
+log "  vtysh -c 'show ip ospf neighbor'       - показать соседей OSPF"
+log "  vtysh -c 'show ip ospf neighbor detail' - детальная информация о соседях"
+log "  vtysh -c 'show ip route ospf'          - показать маршруты OSPF"
+log "  vtysh -c 'show ip ospf interface'      - показать интерфейсы OSPF"
+log "  vtysh -c 'show ip ospf database'       - показать базу данных OSPF"
+log "  vtysh -c 'show running-config'         - показать полную конфигурацию"
+log "  vtysh -c 'show logging'                - показать логи FRR"
+log "  journalctl -u frr -f                   - логи сервиса FRR"
+log ""
 
 # Запрос на сохранение пароля
-echo ""
 read -p "Сохранить пароль в отдельный файл? (y/n): " SAVE_PASSWORD
 
 if [ "$SAVE_PASSWORD" = "y" ] || [ "$SAVE_PASSWORD" = "Y" ]; then
@@ -768,10 +685,11 @@ if [ "$SAVE_PASSWORD" = "y" ] || [ "$SAVE_PASSWORD" = "Y" ]; then
         echo "============================================="
     } > "$PASSWORD_FILE"
     chmod 600 "$PASSWORD_FILE"
-    log INFO "Пароль сохранен в: $PASSWORD_FILE (права: 600)"
+    log "Пароль сохранен в: $PASSWORD_FILE"
 fi
 
-echo ""
-log INFO "Для просмотра полного отчета: cat $REPORT_FILE"
+log ""
+log "Для просмотра полного отчета: cat $REPORT_FILE"
+log ""
 
 exit 0
