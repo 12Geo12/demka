@@ -1,520 +1,618 @@
 #!/bin/bash
+#===============================================================================
+# Скрипт автоматической настройки GRE туннеля и OSPF
+# Для маршрутизаторов HQ-RTR и BR-RTR
+# Поддержка: Alt Linux / ОС на базе /etc/net/ifaces/
+#===============================================================================
 
-# Скрипт настройки GRE туннеля и OSPF для ALT Linux
-# Версия: 3.1 (исправленная)
-
-set -e
-
-# Цвета
+# Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
-REPORT_FILE="/root/network_setup_$(date +%Y%m%d_%H%M%S).log"
-BACKUP_DIR=""
+# Лог-файл
+LOG_FILE="/var/log/gre-ospf-setup.log"
 
-# Глобальные переменные
-MAIN_IF=""
-MAIN_IP=""
-ROUTER_ROLE=""
-TUN_LOCAL=""
-TUN_REMOTE=""
-TUNNEL_IP=""
-REMOTE_TUN=""
-TUNNEL_NET=""
-declare -a LOCAL_NETS
-
-# Логирование
+# Функция логирования
 log() {
-    local color="$1"
-    local level="$2"
-    local message="$3"
-    echo -e "${color}[${level}]${NC} ${message}"
-    echo "[$(date '+%H:%M:%S')][${level}] ${message}" >> "$REPORT_FILE"
+    echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1" | tee -a "$LOG_FILE"
 }
 
-info() { log "$GREEN" "INFO" "$1"; }
-warn() { log "$YELLOW" "WARN" "$1"; }
-error() { log "$RED" "ERROR" "$1"; exit 1; }
-step() { log "$BLUE" "STEP" "$1"; }
-success() { log "$CYAN" "OK" "$1"; }
+log_error() {
+    echo -e "${RED}[ОШИБКА]${NC} $1" | tee -a "$LOG_FILE"
+}
 
-# Определение сетевой конфигурации
-discover_network() {
-    step "Определение сетевой конфигурации..."
-    
-    # Основной интерфейс с default route
-    MAIN_IF=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
-    
-    # Если не нашли через default route, берём первый интерфейс с IP
-    if [ -z "$MAIN_IF" ]; then
-        MAIN_IF=$(ip -4 addr show | awk '/^[0-9]+:/{iface=$2} /inet /{print iface; exit}' | tr -d ':')
+log_warn() {
+    echo -e "${YELLOW}[ПРЕДУПРЕЖДЕНИЕ]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+log_info() {
+    echo -e "${CYAN}[ИНФО]${NC} $1" | tee -a "$LOG_FILE"
+}
+
+# Функция проверки прав root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "Этот скрипт должен быть запущен с правами root"
+        exit 1
     fi
+}
+
+# Функция определения внешнего интерфейса (подключенного к WAN)
+detect_wan_interface() {
+    log_info "Определение WAN интерфейса..."
     
-    [ -z "$MAIN_IF" ] && error "Не найден основной интерфейс"
+    # Получаем список интерфейсов с маршрутами по умолчанию
+    local wan_ifaces=$(ip route show default | awk '{print $5}' | sort -u)
     
-    MAIN_IP=$(ip -4 addr show "$MAIN_IF" 2>/dev/null | awk '/inet /{print $2}' | cut -d'/' -f1)
-    [ -z "$MAIN_IP" ] && error "Не найден IP адрес на интерфейсе $MAIN_IF"
-    
-    info "Основной интерфейс: $MAIN_IF, IP: $MAIN_IP"
-    
-    # Локальные сети (исключаем основной интерфейс и loopback)
-    LOCAL_NETS=()
-    while read -r line; do
-        if [[ $line == *"scope link"* ]]; then
-            local net dev
-            net=$(echo "$line" | awk '{print $1}')
-            dev=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
-            if [ -n "$net" ] && [ "$dev" != "lo" ] && [ "$dev" != "$MAIN_IF" ]; then
-                LOCAL_NETS+=("$net")
+    if [[ -z "$wan_ifaces" ]]; then
+        log_warn "Не найден маршрут по умолчанию. Пытаюсь определить по другим признакам..."
+        # Ищем интерфейсы с публичными IP или в диапазонах 172.16.x.x
+        for iface in $(ls /sys/class/net/ | grep -v lo); do
+            local ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d.]+')
+            if [[ -n "$ip" ]]; then
+                # Проверяем, это не локальный диапазон (192.168.x.x обычно LAN)
+                if [[ "$ip" =~ ^172\.16\.[4-5]\. ]]; then
+                    echo "$iface"
+                    return
+                fi
             fi
-        fi
-    done < <(ip route show scope link 2>/dev/null)
-    
-    # Определение роли роутера
-    ROUTER_ROLE=""
-    
-    # По имени хоста
-    local hostname_str
-    hostname_str=$(hostname 2>/dev/null || echo "")
-    if echo "$hostname_str" | grep -qi "hq"; then
-        ROUTER_ROLE="HQ-RTR"
-    elif echo "$hostname_str" | grep -qi "br"; then
-        ROUTER_ROLE="BR-RTR"
-    fi
-    
-    # По IP адресу (третий октет)
-    if [ -z "$ROUTER_ROLE" ]; then
-        local third
-        third=$(echo "$MAIN_IP" | cut -d'.' -f3)
-        case "$third" in
-            4) ROUTER_ROLE="HQ-RTR" ;;
-            5) ROUTER_ROLE="BR-RTR" ;;
-        esac
-    fi
-    
-    # По локальным сетям
-    if [ -z "$ROUTER_ROLE" ]; then
-        for net in "${LOCAL_NETS[@]}"; do
-            case "$net" in
-                192.168.10.*|192.168.20.*) ROUTER_ROLE="HQ-RTR"; break ;;
-                192.168.30.*) ROUTER_ROLE="BR-RTR"; break ;;
-            esac
         done
-    fi
-    
-    # Интерактивный выбор
-    if [ -z "$ROUTER_ROLE" ]; then
-        echo -e "${YELLOW}Не удалось автоматически определить роль роутера${NC}"
-        echo "1) HQ-RTR (Главный офис)"
-        echo "2) BR-RTR (Филиал)"
-        read -r -p "Выберите [1/2]: " choice
-        case "$choice" in
-            1) ROUTER_ROLE="HQ-RTR" ;;
-            2) ROUTER_ROLE="BR-RTR" ;;
-            *) error "Неверный выбор" ;;
-        esac
-    fi
-    
-    success "Роль роутера: $ROUTER_ROLE"
-}
-
-# Определение параметров туннеля
-set_tunnel_params() {
-    step "Определение параметров туннеля..."
-    
-    TUN_LOCAL="$MAIN_IP"
-    
-    if [ "$ROUTER_ROLE" = "HQ-RTR" ]; then
-        # HQ-RTR: подключается к BR-RTR
-        TUN_REMOTE="172.16.5.2"
-        TUNNEL_IP="172.16.100.2"
-        REMOTE_TUN="172.16.100.1"
-        # Сети HQ по умолчанию
-        if [ ${#LOCAL_NETS[@]} -eq 0 ]; then
-            LOCAL_NETS=("192.168.10.0/24" "192.168.20.0/24")
-        fi
     else
-        # BR-RTR: подключается к HQ-RTR
-        TUN_REMOTE="172.16.4.2"
-        TUNNEL_IP="172.16.100.1"
-        REMOTE_TUN="172.16.100.2"
-        # Сети BR по умолчанию
-        if [ ${#LOCAL_NETS[@]} -eq 0 ]; then
-            LOCAL_NETS=("192.168.30.0/24")
-        fi
+        echo "$wan_ifaces" | head -1
+        return
     fi
     
-    TUNNEL_NET="172.16.100.0/29"
-    
-    info "Локальный endpoint: $TUN_LOCAL"
-    info "Удалённый endpoint: $TUN_REMOTE"
-    info "IP туннеля: $TUNNEL_IP/29"
-    info "Локальные сети: ${LOCAL_NETS[*]}"
+    echo ""
 }
 
-# Резервное копирование
-create_backup() {
-    step "Создание резервной копии..."
-    
-    BACKUP_DIR="/root/backup_$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
-    
-    if [ -d "/etc/net/ifaces" ]; then
-        cp -r /etc/net/ifaces "$BACKUP_DIR/" 2>/dev/null || true
-    fi
-    if [ -d "/etc/frr" ]; then
-        cp -r /etc/frr "$BACKUP_DIR/" 2>/dev/null || true
-    fi
-    if [ -f "/etc/sysctl.conf" ]; then
-        cp /etc/sysctl.conf "$BACKUP_DIR/" 2>/dev/null || true
-    fi
-    
-    success "Резервная копия: $BACKUP_DIR"
+# Функция получения IP-адреса интерфейса
+get_interface_ip() {
+    local iface=$1
+    ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d.]+(?=/|\s)'
 }
 
-# Настройка GRE туннеля
-setup_gre() {
-    step "Настройка GRE туннеля..."
+# Функция получения маски интерфейса
+get_interface_mask() {
+    local iface=$1
+    ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet [\d.]+/\K\d+'
+}
+
+# Функция получения сети интерфейса
+get_interface_network() {
+    local iface=$1
+    local ip=$(get_interface_ip "$iface")
+    local mask=$(get_interface_mask "$iface")
     
-    # Загрузка модуля
-    modprobe gre 2>/dev/null || true
-    if ! lsmod | grep -q "^gre"; then
-        warn "Модуль gre не загружен, продолжаю..."
-    fi
-    
-    # Удаление старого интерфейса если существует
-    ip link del gre1 2>/dev/null || true
-    
-    # Создание туннеля
-    ip tunnel add gre1 mode gre local "$TUN_LOCAL" remote "$TUN_REMOTE" ttl 64 || {
-        error "Не удалось создать GRE туннель"
-    }
-    
-    ip link set gre1 up || error "Не удалось включить интерфейс gre1"
-    ip addr add "${TUNNEL_IP}/29" dev gre1 || error "Не удалось назначить IP для gre1"
-    
-    # Проверка создания
-    sleep 1
-    if ip link show gre1 &>/dev/null; then
-        success "Интерфейс gre1 создан"
-        ip addr show gre1 | grep -E "^[0-9]+:|inet "
-    else
-        error "Интерфейс gre1 не создан"
-    fi
-    
-    # Сохранение конфигурации для ALT Linux (/etc/net)
-    if [ -d "/etc/net/ifaces" ]; then
-        mkdir -p /etc/net/ifaces/gre1
+    if [[ -n "$ip" && -n "$mask" ]]; then
+        # Вычисляем адрес сети
+        local IFS='.'
+        read -ra ip_parts <<< "$ip"
         
-        cat > /etc/net/ifaces/gre1/options << EOF
-TYPE=iptun
+        if [[ $mask -eq 24 ]]; then
+            echo "${ip_parts[0]}.${ip_parts[1]}.${ip_parts[2]}.0/$mask"
+        elif [[ $mask -eq 26 ]]; then
+            echo "${ip_parts[0]}.${ip_parts[1]}.${ip_parts[2]}.0/$mask"
+        elif [[ $mask -eq 27 ]]; then
+            echo "${ip_parts[0]}.${ip_parts[1]}.${ip_parts[2]}.0/$mask"
+        elif [[ $mask -eq 28 ]]; then
+            echo "${ip_parts[0]}.${ip_parts[1]}.${ip_parts[2]}.0/$mask"
+        elif [[ $mask -eq 29 ]]; then
+            echo "${ip_parts[0]}.${ip_parts[1]}.${ip_parts[2]}.0/$mask"
+        else
+            echo "${ip_parts[0]}.${ip_parts[1]}.${ip_parts[2]}.0/$mask"
+        fi
+    fi
+}
+
+# Функция отображения всех интерфейсов
+show_interfaces() {
+    log_info "Обнаруженные интерфейсы:"
+    echo ""
+    printf "${BLUE}%-15s %-18s %-10s %-20s${NC}\n" "Интерфейс" "IP-адрес" "Маска" "Сеть"
+    printf "${BLUE}%-15s %-18s %-10s %-20s${NC}\n" "---------" "----------" "-----" "----"
+    
+    for iface in $(ls /sys/class/net/ | grep -v lo); do
+        local ip=$(get_interface_ip "$iface")
+        local mask=$(get_interface_mask "$iface")
+        local network=$(get_interface_network "$iface")
+        
+        if [[ -n "$ip" ]]; then
+            printf "%-15s %-18s %-10s %-20s\n" "$iface" "$ip" "/$mask" "$network"
+        fi
+    done
+    echo ""
+}
+
+# Функция определения роли маршрутизатора (HQ-RTR или BR-RTR)
+detect_router_role() {
+    local hostname=$(hostname)
+    
+    if [[ "$hostname" =~ [Hh][Qq] ]]; then
+        echo "HQ-RTR"
+    elif [[ "$hostname" =~ [Bb][Rr] ]]; then
+        echo "BR-RTR"
+    else
+        echo "UNKNOWN"
+    fi
+}
+
+# Функция определения IP-адресов для туннеля
+detect_tunnel_ips() {
+    local role=$1
+    
+    if [[ "$role" == "HQ-RTR" ]]; then
+        # HQ-RTR: ищем IP в диапазоне 172.16.4.x
+        for iface in $(ls /sys/class/net/ | grep -v lo); do
+            local ip=$(get_interface_ip "$iface")
+            if [[ "$ip" =~ ^172\.16\.4\. ]]; then
+                TUNLOCAL="$ip"
+                TUNLOCAL_IFACE="$iface"
+            elif [[ "$ip" =~ ^172\.16\.5\. ]]; then
+                TUNREMOTE="$ip"
+            fi
+        done
+        
+        # Если не нашли, предполагаем удалённый адрес
+        if [[ -n "$TUNLOCAL" && -z "$TUNREMOTE" ]]; then
+            # Определяем последний октет удалённого IP (обычно .2)
+            TUNREMOTE="172.16.5.2"
+        fi
+        
+        # IP туннеля для HQ-RTR
+        TUNNEL_IP="172.16.100.2/29"
+        
+    elif [[ "$role" == "BR-RTR" ]]; then
+        # BR-RTR: ищем IP в диапазоне 172.16.5.x
+        for iface in $(ls /sys/class/net/ | grep -v lo); do
+            local ip=$(get_interface_ip "$iface")
+            if [[ "$ip" =~ ^172\.16\.5\. ]]; then
+                TUNLOCAL="$ip"
+                TUNLOCAL_IFACE="$iface"
+            elif [[ "$ip" =~ ^172\.16\.4\. ]]; then
+                TUNREMOTE="$ip"
+            fi
+        done
+        
+        # Если не нашли, предполагаем удалённый адрес
+        if [[ -n "$TUNLOCAL" && -z "$TUNREMOTE" ]]; then
+            TUNREMOTE="172.16.4.2"
+        fi
+        
+        # IP туннеля для BR-RTR
+        TUNNEL_IP="172.16.100.1/29"
+    fi
+}
+
+# Функция обнаружения локальных сетей
+detect_local_networks() {
+    local role=$1
+    LOCAL_NETWORKS=()
+    
+    for iface in $(ls /sys/class/net/ | grep -v lo | grep -v "$TUNLOCAL_IFACE"); do
+        local network=$(get_interface_network "$iface")
+        local ip=$(get_interface_ip "$iface")
+        
+        # Пропускаем WAN интерфейсы (те, у которых маршрут по умолчанию)
+        local is_default=$(ip route show default | grep -c "$iface")
+        
+        # Добавляем только сети 192.168.x.x
+        if [[ "$network" =~ ^192\.168\. && $is_default -eq 0 ]]; then
+            LOCAL_NETWORKS+=("$network")
+            LOCAL_IFACES+=("$iface")
+        fi
+    done
+}
+
+# Функция создания GRE туннеля
+create_gre_tunnel() {
+    local tunnel_name=${1:-"gre1"}
+    
+    log "Создание GRE туннеля $tunnel_name..."
+    
+    # Создаём каталог для интерфейса
+    if [[ -d "/etc/net/ifaces/$tunnel_name" ]]; then
+        log_warn "Каталог /etc/net/ifaces/$tunnel_name уже существует. Удаляем..."
+        rm -rf "/etc/net/ifaces/$tunnel_name"
+    fi
+    
+    mkdir -p "/etc/net/ifaces/$tunnel_name"
+    
+    # Создаём файл options
+    cat > "/etc/net/ifaces/$tunnel_name/options" << EOF
+TUNLOCAL=$TUNLOCAL
+TUNREMOTE=$TUNREMOTE
 TUNTYPE=gre
-TUNLOCAL=$TUN_LOCAL
-TUNREMOTE=$TUN_REMOTE
+TYPE=iptun
+TUNOPTIONS='ttl 64'
+HOST=$TUNLOCAL_IFACE
 EOF
+    
+    log "Файл options создан:"
+    cat "/etc/net/ifaces/$tunnel_name/options"
+    
+    # Создаём файл ipv4address
+    echo "$TUNNEL_IP" > "/etc/net/ifaces/$tunnel_name/ipv4address"
+    
+    log "IP-адрес туннеля: $TUNNEL_IP"
+}
+
+# Функция настройки FRR
+configure_frr() {
+    log "Настройка FRR..."
+    
+    # Включаем автозагрузку FRR
+    systemctl enable --now frr
+    
+    # Проверяем наличие файла daemons
+    if [[ ! -f "/etc/frr/daemons" ]]; then
+        log_error "Файл /etc/frr/daemons не найден!"
+        return 1
+    fi
+    
+    # Включаем OSPFD
+    sed -i 's/^#*ospfd=no/ospfd=yes/' /etc/frr/daemons
+    sed -i 's/^ospfd=no/ospfd=yes/' /etc/frr/daemons
+    
+    log "OSPF демон включён в /etc/frr/daemons"
+    
+    # Перезапускаем FRR
+    systemctl restart frr
+    log "Служба FRR перезапущена"
+}
+
+# Функция генерации команд OSPF
+generate_ospf_commands() {
+    local role=$1
+    local ospf_key=${2:-"1245"}
+    local tunnel_name=${3:-"gre1"}
+    
+    log "Генерация команд OSPF для $role..."
+    
+    # Базовые команды OSPF
+    OSPF_COMMANDS=(
+        "conf t"
+        "router ospf"
+        "passive interface default"
+        "network 172.16.100.0/29 area 0"
+    )
+    
+    # Добавляем локальные сети
+    for network in "${LOCAL_NETWORKS[@]}"; do
+        OSPF_COMMANDS+=("network $network area 0")
+    done
+    
+    OSPF_COMMANDS+=("area 0 authentication")
+    OSPF_COMMANDS+=("exit")
+    OSPF_COMMANDS+=("interface $tunnel_name")
+    OSPF_COMMANDS+=("no ip ospf passive")
+    OSPF_COMMANDS+=("ip ospf authentication-key $ospf_key")
+    OSPF_COMMANDS+=("exit")
+    OSPF_COMMANDS+=("do wr")
+    OSPF_COMMANDS+=("end")
+    OSPF_COMMANDS+=("exit")
+    
+    log "Сгенерированные команды OSPF:"
+    for cmd in "${OSPF_COMMANDS[@]}"; do
+        echo "  $cmd"
+    done
+}
+
+# Функция применения настроек OSPF через vtysh
+apply_ospf_config() {
+    local ospf_key=$1
+    local tunnel_name=$2
+    
+    log "Применение конфигурации OSPF..."
+    
+    # Создаём временный файл с командами
+    local tmp_file=$(mktemp)
+    
+    echo "conf t" >> "$tmp_file"
+    echo "router ospf" >> "$tmp_file"
+    echo "passive interface default" >> "$tmp_file"
+    echo "network 172.16.100.0/29 area 0" >> "$tmp_file"
+    
+    for network in "${LOCAL_NETWORKS[@]}"; do
+        echo "network $network area 0" >> "$tmp_file"
+    done
+    
+    echo "area 0 authentication" >> "$tmp_file"
+    echo "exit" >> "$tmp_file"
+    echo "interface $tunnel_name" >> "$tmp_file"
+    echo "no ip ospf passive" >> "$tmp_file"
+    echo "ip ospf authentication-key $ospf_key" >> "$tmp_file"
+    echo "exit" >> "$tmp_file"
+    echo "do wr" >> "$tmp_file"
+    echo "end" >> "$tmp_file"
+    echo "exit" >> "$tmp_file"
+    
+    # Применяем через vtysh
+    vtysh < "$tmp_file"
+    
+    rm -f "$tmp_file"
+    
+    log "Конфигурация OSPF применена"
+}
+
+# Функция проверки настроек
+verify_configuration() {
+    log "Проверка конфигурации..."
+    
+    echo ""
+    log_info "=== Состояние интерфейсов ==="
+    ip addr show | grep -E "^[0-9]+:|inet " | head -20
+    
+    echo ""
+    log_info "=== Состояние туннеля ==="
+    ip addr show gre1 2>/dev/null || log_warn "Интерфейс gre1 не найден"
+    
+    echo ""
+    log_info "=== Соседи OSPF ==="
+    vtysh -c "show ip ospf neighbor" 2>/dev/null || log_warn "Не удалось получить информацию о соседях OSPF"
+    
+    echo ""
+    log_info "=== Маршруты OSPF ==="
+    vtysh -c "show ip ospf route" 2>/dev/null || log_warn "Не удалось получить маршруты OSPF"
+    
+    echo ""
+    log_info "=== Таблица маршрутизации ==="
+    ip route show | head -20
+}
+
+# Функция интерактивной настройки
+interactive_setup() {
+    clear
+    echo -e "${CYAN}=======================================${NC}"
+    echo -e "${CYAN}  Настройка GRE туннеля и OSPF${NC}"
+    echo -e "${CYAN}=======================================${NC}"
+    echo ""
+    
+    # Показываем интерфейсы
+    show_interfaces
+    
+    # Определяем роль маршрутизатора
+    local detected_role=$(detect_router_role)
+    
+    echo -e "${YELLOW}Определённая роль маршрутизатора: ${GREEN}$detected_role${NC}"
+    echo ""
+    
+    read -p "Подтвердите роль (HQ-RTR/BR-RTR) [$detected_role]: " user_role
+    ROUTER_ROLE="${user_role:-$detected_role}"
+    
+    echo ""
+    log_info "Выбранная роль: $ROUTER_ROLE"
+    
+    # Получаем данные для туннеля
+    detect_tunnel_ips "$ROUTER_ROLE"
+    
+    echo ""
+    echo -e "${CYAN}=== Настройки туннеля ===${NC}"
+    echo "Локальный IP (TUNLOCAL): $TUNLOCAL"
+    echo "Интерфейс: $TUNLOCAL_IFACE"
+    echo "Удалённый IP (TUNREMOTE): $TUNREMOTE"
+    echo "IP туннеля: $TUNNEL_IP"
+    echo ""
+    
+    read -p "Введите локальный IP для туннеля [$TUNLOCAL]: " user_tunlocal
+    TUNLOCAL="${user_tunlocal:-$TUNLOCAL}"
+    
+    read -p "Введите удалённый IP для туннеля [$TUNREMOTE]: " user_tunremote
+    TUNREMOTE="${user_tunremote:-$TUNREMOTE}"
+    
+    read -p "Введите интерфейс для привязки туннеля [$TUNLOCAL_IFACE]: " user_iface
+    TUNLOCAL_IFACE="${user_iface:-$TUNLOCAL_IFACE}"
+    
+    read -p "Введите IP-адрес туннеля [$TUNNEL_IP]: " user_tunnel_ip
+    TUNNEL_IP="${user_tunnel_ip:-$TUNNEL_IP}"
+    
+    # Получаем локальные сети
+    detect_local_networks "$ROUTER_ROLE"
+    
+    echo ""
+    echo -e "${CYAN}=== Обнаруженные локальные сети ===${NC}"
+    for i in "${!LOCAL_NETWORKS[@]}"; do
+        echo "  $((i+1)). ${LOCAL_NETWORKS[$i]} (интерфейс: ${LOCAL_IFACES[$i]})"
+    done
+    
+    echo ""
+    read -p "Добавить дополнительные сети? (через пробел, например 10.0.0.0/24): " extra_networks
+    for net in $extra_networks; do
+        LOCAL_NETWORKS+=("$net")
+    done
+    
+    # Ключ аутентификации
+    echo ""
+    read -p "Введите ключ аутентификации OSPF [1245]: " ospf_key
+    OSPF_KEY="${ospf_key:-1245}"
+    
+    # Имя туннеля
+    read -p "Введите имя туннеля [gre1]: " tunnel_name
+    TUNNEL_NAME="${tunnel_name:-gre1}"
+    
+    # Подтверждение
+    echo ""
+    echo -e "${YELLOW}=== Итоговая конфигурация ===${NC}"
+    echo "Роль: $ROUTER_ROLE"
+    echo "Туннель: $TUNNEL_NAME"
+    echo "TUNLOCAL: $TUNLOCAL"
+    echo "TUNREMOTE: $TUNREMOTE"
+    echo "HOST интерфейс: $TUNLOCAL_IFACE"
+    echo "IP туннеля: $TUNNEL_IP"
+    echo "OSPF ключ: $OSPF_KEY"
+    echo "Локальные сети:"
+    for network in "${LOCAL_NETWORKS[@]}"; do
+        echo "  - $network"
+    done
+    echo ""
+    
+    read -p "Применить конфигурацию? (y/n): " confirm
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        # Применяем настройки
+        create_gre_tunnel "$TUNNEL_NAME"
+        configure_frr
+        generate_ospf_commands "$ROUTER_ROLE" "$OSPF_KEY" "$TUNNEL_NAME"
+        apply_ospf_config "$OSPF_KEY" "$TUNNEL_NAME"
         
-        echo "${TUNNEL_IP}/29" > /etc/net/ifaces/gre1/ipv4address
-        echo "UP" > /etc/net/ifaces/gre1/control
+        # Перезапускаем сеть
+        log "Перезапуск сети..."
+        systemctl restart network
         
-        success "Конфигурация сохранена в /etc/net/ifaces/gre1/"
+        # Проверяем
+        sleep 3
+        verify_configuration
+        
+        log "Настройка завершена!"
+    else
+        log_warn "Настройка отменена пользователем"
     fi
 }
 
-# Включение IP forwarding
-setup_sysctl() {
-    step "Настройка sysctl..."
+# Функция автоматической настройки (без интерактивного режима)
+auto_setup() {
+    local role=$1
+    local ospf_key=${2:-"1245"}
+    local tunnel_name=${3:-"gre1"}
     
-    # Применение немедленно
-    sysctl -w net.ipv4.ip_forward=1 >> "$REPORT_FILE" 2>&1
+    log "Автоматическая настройка для роли: $role"
     
-    # Сохранение в конфиг
-    if ! grep -q "^net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-    else
-        sed -i 's/^#*net.ipv4.ip_forward.*/net.ipv4.ip_forward = 1/' /etc/sysctl.conf
+    ROUTER_ROLE="$role"
+    detect_tunnel_ips "$role"
+    detect_local_networks "$role"
+    OSPF_KEY="$ospf_key"
+    TUNNEL_NAME="$tunnel_name"
+    
+    # Проверяем, что все необходимые данные получены
+    if [[ -z "$TUNLOCAL" || -z "$TUNREMOTE" || -z "$TUNNEL_IP" ]]; then
+        log_error "Не удалось автоматически определить настройки туннеля"
+        log_info "Используйте интерактивный режим: $0 --interactive"
+        exit 1
     fi
     
-    success "IP forwarding включён"
-}
-
-# Установка и настройка FRR
-setup_frr() {
-    step "Настройка FRR (Free Range Routing)..."
+    log "Конфигурация:"
+    log "  Роль: $ROUTER_ROLE"
+    log "  TUNLOCAL: $TUNLOCAL"
+    log "  TUNREMOTE: $TUNREMOTE"
+    log "  IP туннеля: $TUNNEL_IP"
+    log "  Ключ OSPF: $OSPF_KEY"
     
-    # Проверка установки
-    if ! command -v vtysh &>/dev/null; then
-        info "Установка FRR..."
-        
-        # Обновление индекса пакетов
-        apt-get update >> "$REPORT_FILE" 2>&1 || {
-            warn "apt-get update завершился с ошибкой, продолжаю..."
-        }
-        
-        # Установка FRR
-        apt-get install -y frr >> "$REPORT_FILE" 2>&1 || {
-            # Пробуем альтернативное имя пакета
-            apt-get install -y frr8 >> "$REPORT_FILE" 2>&1 || {
-                error "Не удалось установить FRR. Установите вручную: apt-get install frr"
-            }
-        }
-    fi
+    create_gre_tunnel "$TUNNEL_NAME"
+    configure_frr
+    apply_ospf_config "$OSPF_KEY" "$TUNNEL_NAME"
     
-    # Включение демонов
-    if [ -f "/etc/frr/daemons" ]; then
-        sed -i 's/^zebra=no/zebra=yes/' /etc/frr/daemons
-        sed -i 's/^#zebra=no/zebra=yes/' /etc/frr/daemons
-        sed -i 's/^ospfd=no/ospfd=yes/' /etc/frr/daemons
-        sed -i 's/^#ospfd=no/ospfd=yes/' /etc/frr/daemons
-        info "Демоны zebra и ospfd включены"
-    else
-        warn "Файл /etc/frr/daemons не найден"
-    fi
-    
-    # Базовая конфигурация FRR
-    if [ ! -f "/etc/frr/frr.conf" ] || [ ! -s "/etc/frr/frr.conf" ]; then
-        cat > /etc/frr/frr.conf << EOF
-frr version 8.x
-frr defaults traditional
-hostname $(hostname)
-log syslog informational
-no ipv6 forwarding
-service integrated-vtysh-config
-!
-line vty
-!
-EOF
-        info "Создана базовая конфигурация FRR"
-    fi
-    
-    # Права на конфигурацию
-    chown frr:frr /etc/frr/frr.conf 2>/dev/null || true
-    chmod 640 /etc/frr/frr.conf 2>/dev/null || true
-    
-    # Запуск сервиса
-    systemctl enable frr >> "$REPORT_FILE" 2>&1 || true
-    systemctl restart frr >> "$REPORT_FILE" 2>&1
+    log "Перезапуск сети..."
+    systemctl restart network
     
     sleep 3
+    verify_configuration
     
-    if systemctl is-active --quiet frr; then
-        success "FRR успешно запущен"
-    else
-        warn "FRR не запустился нормально. Проверьте: journalctl -u frr -n 50"
-        # Пробуем ещё раз
-        systemctl restart frr >> "$REPORT_FILE" 2>&1
-        sleep 2
-        systemctl is-active --quiet frr || warn "FRR всё ещё не активен"
-    fi
+    log "Автоматическая настройка завершена!"
 }
 
-# Настройка OSPF
-setup_ospf() {
-    step "Настройка OSPF..."
-    
-    # Ожидание готовности vtysh
-    local max_attempts=10
-    local attempt=1
-    while [ $attempt -le $max_attempts ]; do
-        if vtysh -c "show version" &>/dev/null; then
-            break
-        fi
-        info "Ожидание готовности vtysh... ($attempt/$max_attempts)"
-        sleep 1
-        ((attempt++))
-    done
-    
-    if [ $attempt -gt $max_attempts ]; then
-        error "vtysh не отвечает после $max_attempts попыток"
-    fi
-    
-    # Конфигурация OSPF через vtysh
-    info "Настройка OSPF router..."
-    
-    vtysh -c "configure terminal" \
-          -c "router ospf" \
-          -c "ospf router-id $TUNNEL_IP" \
-          -c "passive-interface default" \
-          -c "network $TUNNEL_NET area 0" || {
-        warn "Ошибка при базовой настройке OSPF"
-    }
-    
-    # Добавление локальных сетей
-    for net in "${LOCAL_NETS[@]}"; do
-        if vtysh -c "configure terminal" -c "router ospf" -c "network $net area 0" 2>/dev/null; then
-            info "Добавлена сеть $net в OSPF area 0"
-        else
-            warn "Не удалось добавить сеть $net"
-        fi
-    done
-    
-    # Настройка интерфейса туннеля (без passive, с аутентификацией)
-    info "Настройка интерфейса gre1 для OSPF..."
-    
-    vtysh -c "configure terminal" \
-          -c "interface gre1" \
-          -c "no ip ospf passive" \
-          -c "ip ospf authentication" \
-          -c "ip ospf authentication-key 1245" \
-          -c "ip ospf mtu-ignore" \
-          -c "exit" || {
-        warn "Ошибка при настройке интерфейса gre1"
-    }
-    
-    # Сохранение конфигурации
-    vtysh -c "write memory" 2>/dev/null || vtysh -c "copy running-config startup-config" 2>/dev/null || {
-        warn "Не удалось сохранить конфигурацию FRR"
-    }
-    
-    success "OSPF настроен"
+# Функция отображения справки
+show_help() {
+    echo -e "${CYAN}Использование:${NC}"
+    echo "  $0 [опции]"
+    echo ""
+    echo -e "${CYAN}Опции:${NC}"
+    echo "  -i, --interactive    Интерактивный режим настройки"
+    echo "  -a, --auto           Автоматическая настройка"
+    echo "  -r, --role ROLE      Указать роль (HQ-RTR или BR-RTR)"
+    echo "  -k, --key KEY        Ключ аутентификации OSPF (по умолчанию: 1245)"
+    echo "  -t, --tunnel NAME    Имя туннеля (по умолчанию: gre1)"
+    echo "  -s, --show           Показать информацию об интерфейсах"
+    echo "  -v, --verify         Проверить текущую конфигурацию"
+    echo "  -h, --help           Показать эту справку"
+    echo ""
+    echo -e "${CYAN}Примеры:${NC}"
+    echo "  $0 -i                    # Интерактивный режим"
+    echo "  $0 -a -r HQ-RTR          # Автонастройка для HQ-RTR"
+    echo "  $0 -a -r BR-RTR -k mykey # Автонастройка для BR-RTR с ключом mykey"
+    echo "  $0 -s                    # Показать интерфейсы"
+    echo "  $0 -v                    # Проверить конфигурацию"
 }
 
-# Настройка firewall
-setup_firewall() {
-    step "Настройка firewall..."
-    
-    if systemctl is-active --quiet firewalld; then
-        # Firewalld
-        firewall-cmd --permanent --add-protocol=gre 2>/dev/null || true
-        firewall-cmd --permanent --add-protocol=ospf 2>/dev/null || true
-        firewall-cmd --permanent --zone=trusted --add-interface=gre1 2>/dev/null || true
-        firewall-cmd --permanent --add-port=89/udp 2>/dev/null || true
-        firewall-cmd --reload 2>/dev/null || true
-        info "Firewalld настроен"
-        
-    elif command -v iptables &>/dev/null; then
-        # iptables
-        iptables -I INPUT -p gre -j ACCEPT 2>/dev/null || true
-        iptables -I INPUT -p 89 -j ACCEPT 2>/dev/null || true  # OSPF protocol
-        iptables -I INPUT -i gre1 -j ACCEPT 2>/dev/null || true
-        iptables -I FORWARD -i gre1 -j ACCEPT 2>/dev/null || true
-        iptables -I FORWARD -o gre1 -j ACCEPT 2>/dev/null || true
-        
-        # Сохранение правил (если есть iptables-save)
-        if command -v iptables-save &>/dev/null; then
-            iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
-        fi
-        info "iptables настроены"
-        
-    else
-        warn "Ни firewalld, ни iptables не найдены"
-    fi
-}
-
-# Проверка конфигурации
-verify() {
-    step "Проверка конфигурации..."
-    
-    echo ""
-    echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-    
-    # Интерфейс gre1
-    echo -e "${GREEN}[1] Интерфейс GRE туннеля:${NC}"
-    if ip -4 addr show gre1 &>/dev/null; then
-        ip -4 addr show gre1 | grep -E "^[0-9]+:|inet "
-    else
-        echo "  ${RED}Интерфейс gre1 не найден${NC}"
-    fi
-    
-    # Туннель
-    echo ""
-    echo -e "${GREEN}[2] Состояние туннеля:${NC}"
-    ip tunnel show gre1 2>/dev/null || echo "  Туннель не найден"
-    
-    # OSPF соседи
-    echo ""
-    echo -e "${GREEN}[3] Соседи OSPF:${NC}"
-    local neighbors
-    neighbors=$(vtysh -c "show ip ospf neighbor" 2>/dev/null)
-    if [ -n "$neighbors" ]; then
-        echo "$neighbors"
-    else
-        echo "  ${YELLOW}Нет соседей (настройте туннель на другой стороне)${NC}"
-    fi
-    
-    # OSPF маршруты
-    echo ""
-    echo -e "${GREEN}[4] OSPF маршруты:${NC}"
-    local routes
-    routes=$(vtysh -c "show ip route ospf" 2>/dev/null)
-    if [ -n "$routes" ]; then
-        echo "$routes"
-    else
-        echo "  ${YELLOW}Нет OSPF маршрутов${NC}"
-    fi
-    
-    # Пинг удалённого конца туннеля
-    echo ""
-    echo -e "${GREEN}[5] Пинг удалённого конца туннеля ($REMOTE_TUN):${NC}"
-    if ping -c 3 -W 2 "$REMOTE_TUN" &>/dev/null; then
-        echo "  ${GREEN}✓ Туннель работает${NC}"
-    else
-        echo "  ${YELLOW}✗ Нет ответа (проверьте туннель на другой стороне)${NC}"
-    fi
-    
-    # FRR статус
-    echo ""
-    echo -e "${GREEN}[6] Статус FRR:${NC}"
-    if systemctl is-active --quiet frr; then
-        echo "  ${GREEN}✓ FRR активен${NC}"
-    else
-        echo "  ${RED}✗ FRR не активен${NC}"
-    fi
-    
-    echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-}
-
-# Главная функция
+# Основная функция
 main() {
-    # Инициализация лог-файла
-    echo "═════════════════════════════════════════════════" > "$REPORT_FILE"
-    echo "  Настройка GRE туннеля и OSPF (ALT Linux)" >> "$REPORT_FILE"
-    echo "  Дата: $(date '+%Y-%m-%d %H:%M:%S')" >> "$REPORT_FILE"
-    echo "═════════════════════════════════════════════════" >> "$REPORT_FILE"
+    local mode=""
+    local role=""
+    local key="1245"
+    local tunnel="gre1"
     
-    # Вывод заголовка на экран
-    echo ""
-    echo -e "${CYAN}═════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}    Настройка GRE туннеля и OSPF (ALT Linux)    ${NC}"
-    echo -e "${CYAN}═════════════════════════════════════════════════${NC}"
-    echo ""
+    # Парсинг аргументов
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -i|--interactive)
+                mode="interactive"
+                shift
+                ;;
+            -a|--auto)
+                mode="auto"
+                shift
+                ;;
+            -r|--role)
+                role="$2"
+                shift 2
+                ;;
+            -k|--key)
+                key="$2"
+                shift 2
+                ;;
+            -t|--tunnel)
+                tunnel="$2"
+                shift 2
+                ;;
+            -s|--show)
+                mode="show"
+                shift
+                ;;
+            -v|--verify)
+                mode="verify"
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                log_error "Неизвестная опция: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
     
     # Проверка прав root
-    if [ "$EUID" -ne 0 ]; then
-        error "Скрипт должен быть запущен от имени root"
-    fi
+    check_root
     
-    # Основные шаги
-    discover_network
-    set_tunnel_params
-    create_backup
-    setup_sysctl
-    setup_gre
-    setup_frr
-    setup_firewall
-    setup_ospf
-    verify
-    
-    # Итоговое сообщение
-    echo ""
-    success "═════════ НАСТРОЙКА ЗАВЕРШЕНА ═════════"
-    echo ""
-    info "Отчёт: $REPORT_FILE"
-    info "Резервная копия: $BACKUP_DIR"
-    echo ""
-    echo -e "${YELLOW}Полезные команды для проверки:${NC}"
-    echo "  vtysh -c 'show ip ospf neighbor'   # Соседи OSPF"
-    echo "  vtysh -c 'show ip route ospf'      # OSPF маршруты"
-    echo "  vtysh -c 'show ip ospf interface'  # Интерфейсы OSPF"
-    echo "  ip addr show gre1                  # Состояние туннеля"
-    echo "  ip tunnel show                     # Информация о туннеле"
-    echo ""
-    echo -e "${YELLOW}Для просмотра логов:${NC}"
-    echo "  journalctl -u frr -f               # Логи FRR в реальном времени"
-    echo ""
+    case $mode in
+        interactive)
+            interactive_setup
+            ;;
+        auto)
+            if [[ -z "$role" ]]; then
+                role=$(detect_router_role)
+                if [[ "$role" == "UNKNOWN" ]]; then
+                    log_error "Не удалось определить роль маршрутизатора. Укажите с помощью -r HQ-RTR или -r BR-RTR"
+                    exit 1
+                fi
+            fi
+            auto_setup "$role" "$key" "$tunnel"
+            ;;
+        show)
+            show_interfaces
+            ;;
+        verify)
+            verify_configuration
+            ;;
+        *)
+            show_help
+            ;;
+    esac
 }
 
 # Запуск
