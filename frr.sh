@@ -2,7 +2,7 @@
 
 # ==============================================================================
 # Скрипт автоматической настройки OSPF для FRR (ALT Linux)
-# Версия 4.0: POSIX-совместимый (работает с sh)
+# Версия 5.0: Полностью исправленный, POSIX-совместимый
 # ==============================================================================
 
 REPORT_FILE="ospf_report_$(hostname)_$(date +%F_%H-%M).txt"
@@ -31,6 +31,16 @@ print_error() {
 
 print_success() {
     echo "[+] $1"
+}
+
+# ------------------------------------------------------------------------------
+# Проверка прав root
+# ------------------------------------------------------------------------------
+check_root() {
+    if [ "$(id -u)" != "0" ]; then
+        print_error "Скрипт должен запускаться от root!"
+        exit 1
+    fi
 }
 
 # ------------------------------------------------------------------------------
@@ -63,18 +73,69 @@ check_install_frr() {
 }
 
 # ------------------------------------------------------------------------------
+# Загрузка модуля GRE
+# ------------------------------------------------------------------------------
+load_gre_module() {
+    print_info "Проверка модуля GRE..."
+    
+    if ! lsmod | grep -q ip_gre; then
+        print_info "Загрузка модуля ip_gre..."
+        modprobe ip_gre
+        if [ $? -eq 0 ]; then
+            print_success "Модуль ip_gre загружен"
+        else
+            print_error "Не удалось загрузить модуль ip_gre"
+            exit 1
+        fi
+    else
+        print_success "Модуль ip_gre уже загружен"
+    fi
+}
+
+# ------------------------------------------------------------------------------
 # Показать существующие интерфейсы
 # ------------------------------------------------------------------------------
 show_interfaces() {
     echo ""
     print_info "Доступные сетевые интерфейсы:"
-    printf "    %-15s %-25s\n" "ИНТЕРФЕЙС" "IP АДРЕС"
-    printf "    %-15s %-25s\n" "-----------" "--------"
+    printf "    %-12s %-25s %-20s\n" "ИНТЕРФЕЙС" "IP АДРЕС" "СТАТУС"
+    printf "    %-12s %-25s %-20s\n" "-----------" "--------" "------"
     
-    ip -o addr show 2>/dev/null | awk '$2 != "lo" && NF >= 4 {
-        printf "    %-15s %-25s\n", $2, $4
-    }' || print_warn "Нет активных интерфейсов с IP"
+    ip -o addr show 2>/dev/null | while read -r line; do
+        IFACE=$(echo "$line" | awk '{print $2}')
+        IP=$(echo "$line" | awk '{print $4}')
+        STATE=$(ip link show "$IFACE" 2>/dev/null | grep -o 'state [A-Z]*' | awk '{print $2}')
+        printf "    %-12s %-25s %-20s\n" "$IFACE" "$IP" "$STATE"
+    done
     echo ""
+}
+
+# ------------------------------------------------------------------------------
+# Исправление неправильного IP на физическом интерфейсе
+# ------------------------------------------------------------------------------
+fix_wrong_ip() {
+    print_info "Проверка корректности назначения IP..."
+    
+    # Проверяем, не назначен ли IP туннеля на физический интерфейс
+    for IFACE in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}'); do
+        case "$IFACE" in
+            lo|gre*|ipip*|tun*)
+                continue
+                ;;
+            *)
+                # Проверяем есть ли на физическом интерфейсе IP из сети 10.10.0.0/30
+                if ip addr show "$IFACE" 2>/dev/null | grep -q '10\.10\.0\.[0-9]/30'; then
+                    print_warn "Обнаружен IP туннеля на физическом интерфейсе $IFACE"
+                    print_info "Удаляем 10.10.0.0/30 с $IFACE..."
+                    ip addr show "$IFACE" | grep '10\.10\.0\.[0-9]/30' | while read -r line; do
+                        IP_TO_DEL=$(echo "$line" | awk '{print $2}' | awk '{print $1}')
+                        ip addr del "$IP_TO_DEL" dev "$IFACE" 2>/dev/null
+                        print_success "Удален $IP_TO_DEL с $IFACE"
+                    done
+                fi
+                ;;
+        esac
+    done
 }
 
 # ------------------------------------------------------------------------------
@@ -84,39 +145,27 @@ create_gre_tunnel() {
     print_header "НАСТРОЙКА GRE ТУННЕЛЯ"
     
     echo ""
-    print_info "GRE туннель не найден. Создать новый?"
-    printf "Создать GRE туннель? (y/n): "
-    read CREATE_TUNNEL
+    print_info "GRE туннель не найден. Создадим новый."
     
-    case "$CREATE_TUNNEL" in
-        [Yy]*)
-            ;;
-        *)
-            print_warn "Без туннеля OSPF между офисами работать не будет!"
-            printf "Продолжить без туннеля? (y/n): "
-            read CONTINUE
-            case "$CONTINUE" in
-                [Yy]*)
-                    TUNNEL_IF=""
-                    return 0
-                    ;;
-                *)
-                    exit 1
-                    ;;
-            esac
-            ;;
-    esac
+    # Получаем внешний IP по умолчанию
+    DEFAULT_LOCAL_IP=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
     
-    # Параметры для создания туннеля
-    printf "Введите локальный IP (внешний интерфейс): "
+    printf "Введите ваш внешний IP (по умолчанию %s): " "$DEFAULT_LOCAL_IP"
     read LOCAL_IP
-    printf "Введите удаленный IP (внешний IP другого офиса): "
+    LOCAL_IP=${LOCAL_IP:-$DEFAULT_LOCAL_IP}
+    
+    printf "Введите внешний IP другого офиса: "
     read REMOTE_IP
-    printf "Введите IP для этого конца туннеля (например, 10.10.0.1): "
+    
+    printf "Введите IP для этого конца туннеля (по умолчанию 10.10.0.1): "
     read TUNNEL_LOCAL_IP
-    printf "Введите IP для удаленного конца туннеля (например, 10.10.0.2): "
+    TUNNEL_LOCAL_IP=${TUNNEL_LOCAL_IP:-10.10.0.1}
+    
+    printf "Введите IP для удаленного конца туннеля (по умолчанию 10.10.0.2): "
     read TUNNEL_REMOTE_IP
-    printf "Введите имя интерфейса туннеля (gre1): "
+    TUNNEL_REMOTE_IP=${TUNNEL_REMOTE_IP:-10.10.0.2}
+    
+    printf "Введите имя интерфейса туннеля (по умолчанию gre1): "
     read TUNNEL_IF
     TUNNEL_IF=${TUNNEL_IF:-gre1}
     
@@ -126,9 +175,28 @@ create_gre_tunnel() {
     ip link del "$TUNNEL_IF" 2>/dev/null || true
     
     # Создаем туннель
-    ip tunnel add "$TUNNEL_IF" mode gre remote "$REMOTE_IP" local "$LOCAL_IP" ttl 255
-    ip addr add "$TUNNEL_LOCAL_IP/30" dev "$TUNNEL_IF"
-    ip link set "$TUNNEL_IF" up
+    if ip tunnel add "$TUNNEL_IF" mode gre remote "$REMOTE_IP" local "$LOCAL_IP" ttl 255; then
+        print_success "Туннель создан"
+    else
+        print_error "Не удалось создать туннель"
+        exit 1
+    fi
+    
+    # Добавляем IP
+    if ip addr add "$TUNNEL_LOCAL_IP/30" dev "$TUNNEL_IF"; then
+        print_success "IP адрес назначен"
+    else
+        print_error "Не удалось назначить IP"
+        exit 1
+    fi
+    
+    # Поднимаем интерфейс
+    if ip link set "$TUNNEL_IF" up; then
+        print_success "Интерфейс поднят"
+    else
+        print_error "Не удалось поднять интерфейс"
+        exit 1
+    fi
     
     print_success "GRE туннель создан: $TUNNEL_IF"
     print_info "  Локальный IP: $LOCAL_IP"
@@ -144,8 +212,21 @@ create_gre_tunnel() {
 select_tunnel_interface() {
     print_header "ВЫБОР ТУННЕЛЬНОГО ИНТЕРФЕЙСА"
     
-    # Ищем существующие GRE/IPIP туннели
-    TUNNEL_IF=$(ip -o link show 2>/dev/null | grep -iE 'gre|ipip|tun' | awk -F': ' '{print $2}' | awk '{print $1}' | head -1)
+    # Исправляем неправильные IP
+    fix_wrong_ip
+    
+    # Ищем существующие GRE туннели
+    TUNNEL_IF=""
+    for IFACE in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}'); do
+        case "$IFACE" in
+            gre*|ipip*|tun*)
+                if ip addr show "$IFACE" 2>/dev/null | grep -q 'inet '; then
+                    TUNNEL_IF="$IFACE"
+                    break
+                fi
+                ;;
+        esac
+    done
     
     if [ -n "$TUNNEL_IF" ]; then
         print_success "Найден существующий туннель: $TUNNEL_IF"
@@ -155,13 +236,14 @@ select_tunnel_interface() {
         TUNNEL_IP=$(ip -o addr show "$TUNNEL_IF" 2>/dev/null | awk '{print $4}' | head -1)
         if [ -n "$TUNNEL_IP" ]; then
             IP_PART=$(echo "$TUNNEL_IP" | cut -d'/' -f1)
-            TUNNEL_NET="${IP_PART%.*}.0/30"
+            TUNNEL_NET=$(echo "$IP_PART" | sed 's/\.[0-9]*$/\.0/')"/30"
         fi
         
         printf "Использовать этот туннель? (y/n): "
         read USE_EXISTING
         case "$USE_EXISTING" in
             [Yy]*)
+                print_success "Используем $TUNNEL_IF"
                 ;;
             *)
                 TUNNEL_IF=""
@@ -179,17 +261,18 @@ select_tunnel_interface() {
 get_router_id() {
     print_header "НАСТРОЙКА OSPF ПАРАМЕТРОВ"
     
-    # Пробуем получить IP туннеля или первый доступный IP
+    # Пробуем получить IP туннеля
     if [ -n "$TUNNEL_IF" ]; then
         DEFAULT_RID=$(ip -o addr show "$TUNNEL_IF" 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1)
     fi
     
+    # Если нет, берем первый доступный IP
     if [ -z "$DEFAULT_RID" ]; then
         DEFAULT_RID=$(ip -o addr show 2>/dev/null | awk '$2 != "lo" && NF >= 4 {print $4; exit}' | cut -d'/' -f1)
     fi
     
     if [ -n "$DEFAULT_RID" ]; then
-        printf "Введите OSPF Router-ID (по умолчанию: $DEFAULT_RID): "
+        printf "Введите OSPF Router-ID (по умолчанию: %s): " "$DEFAULT_RID"
         read ROUTER_ID
         ROUTER_ID=${ROUTER_ID:-$DEFAULT_RID}
     else
@@ -208,22 +291,20 @@ get_local_networks() {
     print_info "Поиск локальных сетей для анонсирования..."
     
     LOCAL_NETS=""
-    TMP_IFACES=$(mktemp)
+    TMP_IFACES="/tmp/interfaces_$$"
     
     # Собираем все сети кроме туннеля и loopback
     ip -o addr show 2>/dev/null | awk '$2 != "lo" && NF >= 4 {print $2, $4}' > "$TMP_IFACES"
     
     while read -r IFACE IP; do
         # Пропускаем туннель и loopback
-        if [ "$IFACE" = "$TUNNEL_IF" ]; then
-            continue
-        fi
-        if [ "$IFACE" = "lo" ]; then
-            continue
-        fi
-        if [ -z "$IP" ]; then
-            continue
-        fi
+        case "$IFACE" in
+            "$TUNNEL_IF"|lo)
+                continue
+                ;;
+        esac
+        
+        [ -z "$IP" ] && continue
         
         # Извлекаем сеть из IP/маски
         NET_IP=$(echo "$IP" | cut -d'/' -f1)
@@ -254,6 +335,7 @@ get_local_networks() {
         read USE_FOUND
         case "$USE_FOUND" in
             [Yy]*)
+                print_success "Используем найденные сети"
                 ;;
             *)
                 printf "Введите сети вручную (через пробел): "
@@ -272,9 +354,10 @@ configure_ospf() {
     echo ""
     printf "Введите пароль для OSPF аутентификации: "
     # Отключаем эхо для пароля
+    old_stty=$(stty -g)
     stty -echo
     read OSPF_PASS
-    stty echo
+    stty "$old_stty"
     echo ""
     
     if [ -z "$OSPF_PASS" ]; then
@@ -288,7 +371,7 @@ configure_ospf() {
     vtysh -c "conf t" -c "no router ospf" 2>/dev/null || true
     
     # Создаем новую конфигурацию
-    TMP_CONFIG=$(mktemp)
+    TMP_CONFIG="/tmp/ospf_config_$$"
     
     cat > "$TMP_CONFIG" << EOFCONFIG
 configure terminal
@@ -410,6 +493,12 @@ check_status() {
     echo ""
     print_info "OSPF маршруты:"
     vtysh -c "show ip route ospf" 2>/dev/null | head -10 || print_warn "Маршруты не найдены"
+    
+    echo ""
+    print_info "Статус туннеля:"
+    if [ -n "$TUNNEL_IF" ]; then
+        ip addr show "$TUNNEL_IF" 2>/dev/null || print_warn "Туннель не найден"
+    fi
 }
 
 # ==============================================================================
@@ -419,7 +508,9 @@ check_status() {
 clear
 print_header "АВТОМАТИЧЕСКАЯ НАСТРОЙКА OSPF ДЛЯ FRR (ALT Linux)"
 
+check_root
 check_install_frr
+load_gre_module
 show_interfaces
 select_tunnel_interface
 get_router_id
