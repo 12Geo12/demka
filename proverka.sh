@@ -1,308 +1,279 @@
 #!/bin/sh
 #===============================================================================
-#                    СКРИПТ НАСТРОЙКИ GRE-ТУННЕЛЯ НА ALTLINUX SERVER
+#           СКРИПТ НАСТРОЙКИ GRE-ТУННЕЛЯ И OSPF НА ALTLINUX SERVER
 #===============================================================================
-# Данный скрипт выполняет настройку IP-туннеля (GRE) между маршрутизаторами
-# офисов HQ и BR на базе AltLinux Server.
+# Настройка туннеля GRE между маршрутизаторами HQ-R и BR-R
+# с динамической маршрутизацией OSPF (FRR)
 #===============================================================================
 
 # Глобальные переменные
-EXTERNAL_INTERFACE=""
-EXTERNAL_IP=""
-EXTERNAL_PREFIX=""
-REMOTE_IP=""
-TUNNEL_LOCAL=""
+TUNNEL_IFACE="tun1"
+TUNNEL_DIR="/etc/net/ifaces/$TUNNEL_IFACE"
+ROLE=""
+EXTERNAL_IF=""
+TUNLOCAL=""
+TUNREMOTE=""
+TUNNEL_IP=""
 TUNNEL_REMOTE=""
-TUNNEL_PREFIX=""
-TUNNEL_PASSWORD=""
-TUNNEL_IFACE="gre1"
+LOCAL_NETWORK=""
 
 #-------------------------------------------------------------------------------
 # ФУНКЦИИ
 #-------------------------------------------------------------------------------
 
 log_info() {
-    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo "[INFO] $1"
 }
 
 log_error() {
-    echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo "[ERROR] $1"
 }
 
 log_success() {
-    echo "[SUCCESS] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo "[SUCCESS] $1"
 }
 
-# Получение всех интерфейсов с IP-адресами
-get_all_interfaces() {
-    log_info "Получение списка интерфейсов..."
-    
+# Получение списка интерфейсов
+get_interfaces() {
     echo ""
     echo "========================================"
     echo "    ДОСТУПНЫЕ СЕТЕВЫЕ ИНТЕРФЕЙСЫ"
     echo "========================================"
     echo ""
     
-    # Временный файл для хранения интерфейсов
-    TMP_FILE="/tmp/tunnel_interfaces.tmp"
+    TMP_FILE="/tmp/ifaces_list.tmp"
     > "$TMP_FILE"
+    count=0
     
-    local_count=0
-    
-    # Получаем все интерфейсы с IPv4 адресами (кроме lo)
-    ip -4 addr show | grep -v "^1:" | while read -r line; do
-        # Ищем имя интерфейса
+    ip -4 addr show | while read -r line; do
         iface=$(echo "$line" | grep -oE "^[0-9]+: [^:]+" | sed 's/^[0-9]*: //')
         if [ -n "$iface" ]; then
             current_iface="$iface"
         fi
         
-        # Ищем IP-адрес
         ip_addr=$(echo "$line" | grep -oE "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+" | sed 's/inet //')
-        if [ -n "$ip_addr" ] && [ -n "$current_iface" ]; then
-            local_count=$((local_count + 1))
-            echo "$local_count $current_iface $ip_addr" >> "$TMP_FILE"
-            echo "  $local_count) Интерфейс: $current_iface"
+        if [ -n "$ip_addr" ] && [ -n "$current_iface" ] && [ "$current_iface" != "lo" ]; then
+            count=$((count + 1))
+            echo "$count $current_iface $ip_addr" >> "$TMP_FILE"
+            echo "  $count) Интерфейс: $current_iface"
             echo "     IP-адрес: $ip_addr"
             echo ""
         fi
     done
     
-    if [ ! -s "$TMP_FILE" ]; then
-        log_error "Не найдено интерфейсов с IPv4 адресами"
-        rm -f "$TMP_FILE"
-        return 1
-    fi
-    
     echo "----------------------------------------"
-    return 0
 }
 
-# Выбор внешнего интерфейса
-select_external_interface() {
+# Выбор интерфейса
+select_interface() {
     echo ""
-    echo "Выберите номер интерфейса для туннеля:"
-    printf "Введите номер: "
+    printf "Выберите номер интерфейса для туннеля: "
     read -r selection
     
-    # Проверка ввода
     if [ -z "$selection" ]; then
-        log_error "Не указан номер интерфейса"
+        log_error "Не указан номер"
         return 1
     fi
     
-    # Получаем данные выбранного интерфейса
-    selected_line=$(grep "^$selection " /tmp/tunnel_interfaces.tmp)
+    selected_line=$(grep "^$selection " /tmp/ifaces_list.tmp 2>/dev/null)
     
     if [ -z "$selected_line" ]; then
         log_error "Неверный выбор"
-        rm -f /tmp/tunnel_interfaces.tmp
         return 1
     fi
     
-    EXTERNAL_INTERFACE=$(echo "$selected_line" | awk '{print $2}')
+    EXTERNAL_IF=$(echo "$selected_line" | awk '{print $2}')
     local ip_with_mask=$(echo "$selected_line" | awk '{print $3}')
-    EXTERNAL_IP=$(echo "$ip_with_mask" | cut -d'/' -f1)
-    EXTERNAL_PREFIX=$(echo "$ip_with_mask" | cut -d'/' -f2)
+    TUNLOCAL=$(echo "$ip_with_mask" | cut -d'/' -f1)
     
-    rm -f /tmp/tunnel_interfaces.tmp
+    rm -f /tmp/ifaces_list.tmp
     
     echo ""
-    echo "----------------------------------------"
-    echo "Выбран интерфейс: $EXTERNAL_INTERFACE"
-    echo "IP-адрес: $EXTERNAL_IP/$EXTERNAL_PREFIX"
+    echo "Выбран интерфейс: $EXTERNAL_IF"
+    echo "IP-адрес: $TUNLOCAL"
     echo "----------------------------------------"
     
     return 0
 }
 
-# Запрос удаленного IP-адреса
-get_remote_ip() {
+# Выбор роли маршрутизатора
+select_role() {
     echo ""
     echo "========================================"
-    echo "    НАСТРОЙКА УДАЛЕННОГО IP-АДРЕСА"
+    echo "    ВЫБОР РОЛИ МАРШРУТИЗАТОРА"
     echo "========================================"
     echo ""
-    echo "Введите IP-адрес удаленного маршрутизатора."
-    echo "Это внешний IP-адрес другого конца туннеля."
+    echo "  1) HQ-R (главный офис)"
+    echo "  2) BR-R (филиал)"
     echo ""
-    printf "Удаленный IP-адрес (без маски): "
-    read -r REMOTE_IP
+    printf "Ваш выбор [1-2]: "
+    read -r role_choice
     
-    if [ -z "$REMOTE_IP" ]; then
-        log_error "IP-адрес не указан"
-        return 1
-    fi
-    
-    # Простая проверка формата
-    if ! echo "$REMOTE_IP" | grep -qE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$"; then
-        log_error "Неверный формат IP-адреса"
-        return 1
-    fi
-    
-    echo ""
-    echo "Удаленный IP-адрес: $REMOTE_IP"
-    echo "----------------------------------------"
-    
-    return 0
-}
-
-# Запрос туннельных IP-адресов
-get_tunnel_ips() {
-    echo ""
-    echo "========================================"
-    echo "    НАСТРОЙКА ТУННЕЛЬНЫХ IP-АДРЕСОВ"
-    echo "========================================"
-    echo ""
-    echo "Введите IP-адреса для туннельного интерфейса."
-    echo "Обычно используется сеть 10.10.0.0/30 или 10.0.0.0/30"
-    echo ""
-    
-    printf "Локальный туннельный IP (например, 10.10.0.1): "
-    read -r TUNNEL_LOCAL
-    
-    if [ -z "$TUNNEL_LOCAL" ]; then
-        log_error "IP-адрес не указан"
-        return 1
-    fi
-    
-    printf "Маска подсети туннеля [30]: "
-    read -r TUNNEL_PREFIX
-    
-    if [ -z "$TUNNEL_PREFIX" ]; then
-        TUNNEL_PREFIX="30"
-    fi
-    
-    printf "Удаленный туннельный IP (например, 10.10.0.2): "
-    read -r TUNNEL_REMOTE
-    
-    if [ -z "$TUNNEL_REMOTE" ]; then
-        log_error "IP-адрес не указан"
-        return 1
-    fi
-    
-    echo ""
-    echo "----------------------------------------"
-    echo "Локальный туннельный IP: $TUNNEL_LOCAL/$TUNNEL_PREFIX"
-    echo "Удаленный туннельный IP: $TUNNEL_REMOTE"
-    echo "----------------------------------------"
-    
-    return 0
-}
-
-# Выбор пароля аутентификации
-select_password() {
-    echo ""
-    echo "========================================"
-    echo "    ВЫБОР ПАРОЛЯ АУТЕНТИФИКАЦИИ"
-    echo "========================================"
-    echo ""
-    echo "Выберите опцию:"
-    echo "  1) Пароль по умолчанию: P@ssw0rd"
-    echo "  2) Ввести свой пароль"
-    echo "  3) Сгенерировать случайный пароль"
-    echo ""
-    printf "Ваш выбор [1-3]: "
-    read -r password_choice
-    
-    case "$password_choice" in
+    case "$role_choice" in
         1)
-            TUNNEL_PASSWORD="P@ssw0rd"
-            log_info "Выбран пароль по умолчанию"
+            ROLE="HQ-R"
+            TUNNEL_IP="172.16.0.1/30"
+            TUNNEL_REMOTE="172.16.0.2"
             ;;
         2)
-            printf "Введите пароль: "
-            read -r TUNNEL_PASSWORD
-            if [ -z "$TUNNEL_PASSWORD" ]; then
-                log_error "Пароль пуст. Используется по умолчанию."
-                TUNNEL_PASSWORD="P@ssw0rd"
-            fi
-            log_info "Установлен пользовательский пароль"
-            ;;
-        3)
-            TUNNEL_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9@#$%' | head -c 16)
-            log_info "Сгенерирован случайный пароль"
+            ROLE="BR-R"
+            TUNNEL_IP="172.16.0.2/30"
+            TUNNEL_REMOTE="172.16.0.1"
             ;;
         *)
-            TUNNEL_PASSWORD="P@ssw0rd"
-            log_info "Неверный выбор. Используется пароль по умолчанию."
+            log_error "Неверный выбор"
+            return 1
             ;;
     esac
     
     echo ""
+    echo "Роль: $ROLE"
+    echo "Туннельный IP: $TUNNEL_IP"
     echo "----------------------------------------"
-    echo "Пароль аутентификации: $TUNNEL_PASSWORD"
-    echo "----------------------------------------"
-    echo ""
+    
+    return 0
 }
 
-# Загрузка модуля GRE
-load_gre_module() {
-    log_info "Загрузка модуля GRE..."
+# Ввод удаленного IP
+get_remote_ip() {
+    echo ""
+    echo "========================================"
+    echo "    НАСТРОЙКА УДАЛЕННОГО IP"
+    echo "========================================"
+    echo ""
+    echo "Введите внешний IP-адрес удаленного маршрутизатора."
+    echo ""
+    printf "Удаленный IP-адрес: "
+    read -r TUNREMOTE
     
-    if modprobe gre 2>/dev/null; then
-        echo "Модуль GRE успешно загружен"
-    else
-        log_error "Не удалось загрузить модуль GRE"
+    if [ -z "$TUNREMOTE" ]; then
+        log_error "IP не указан"
         return 1
     fi
     
-    # Добавляем в автозагрузку
-    if [ -f /etc/modules ]; then
-        if ! grep -q "^gre" /etc/modules; then
-            echo "gre" >> /etc/modules
-            echo "Модуль GRE добавлен в автозагрузку"
+    echo ""
+    echo "Удаленный IP: $TUNREMOTE"
+    echo "----------------------------------------"
+    
+    return 0
+}
+
+# Ввод локальной сети
+get_local_network() {
+    echo ""
+    echo "========================================"
+    echo "    НАСТРОЙКА ЛОКАЛЬНОЙ СЕТИ"
+    echo "========================================"
+    echo ""
+    echo "Введите сеть для анонса через OSPF."
+    echo "HQ-R: обычно 192.168.0.0/25"
+    echo "BR-R: обычно 192.168.0.128/27"
+    echo ""
+    printf "Локальная сеть (например, 192.168.0.0/25): "
+    read -r LOCAL_NETWORK
+    
+    if [ -z "$LOCAL_NETWORK" ]; then
+        if [ "$ROLE" = "HQ-R" ]; then
+            LOCAL_NETWORK="192.168.0.0/25"
+        else
+            LOCAL_NETWORK="192.168.0.128/27"
         fi
+        echo "Используется сеть по умолчанию: $LOCAL_NETWORK"
     fi
     
     echo ""
-    echo "Проверка загруженных модулей:"
-    lsmod | grep gre
-    echo ""
+    echo "Локальная сеть: $LOCAL_NETWORK"
+    echo "----------------------------------------"
+    
+    return 0
 }
 
-# Создание конфигурации туннеля
-create_tunnel_config() {
-    log_info "Создание конфигурации туннеля..."
+# Выбор пароля OSPF
+select_password() {
+    echo ""
+    echo "========================================"
+    echo "    ПАРОЛЬ АУТЕНТИФИКАЦИИ OSPF"
+    echo "========================================"
+    echo ""
+    echo "  1) Пароль по умолчанию: P@ssw0rd"
+    echo "  2) Ввести свой пароль"
+    echo "  3) Без пароля"
+    echo ""
+    printf "Ваш выбор [1-3]: "
+    read -r pass_choice
     
-    TUNNEL_DIR="/etc/net/ifaces/$TUNNEL_IFACE"
+    case "$pass_choice" in
+        1)
+            OSPF_PASSWORD="P@ssw0rd"
+            USE_AUTH="yes"
+            ;;
+        2)
+            printf "Введите пароль: "
+            read -r OSPF_PASSWORD
+            if [ -z "$OSPF_PASSWORD" ]; then
+                OSPF_PASSWORD="P@ssw0rd"
+            fi
+            USE_AUTH="yes"
+            ;;
+        3)
+            OSPF_PASSWORD=""
+            USE_AUTH="no"
+            ;;
+        *)
+            OSPF_PASSWORD="P@ssw0rd"
+            USE_AUTH="yes"
+            ;;
+    esac
+    
+    echo ""
+    if [ "$USE_AUTH" = "yes" ]; then
+        echo "Пароль OSPF: $OSPF_PASSWORD"
+    else
+        echo "Аутентификация OSPF отключена"
+    fi
+    echo "----------------------------------------"
+}
+
+# Создание туннеля
+create_tunnel() {
+    log_info "Создание конфигурации туннеля..."
     
     # Создание директории
     mkdir -p "$TUNNEL_DIR"
     
-    # Создание файла options
+    # Файл ipv4address
+    echo "$TUNNEL_IP" > "$TUNNEL_DIR/ipv4address"
+    echo "Создан: $TUNNEL_DIR/ipv4address"
+    cat "$TUNNEL_DIR/ipv4address"
+    echo ""
+    
+    # Файл options
     cat > "$TUNNEL_DIR/options" << EOF
 TYPE=iptun
 TUNTYPE=gre
-TUNLOCAL=$EXTERNAL_IP
-TUNREMOTE=$REMOTE_IP
+TUNLOCAL=$TUNLOCAL
+TUNREMOTE=$TUNREMOTE
 TUNOPTIONS='ttl 64'
+HOST=$EXTERNAL_IF
 EOF
     
-    echo "Создан файл: $TUNNEL_DIR/options"
+    echo "Создан: $TUNNEL_DIR/options"
     cat "$TUNNEL_DIR/options"
-    echo ""
-    
-    # Создание файла ipv4address
-    cat > "$TUNNEL_DIR/ipv4address" << EOF
-$TUNNEL_LOCAL/$TUNNEL_PREFIX
-EOF
-    
-    echo "Создан файл: $TUNNEL_DIR/ipv4address"
-    cat "$TUNNEL_DIR/ipv4address"
     echo ""
     
     log_success "Конфигурация туннеля создана"
 }
 
-# Перезапуск сетевой службы
+# Перезапуск сети
 restart_network() {
     log_info "Перезапуск сетевой службы..."
     
-    if systemctl restart network; then
-        echo "Сетевая служба успешно перезапущена"
+    systemctl restart network
+    
+    if [ $? -eq 0 ]; then
+        echo "Сеть успешно перезапущена"
     else
-        log_error "Ошибка при перезапуске сетевой службы"
+        log_error "Ошибка перезапуска сети"
         return 1
     fi
     
@@ -311,81 +282,112 @@ restart_network() {
 
 # Проверка туннеля
 verify_tunnel() {
-    log_info "Проверка туннельного интерфейса..."
+    log_info "Проверка туннеля..."
     
     echo ""
-    echo "Состояние интерфейсов:"
-    ip -br a 2>/dev/null | grep -E "(gre|$TUNNEL_IFACE)" || echo "Интерфейс не найден"
+    echo "Интерфейсы:"
+    ip -br a | grep -E "(tun|$TUNNEL_IFACE)"
     echo ""
     
-    echo "Детальная информация о туннеле:"
-    ip a show "$TUNNEL_IFACE" 2>/dev/null || echo "Интерфейс $TUNNEL_IFACE не найден"
-    echo ""
-    
-    echo "Маршруты:"
-    ip r | grep -E "(gre|10\.)" || echo "Маршруты не найдены"
+    echo "Туннельный интерфейс $TUNNEL_IFACE:"
+    ip a show "$TUNNEL_IFACE" 2>/dev/null || echo "Интерфейс не найден"
     echo ""
 }
 
 # Тест связности
-test_tunnel_connectivity() {
-    log_info "Проверка связности туннеля..."
+test_connectivity() {
+    echo ""
+    printf "Проверить связность туннеля? [Y/n]: "
+    read -r test_choice
+    
+    case "$test_choice" in
+        [Nn])
+            return
+            ;;
+    esac
     
     echo ""
-    echo "Пинг удаленного туннельного адреса ($TUNNEL_REMOTE):"
+    echo "Пинг $TUNNEL_REMOTE:"
     ping -c 4 "$TUNNEL_REMOTE"
     echo ""
 }
 
-# Настройка OSPF
-setup_ospf() {
-    echo ""
-    printf "Настроить OSPF для динамической маршрутизации? [y/N]: "
-    read -r ospf_choice
+# Установка FRR
+install_frr() {
+    log_info "Установка FRR..."
     
-    case "$ospf_choice" in
-        [Yy]|[Yy][Ee][Ss])
-            log_info "Установка FRR..."
-            
-            apt-get update
-            apt-get install -y frr
-            
-            # Включение OSPF
-            if [ -f /etc/frr/daemons ]; then
-                sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons
-            fi
-            
-            systemctl enable --now frr
-            systemctl restart frr
-            
-            echo ""
-            echo "FRR установлен и запущен"
-            echo ""
-            echo "Настройка OSPF через vtysh:"
-            echo "----------------------------------------"
-            echo "vtysh"
-            echo "conf t"
-            echo "router ospf"
-            echo "ospf router-id $TUNNEL_LOCAL"
-            echo "network ${TUNNEL_LOCAL%.*.*}.0.0/30 area 0"
-            echo "area 0 authentication"
-            echo "exit"
-            echo "interface $TUNNEL_IFACE"
-            echo "ip ospf authentication-key $TUNNEL_PASSWORD"
-            echo "ip ospf authentication"
-            echo "no ip ospf passive"
-            echo "exit"
-            echo "exit"
-            echo "wr"
-            echo "----------------------------------------"
-            echo ""
-            
-            log_success "Базовая настройка OSPF подготовлена"
-            ;;
-        *)
-            log_info "Пропуск настройки OSPF"
-            ;;
-    esac
+    apt-get update
+    apt-get install -y frr
+    
+    systemctl enable --now frr
+    
+    echo ""
+    log_success "FRR установлен"
+}
+
+# Настройка FRR
+configure_frr() {
+    log_info "Настройка OSPF..."
+    
+    # Включаем OSPF в daemons
+    if [ -f /etc/frr/daemons ]; then
+        sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons
+        echo "OSPF включен в /etc/frr/daemons"
+    fi
+    
+    # Перезапускаем FRR
+    systemctl restart frr
+    
+    # Настраиваем OSPF через vtysh
+    echo ""
+    echo "Настройка OSPF через vtysh..."
+    
+    if [ "$USE_AUTH" = "yes" ]; then
+        vtysh -c "conf t" \
+              -c "router ospf" \
+              -c "passive-interface default" \
+              -c "network $LOCAL_NETWORK area 0" \
+              -c "network 172.16.0.0/30 area 0" \
+              -c "area 0 authentication" \
+              -c "exit" \
+              -c "int $TUNNEL_IFACE" \
+              -c "ip ospf authentication-key $OSPF_PASSWORD" \
+              -c "ip ospf authentication" \
+              -c "ip ospf network point-to-point" \
+              -c "no ip ospf passive" \
+              -c "do wr"
+    else
+        vtysh -c "conf t" \
+              -c "router ospf" \
+              -c "passive-interface default" \
+              -c "network $LOCAL_NETWORK area 0" \
+              -c "network 172.16.0.0/30 area 0" \
+              -c "exit" \
+              -c "int $TUNNEL_IFACE" \
+              -c "ip ospf network point-to-point" \
+              -c "no ip ospf passive" \
+              -c "do wr"
+    fi
+    
+    echo ""
+    log_success "OSPF настроен"
+}
+
+# Проверка OSPF
+verify_ospf() {
+    echo ""
+    echo "========================================"
+    echo "    ПРОВЕРКА OSPF"
+    echo "========================================"
+    echo ""
+    
+    echo "Соседи OSPF:"
+    vtysh -c "show ip ospf neighbor"
+    echo ""
+    
+    echo "Маршруты OSPF:"
+    vtysh -c "show ip route ospf"
+    echo ""
 }
 
 # Итоговая информация
@@ -395,22 +397,29 @@ print_summary() {
     echo "         ИТОГОВАЯ ИНФОРМАЦИЯ"
     echo "========================================"
     echo ""
-    echo "Внешний интерфейс: $EXTERNAL_INTERFACE"
-    echo "Локальный IP: $EXTERNAL_IP/$EXTERNAL_PREFIX"
-    echo "Удаленный IP: $REMOTE_IP"
+    echo "Роль: $ROLE"
+    echo ""
+    echo "Внешний интерфейс: $EXTERNAL_IF"
+    echo "Локальный IP: $TUNLOCAL"
+    echo "Удаленный IP: $TUNREMOTE"
     echo ""
     echo "Туннельный интерфейс: $TUNNEL_IFACE"
-    echo "Локальный туннельный IP: $TUNNEL_LOCAL/$TUNNEL_PREFIX"
+    echo "Туннельный IP: $TUNNEL_IP"
     echo "Удаленный туннельный IP: $TUNNEL_REMOTE"
     echo ""
-    echo "Пароль аутентификации: $TUNNEL_PASSWORD"
+    echo "Локальная сеть: $LOCAL_NETWORK"
+    if [ "$USE_AUTH" = "yes" ]; then
+        echo "Пароль OSPF: $OSPF_PASSWORD"
+    fi
     echo ""
-    echo "Конфигурационные файлы:"
+    echo "Конфигурация:"
     echo "  /etc/net/ifaces/$TUNNEL_IFACE/options"
     echo "  /etc/net/ifaces/$TUNNEL_IFACE/ipv4address"
     echo ""
-    echo "Проверка туннеля:"
+    echo "Проверка:"
+    echo "  ip a show $TUNNEL_IFACE"
     echo "  ping $TUNNEL_REMOTE"
+    echo "  vtysh -c 'show ip ospf neighbor'"
     echo ""
     echo "========================================"
 }
@@ -422,36 +431,36 @@ print_summary() {
 clear
 
 echo "==============================================================================="
-echo "                 СКРИПТ НАСТРОЙКИ GRE-ТУННЕЛЯ НА ALTLINUX SERVER"
+echo "      СКРИПТ НАСТРОЙКИ GRE-ТУННЕЛЯ И OSPF НА ALTLINUX SERVER"
 echo "==============================================================================="
 echo ""
-echo "Данный скрипт выполнит:"
-echo "  1. Определение доступных интерфейсов"
-echo "  2. Выбор внешнего интерфейса для туннеля"
-echo "  3. Настройку параметров туннеля"
-echo "  4. Настройку парольной аутентификации"
-echo "  5. Проверку работоспособности туннеля"
+echo "Выполняется:"
+echo "  1. Создание GRE-туннеля (tun1)"
+echo "  2. Настройка IP-адресов туннеля"
+echo "  3. Установка и настройка FRR (OSPF)"
+echo "  4. Настройка динамической маршрутизации"
 echo ""
 
-# Проверка прав root
+# Проверка root
 if [ "$(id -u)" -ne 0 ]; then
-    log_error "Скрипт должен выполняться от имени root"
+    log_error "Запустите от root"
     exit 1
 fi
 
-# Шаг 1: Получение списка интерфейсов
-get_all_interfaces || exit 1
+# Выбор интерфейса
+get_interfaces
+select_interface || exit 1
 
-# Шаг 2: Выбор внешнего интерфейса
-select_external_interface || exit 1
+# Выбор роли
+select_role || exit 1
 
-# Шаг 3: Запрос удаленного IP
+# Удаленный IP
 get_remote_ip || exit 1
 
-# Шаг 4: Запрос туннельных IP
-get_tunnel_ips || exit 1
+# Локальная сеть
+get_local_network || exit 1
 
-# Шаг 5: Выбор пароля
+# Пароль
 select_password
 
 # Подтверждение
@@ -460,52 +469,53 @@ echo "========================================"
 echo "    ПОДТВЕРЖДЕНИЕ ПАРАМЕТРОВ"
 echo "========================================"
 echo ""
-echo "Внешний интерфейс: $EXTERNAL_INTERFACE ($EXTERNAL_IP/$EXTERNAL_PREFIX)"
-echo "Удаленный IP: $REMOTE_IP"
-echo "Локальный туннельный IP: $TUNNEL_LOCAL/$TUNNEL_PREFIX"
-echo "Удаленный туннельный IP: $TUNNEL_REMOTE"
-echo "Пароль: $TUNNEL_PASSWORD"
+echo "Роль: $ROLE"
+echo "Внешний интерфейс: $EXTERNAL_IF ($TUNLOCAL)"
+echo "Удаленный IP: $TUNREMOTE"
+echo "Туннельный IP: $TUNNEL_IP"
+echo "Локальная сеть: $LOCAL_NETWORK"
 echo ""
-printf "Продолжить настройку? [Y/n]: "
+printf "Продолжить? [Y/n]: "
 read -r confirm
 
 case "$confirm" in
-    [Nn]|[Nn][Oo])
-        log_info "Настройка отменена"
+    [Nn])
+        log_info "Отменено"
         exit 0
         ;;
 esac
 
-# Шаг 6: Загрузка модуля GRE
-load_gre_module
+# Создание туннеля
+create_tunnel
 
-# Шаг 7: Создание конфигурации
-create_tunnel_config
-
-# Шаг 8: Перезапуск сети
+# Перезапуск сети
 restart_network
 
-# Шаг 9: Проверка
+# Проверка туннеля
 verify_tunnel
 
-# Шаг 10: Тест связности
-echo ""
-printf "Выполнить тест связности? [Y/n]: "
-read -r test_choice
+# Тест связности
+test_connectivity
 
-case "$test_choice" in
-    [Nn]|[Nn][Oo])
-        ;;
-    *)
-        test_tunnel_connectivity
+# Установка FRR
+printf "Установить и настроить FRR (OSPF)? [Y/n]: "
+read -r frr_choice
+
+case "$frr_choice" in
+    [Nn])
+        print_summary
+        log_success "Туннель настроен. OSPF пропущен."
+        exit 0
         ;;
 esac
 
-# Шаг 11: Настройка OSPF
-setup_ospf
+install_frr
+configure_frr
+verify_ospf
 
-# Итоговая информация
+# Итог
 print_summary
 
-log_success "Настройка GRE-туннеля завершена!"
+log_success "Настройка завершена!"
 echo ""
+
