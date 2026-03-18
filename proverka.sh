@@ -8,10 +8,17 @@
 #===============================================================================
 
 #-------------------------------------------------------------------------------
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+#-------------------------------------------------------------------------------
+declare -a INTERFACES
+declare -a IP_ADDRESSES
+INTERFACE_COUNT=0
+
+#-------------------------------------------------------------------------------
 # ФУНКЦИИ
 #-------------------------------------------------------------------------------
 
-# Вывод информации с меткой времени
+# Вывод информации
 log_info() {
     echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
@@ -24,91 +31,142 @@ log_success() {
     echo "[SUCCESS] $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-# Автоматическое определение IP-адреса внешнего интерфейса
-detect_external_ip() {
-    log_info "Определение внешнего IP-адреса..."
+# Получение всех интерфейсов с IP-адресами
+get_all_interfaces() {
+    log_info "Получение списка интерфейсов..."
     
-    # Получаем список интерфейсов с IP-адресами из сети 172.16.0.0/12
-    local interfaces=$(ip -4 addr show | grep -E "inet 172\.(1[0-6]|[0-9])\." | head -1)
+    echo ""
+    echo "========================================"
+    echo "    ДОСТУПНЫЕ СЕТЕВЫЕ ИНТЕРФЕЙСЫ"
+    echo "========================================"
+    echo ""
     
-    if [ -z "$interfaces" ]; then
-        log_error "Не найден интерфейс с IP-адресом из сети 172.16.0.0/12"
+    # Используем глобальные массивы
+    local count=0
+    
+    # Получаем все интерфейсы с IPv4 адресами
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[0-9]+:[[:space:]]([^:]+): ]]; then
+            current_iface="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ inet[[:space:]]([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+) ]]; then
+            ip_addr="${BASH_REMATCH[1]}"
+            # Пропускаем loopback
+            if [[ "$current_iface" != "lo" ]]; then
+                count=$((count + 1))
+                INTERFACES+=("$current_iface")
+                IP_ADDRESSES+=("$ip_addr")
+                echo "  $count) Интерфейс: $current_iface"
+                echo "     IP-адрес: $ip_addr"
+                echo ""
+            fi
+        fi
+    done < <(ip -4 addr show)
+    
+    if [ $count -eq 0 ]; then
+        log_error "Не найдено интерфейсов с IPv4 адресами"
         return 1
     fi
     
-    EXTERNAL_INTERFACE=$(echo "$interfaces" | awk '{print $NF}')
-    EXTERNAL_IP=$(echo "$interfaces" | awk '{print $2}' | cut -d'/' -f1)
-    EXTERNAL_PREFIX=$(echo "$interfaces" | awk '{print $2}' | cut -d'/' -f2)
+    INTERFACE_COUNT=$count
     
     echo "----------------------------------------"
-    echo "Найден внешний интерфейс: $EXTERNAL_INTERFACE"
+    return 0
+}
+
+# Выбор внешнего интерфейса
+select_external_interface() {
+    echo ""
+    echo "Выберите номер интерфейса, который будет использоваться для туннеля:"
+    echo -n "Введите номер [1-$INTERFACE_COUNT]: "
+    read -r selection
+    
+    if [[ ! "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$INTERFACE_COUNT" ]; then
+        log_error "Неверный выбор"
+        return 1
+    fi
+    
+    local idx=$((selection - 1))
+    EXTERNAL_INTERFACE="${INTERFACES[$idx]}"
+    local ip_with_mask="${IP_ADDRESSES[$idx]}"
+    EXTERNAL_IP="${ip_with_mask%/*}"
+    EXTERNAL_PREFIX="${ip_with_mask#*/}"
+    
+    echo ""
+    echo "----------------------------------------"
+    echo "Выбран внешний интерфейс: $EXTERNAL_INTERFACE"
     echo "IP-адрес: $EXTERNAL_IP/$EXTERNAL_PREFIX"
     echo "----------------------------------------"
     
     return 0
 }
 
-# Определение удаленного IP-адреса для туннеля
-detect_remote_ip() {
-    log_info "Определение удаленного IP-адреса для туннеля..."
+# Запрос удаленного IP-адреса у пользователя
+get_remote_ip() {
+    echo ""
+    echo "========================================"
+    echo "    НАСТРОЙКА УДАЛЕННОГО IP-АДРЕСА"
+    echo "========================================"
+    echo ""
+    echo "Введите IP-адрес удаленного маршрутизатора для туннеля."
+    echo "Это внешний IP-адрес другого конца туннеля."
+    echo ""
+    echo -n "Удаленный IP-адрес (без маски): "
+    read -r REMOTE_IP
     
-    # Определяем роль маршрутизатора по IP-адресу
-    case "$EXTERNAL_IP" in
-        172.16.1.*)
-            # HQ-RTR (сеть 172.16.1.0/28)
-            ROUTER_ROLE="HQ-RTR"
-            REMOTE_IP="172.16.2.2"
-            TUNNEL_LOCAL="10.10.0.1"
-            TUNNEL_REMOTE="10.10.0.2"
-            TUNNEL_PREFIX="30"
-            log_info "Определена роль: HQ-RTR"
-            ;;
-        172.16.2.*)
-            # BR-RTR (сеть 172.16.2.0/28)
-            ROUTER_ROLE="BR-RTR"
-            REMOTE_IP="172.16.1.2"
-            TUNNEL_LOCAL="10.10.0.2"
-            TUNNEL_REMOTE="10.10.0.1"
-            TUNNEL_PREFIX="30"
-            log_info "Определена роль: BR-RTR"
-            ;;
-        172.16.4.*)
-            # Альтернативная конфигурация HQ-RTR
-            ROUTER_ROLE="HQ-RTR"
-            REMOTE_IP="172.16.5.2"
-            TUNNEL_LOCAL="10.0.0.1"
-            TUNNEL_REMOTE="10.0.0.2"
-            TUNNEL_PREFIX="30"
-            log_info "Определена роль: HQ-RTR (альтернативная сеть)"
-            ;;
-        172.16.5.*)
-            # Альтернативная конфигурация BR-RTR
-            ROUTER_ROLE="BR-RTR"
-            REMOTE_IP="172.16.4.2"
-            TUNNEL_LOCAL="10.0.0.2"
-            TUNNEL_REMOTE="10.0.0.1"
-            TUNNEL_PREFIX="30"
-            log_info "Определена роль: BR-RTR (альтернативная сеть)"
-            ;;
-        *)
-            log_error "Не удалось определить роль маршрутизатора для IP: $EXTERNAL_IP"
-            echo "Введите удаленный IP-адрес вручную:"
-            read -r REMOTE_IP
-            echo "Введите локальный туннельный IP-адрес (например, 10.10.0.1):"
-            read -r TUNNEL_LOCAL
-            echo "Введите удаленный туннельный IP-адрес (например, 10.10.0.2):"
-            read -r TUNNEL_REMOTE
-            TUNNEL_PREFIX="30"
-            ROUTER_ROLE="CUSTOM"
-            ;;
-    esac
+    # Проверка формата IP
+    if [[ ! "$REMOTE_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Неверный формат IP-адреса"
+        return 1
+    fi
     
+    echo ""
+    echo "Удаленный IP-адрес: $REMOTE_IP"
     echo "----------------------------------------"
-    echo "Роль маршрутизатора: $ROUTER_ROLE"
-    echo "Удаленный IP: $REMOTE_IP"
+    
+    return 0
+}
+
+# Запрос туннельных IP-адресов
+get_tunnel_ips() {
+    echo ""
+    echo "========================================"
+    echo "    НАСТРОЙКА ТУННЕЛЬНЫХ IP-АДРЕСОВ"
+    echo "========================================"
+    echo ""
+    echo "Введите IP-адреса для туннельного интерфейса."
+    echo "Обычно используется сеть 10.10.0.0/30 или 10.0.0.0/30"
+    echo ""
+    
+    echo -n "Локальный туннельный IP-адрес (например, 10.10.0.1): "
+    read -r TUNNEL_LOCAL
+    
+    if [[ ! "$TUNNEL_LOCAL" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Неверный формат IP-адреса"
+        return 1
+    fi
+    
+    echo -n "Маска подсети туннеля (например, 30): "
+    read -r TUNNEL_PREFIX
+    
+    if [ -z "$TUNNEL_PREFIX" ]; then
+        TUNNEL_PREFIX="30"
+    fi
+    
+    echo -n "Удаленный туннельный IP-адрес (например, 10.10.0.2): "
+    read -r TUNNEL_REMOTE
+    
+    if [[ ! "$TUNNEL_REMOTE" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Неверный формат IP-адреса"
+        return 1
+    fi
+    
+    echo ""
+    echo "----------------------------------------"
     echo "Локальный туннельный IP: $TUNNEL_LOCAL/$TUNNEL_PREFIX"
     echo "Удаленный туннельный IP: $TUNNEL_REMOTE"
     echo "----------------------------------------"
+    
+    return 0
 }
 
 # Выбор пароля для аутентификации туннеля
@@ -247,7 +305,7 @@ verify_tunnel() {
     echo ""
     
     echo "Маршруты:"
-    ip r | grep -E "(gre|10\.)"
+    ip r | grep -E "(gre|10\.)" || echo "Маршруты не найдены"
     echo ""
 }
 
@@ -292,16 +350,7 @@ setup_ospf() {
         echo "conf t"
         echo "router ospf"
         echo "ospf router-id $TUNNEL_LOCAL"
-        echo "network 10.10.0.0/30 area 0"
-        
-        # Определяем сети для анонса
-        if [ "$ROUTER_ROLE" = "HQ-RTR" ]; then
-            echo "network 192.168.100.0/27 area 0"
-            echo "network 192.168.200.64/28 area 0"
-        else
-            echo "network 192.168.3.0/28 area 0"
-        fi
-        
+        echo "network ${TUNNEL_LOCAL%.*.*}.0.0/30 area 0"
         echo "area 0 authentication"
         echo "exit"
         echo "interface $TUNNEL_IFACE"
@@ -326,8 +375,6 @@ print_summary() {
     echo "========================================"
     echo "         ИТОГОВАЯ ИНФОРМАЦИЯ"
     echo "========================================"
-    echo ""
-    echo "Роль маршрутизатора: $ROUTER_ROLE"
     echo ""
     echo "Внешний интерфейс: $EXTERNAL_INTERFACE"
     echo "Локальный IP: $EXTERNAL_IP/$EXTERNAL_PREFIX"
@@ -360,10 +407,11 @@ echo "                 СКРИПТ НАСТРОЙКИ GRE-ТУННЕЛЯ НА A
 echo "==============================================================================="
 echo ""
 echo "Данный скрипт выполнит:"
-echo "  1. Автоматическое определение IP-адресов"
-echo "  2. Создание GRE-туннеля между офисами"
-echo "  3. Настройку парольной аутентификации"
-echo "  4. Проверку работоспособности туннеля"
+echo "  1. Определение доступных интерфейсов"
+echo "  2. Выбор внешнего интерфейса для туннеля"
+echo "  3. Настройку параметров туннеля"
+echo "  4. Настройку парольной аутентификации"
+echo "  5. Проверку работоспособности туннеля"
 echo ""
 
 # Проверка прав root
@@ -372,20 +420,46 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# Шаг 1: Определение IP-адресов
-detect_external_ip
+# Шаг 1: Получение списка интерфейсов
+get_all_interfaces
 if [ $? -ne 0 ]; then
     exit 1
 fi
 
-detect_remote_ip
+# Шаг 2: Выбор внешнего интерфейса
+select_external_interface
+if [ $? -ne 0 ]; then
+    exit 1
+fi
 
-# Шаг 2: Выбор пароля
+# Шаг 3: Запрос удаленного IP
+get_remote_ip
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
+# Шаг 4: Запрос туннельных IP
+get_tunnel_ips
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
+# Шаг 5: Выбор пароля
 select_password
 
 # Подтверждение продолжения
 echo ""
-echo "Продолжить настройку туннеля? [Y/n]: "
+echo "========================================"
+echo "    ПОДТВЕРЖДЕНИЕ ПАРАМЕТРОВ"
+echo "========================================"
+echo ""
+echo "Внешний интерфейс: $EXTERNAL_INTERFACE ($EXTERNAL_IP/$EXTERNAL_PREFIX)"
+echo "Удаленный IP: $REMOTE_IP"
+echo "Локальный туннельный IP: $TUNNEL_LOCAL/$TUNNEL_PREFIX"
+echo "Удаленный туннельный IP: $TUNNEL_REMOTE"
+echo "Пароль: $TUNNEL_PASSWORD"
+echo ""
+echo -n "Продолжить настройку туннеля? [Y/n]: "
 read -r continue_choice
 
 if [[ "$continue_choice" =~ ^[Nn]$ ]]; then
@@ -393,19 +467,19 @@ if [[ "$continue_choice" =~ ^[Nn]$ ]]; then
     exit 0
 fi
 
-# Шаг 3: Загрузка модуля GRE
+# Шаг 6: Загрузка модуля GRE
 load_gre_module
 
-# Шаг 4: Создание конфигурации
+# Шаг 7: Создание конфигурации
 create_tunnel_config
 
-# Шаг 5: Перезапуск сети
+# Шаг 8: Перезапуск сети
 restart_network
 
-# Шаг 6: Проверка
+# Шаг 9: Проверка
 verify_tunnel
 
-# Шаг 7: Проверка связности
+# Шаг 10: Проверка связности
 echo "Выполнить тест связности туннеля? [Y/n]: "
 read -r test_choice
 
@@ -413,7 +487,7 @@ if [[ ! "$test_choice" =~ ^[Nn]$ ]]; then
     test_tunnel_connectivity
 fi
 
-# Шаг 8: Настройка OSPF
+# Шаг 11: Настройка OSPF
 setup_ospf
 
 # Вывод итоговой информации
