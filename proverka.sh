@@ -1,1963 +1,423 @@
 #!/bin/bash
 #===============================================================================
-# Скрипт настройки OSPF динамической маршрутизации для ALT Linux
-# Задание 7: Обеспечение динамической маршрутизации между офисами
-# Включает: создание GRE туннеля (если не существует) + настройка OSPF
+#                    СКРИПТ НАСТРОЙКИ GRE-ТУННЕЛЯ НА ALTLINUX SERVER
+#===============================================================================
+# Данный скрипт выполняет автоматическую настройку IP-туннеля (GRE) между
+# маршрутизаторами офисов HQ и BR на базе AltLinux Server.
+# Скрипт автоматически определяет IP-адреса интерфейсов и настраивает туннель.
 #===============================================================================
 
-# Цвета для вывода
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-NC='\033[0m' # No Color
+#-------------------------------------------------------------------------------
+# ФУНКЦИИ
+#-------------------------------------------------------------------------------
 
-# Файлы
-LOG_FILE="/var/log/ospf-setup.log"
-REPORT_FILE="/root/ospf-config-report.txt"
-INTERFACES_FILE="/etc/net/interfaces"
-
-# Глобальные переменные
-ROUTER_ROLE=""
-ROUTER_ID=""
-GRE_INTERFACE=""
-GRE_IP=""
-GRE_NETWORK=""
-GRE_REMOTE_IP=""
-GRE_LOCAL_IP=""
-GRE_KEY=""
-OSPF_PASSWORD=""
-OSPF_NETWORK_TYPE="point-to-point"
-NETWORKS=()
-CREATE_GRE=false
-
-#===============================================================================
-# Функции вывода
-#===============================================================================
-
-print_header() {
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║     НАСТРОЙКА OSPF ДИНАМИЧЕСКОЙ МАРШРУТИЗАЦИИ - ALT LINUX           ║"
-    echo "║                  Задание 7: Link State Protocol                      ║"
-    echo "║                                                                      ║"
-    echo "║   Функции скрипта:                                                   ║"
-    echo "║   • Создание GRE туннеля (если не существует)                        ║"
-    echo "║   • Настройка OSPF с аутентификацией                                 ║"
-    echo "║   • Автоматическое определение сетей                                 ║"
-    echo "║   • Генерация отчёта                                                 ║"
-    echo "╚══════════════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+# Вывод информации с меткой времени
+log_info() {
+    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-print_section() {
-    echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}  $1${NC}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+log_error() {
+    echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-print_success() {
-    echo -e "${GREEN}[✓]${NC} $1"
+log_success() {
+    echo "[SUCCESS] $(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-print_error() {
-    echo -e "${RED}[✗]${NC} $1"
-}
-
-print_info() {
-    echo -e "${BLUE}[i]${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}[!]${NC} $1"
-}
-
-print_menu() {
-    echo -e "${MAGENTA}►${NC} $1"
-}
-
-log_message() {
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $1" >> "$LOG_FILE"
-}
-
-#===============================================================================
-# Функции определения системы
-#===============================================================================
-
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        print_error "Этот скрипт должен быть запущен от имени root"
-        exit 1
-    fi
-}
-
-check_alt_linux() {
-    if [[ -f /etc/os-release ]]; then
-        source /etc/os-release
-        if [[ "$ID" != "altlinux" && "$ID" != "alt" ]]; then
-            print_warning "Обнаружена система: $PRETTY_NAME"
-            print_warning "Скрипт оптимизирован для ALT Linux"
-            read -p "Продолжить? (y/n): " continue_choice
-            [[ "$continue_choice" != "y" && "$continue_choice" != "Y" ]] && exit 0
-        else
-            print_success "Обнаружена ALT Linux: $PRETTY_NAME"
-        fi
-    else
-        print_warning "Не удалось определить ОС"
-    fi
-}
-
-get_hostname() {
-    hostname -f 2>/dev/null || hostname
-}
-
-#===============================================================================
-# Функции определения интерфейсов и IP-адресов
-#===============================================================================
-
-get_all_interfaces() {
-    ls /sys/class/net/ | grep -v "^lo$"
-}
-
-get_external_interfaces() {
-    # Возвращаем интерфейсы, которые НЕ являются GRE/TUN
-    for iface in $(get_all_interfaces); do
-        if [[ ! "$iface" =~ ^gre[0-9]+$ ]] && [[ ! "$iface" =~ ^tun[0-9]+$ ]]; then
-            echo "$iface"
-        fi
-    done
-}
-
-get_interface_ip() {
-    local iface=$1
-    ip -4 addr show dev "$iface" 2>/dev/null | grep -oP 'inet \K[\d.]+'
-}
-
-get_interface_network() {
-    local iface=$1
-    local ip_info=$(ip -4 addr show dev "$iface" 2>/dev/null | grep -oP 'inet [\d./]+')
-    if [[ -n "$ip_info" ]]; then
-        local ip=$(echo "$ip_info" | grep -oP '[\d.]+(?=/)')
-        local cidr=$(echo "$ip_info" | grep -oP '(?<=/)\d+')
-        if [[ -n "$ip" && -n "$cidr" ]]; then
-            # Вычисляем сеть
-            local mask=$((32 - cidr))
-            local ip_parts=(${ip//./ })
-            local ip_num=$((ip_parts[0] << 24 | ip_parts[1] << 16 | ip_parts[2] << 8 | ip_parts[3]))
-            local mask_num=$(((0xFFFFFFFF << mask) & 0xFFFFFFFF))
-            local network_num=$((ip_num & mask_num))
-            echo "$((network_num >> 24 & 0xFF)).$((network_num >> 16 & 0xFF)).$((network_num >> 8 & 0xFF)).$((network_num & 0xFF))/$cidr"
-        fi
-    fi
-}
-
-get_interface_mask() {
-    local iface=$1
-    ip -4 addr show dev "$iface" 2>/dev/null | grep -oP '(?<=/)\d+'
-}
-
-find_gre_interface() {
-    for iface in $(get_all_interfaces); do
-        if [[ "$iface" =~ ^gre[0-9]+$ ]] || [[ "$iface" =~ ^tun[0-9]+$ ]]; then
-            echo "$iface"
-            return 0
-        fi
-    done
-    return 1
-}
-
-check_gre_exists() {
-    local iface=$1
-    ip link show "$iface" &>/dev/null
-    return $?
-}
-
-list_interfaces_with_details() {
-    print_section "Обнаруженные сетевые интерфейсы"
-    echo -e "${CYAN}Интерфейс\tIP-адрес\t\tСеть${NC}"
-    echo "────────────────────────────────────────────────────────────────────"
+# Автоматическое определение IP-адреса внешнего интерфейса
+detect_external_ip() {
+    log_info "Определение внешнего IP-адреса..."
     
-    for iface in $(get_all_interfaces); do
-        local ip=$(get_interface_ip "$iface")
-        local network=$(get_interface_network "$iface")
-        if [[ -n "$ip" ]]; then
-            local iface_type=""
-            if [[ "$iface" =~ ^gre[0-9]+$ ]]; then
-                iface_type=" (GRE)"
-            elif [[ "$iface" =~ ^tun[0-9]+$ ]]; then
-                iface_type=" (TUN)"
-            fi
-            printf "%-12s\t%-16s\t%s%s\n" "$iface" "$ip" "$network" "$iface_type"
-        fi
-    done
-    echo ""
-}
-
-#===============================================================================
-# Функции создания GRE туннеля
-#===============================================================================
-
-create_gre_tunnel_interactive() {
-    print_section "Создание GRE туннеля"
+    # Получаем список интерфейсов с IP-адресами из сети 172.16.0.0/12
+    local interfaces=$(ip -4 addr show | grep -E "inet 172\.(1[0-6]|[0-9])\." | head -1)
     
-    echo -e "${YELLOW}GRE туннель не обнаружен или не настроен. Создаём с нуля.${NC}"
-    echo ""
-    
-    # ==========================================
-    # Шаг 1: Имя интерфейса
-    # ==========================================
-    local default_iface="gre1"
-    print_menu "Шаг 1: Имя интерфейса GRE туннеля"
-    echo "  Рекомендуемое имя: $default_iface"
-    read -p "  Имя интерфейса [$default_iface]: " input_iface
-    GRE_INTERFACE="${input_iface:-$default_iface}"
-    
-    # Проверяем, не существует ли уже такой интерфейс
-    if ip link show "$GRE_INTERFACE" &>/dev/null; then
-        print_warning "Интерфейс $GRE_INTERFACE уже существует!"
-        ip addr show "$GRE_INTERFACE"
-        read -p "Использовать существующий интерфейс? (y/n): " use_existing
-        if [[ "$use_existing" == "y" || "$use_existing" == "Y" ]]; then
-            GRE_IP=$(get_interface_ip "$GRE_INTERFACE")
-            GRE_NETWORK=$(get_interface_network "$GRE_INTERFACE")
-            CREATE_GRE=false
-            return 0
-        fi
-    fi
-    
-    # ==========================================
-    # Шаг 2: Внешний интерфейс для туннеля
-    # ==========================================
-    echo ""
-    print_menu "Шаг 2: Выбор внешнего интерфейса для GRE туннеля"
-    echo "  Это интерфейс, через который будет идти туннель к другому роутеру"
-    echo ""
-    
-    local i=1
-    declare -A iface_map
-    echo "  Доступные интерфейсы:"
-    for iface in $(get_all_interfaces); do
-        if [[ "$iface" =~ ^gre ]] || [[ "$iface" =~ ^tun ]] || [[ "$iface" =~ ^lo ]]; then
-            continue
-        fi
-        local ip=$(get_interface_ip "$iface")
-        if [[ -n "$ip" ]]; then
-            # Определяем тип интерфейса
-            local iface_type=""
-            if ip link show "$iface" 2>/dev/null | grep -qi "ether"; then
-                iface_type="Ethernet"
-            elif ip link show "$iface" 2>/dev/null | grep -qi "loopback"; then
-                iface_type="Loopback"
-            else
-                iface_type="Другой"
-            fi
-            
-            echo "    $i) $iface - IP: $ip ($iface_type)"
-            iface_map[$i]="$ip|$iface"
-            ((i++))
-        fi
-    done
-    
-    echo ""
-    read -p "  Выберите номер интерфейса [1]: " ext_iface_choice
-    [[ "$ext_iface_choice" == "" ]] && ext_iface_choice="1"
-    
-    if [[ -n "${iface_map[$ext_iface_choice]}" ]]; then
-        GRE_LOCAL_IP=$(echo "${iface_map[$ext_iface_choice]}" | cut -d'|' -f1)
-        local ext_iface=$(echo "${iface_map[$ext_iface_choice]}" | cut -d'|' -f2)
-        print_success "Выбран внешний интерфейс: $ext_iface ($GRE_LOCAL_IP)"
-    else
-        print_error "Неверный выбор"
+    if [ -z "$interfaces" ]; then
+        log_error "Не найден интерфейс с IP-адресом из сети 172.16.0.0/12"
         return 1
     fi
     
-    # ==========================================
-    # Шаг 3: IP удалённого роутера
-    # ==========================================
-    echo ""
-    print_menu "Шаг 3: Внешний IP удалённого маршрутизатора"
-    echo "  Это IP адрес ДРУГОГО роутера (к которому подключаемся)"
+    EXTERNAL_INTERFACE=$(echo "$interfaces" | awk '{print $NF}')
+    EXTERNAL_IP=$(echo "$interfaces" | awk '{print $2}' | cut -d'/' -f1)
+    EXTERNAL_PREFIX=$(echo "$interfaces" | awk '{print $2}' | cut -d'/' -f2)
     
-    # Предлагаем типичные IP в зависимости от роли
-    local suggested_remote=""
-    case $ROUTER_ROLE in
-        "HQ-RTR")
-            suggested_remote="172.16.2.1"
-            echo "  Подсказка: Для HQ-RTR удалённый IP обычно BR-RTR"
-            ;;
-        "BR-RTR")
-            suggested_remote="172.16.1.1"
-            echo "  Подсказка: Для BR-RTR удалённый IP обычно HQ-RTR"
-            ;;
-    esac
-    
-    echo ""
-    read -p "  Внешний IP удалённого роутера [$suggested_remote]: " input_remote
-    GRE_REMOTE_IP="${input_remote:-$suggested_remote}"
-    
-    # ==========================================
-    # Шаг 4: Внутренний IP GRE туннеля
-    # ==========================================
-    echo ""
-    print_menu "Шаг 4: Внутренний IP адрес GRE туннеля"
-    echo "  Это IP адрес внутри туннеля (для OSPF)"
-    
-    local suggested_gre_ip=""
-    local suggested_remote_gre=""
-    
-    case $ROUTER_ROLE in
-        "HQ-RTR")
-            suggested_gre_ip="10.10.0.1/30"
-            suggested_remote_gre="10.10.0.2"
-            echo "  Подсказка: HQ-RTR обычно использует 10.10.0.1/30"
-            echo "             BR-RTR будет использовать 10.10.0.2/30"
-            ;;
-        "BR-RTR")
-            suggested_gre_ip="10.10.0.2/30"
-            suggested_remote_gre="10.10.0.1"
-            echo "  Подсказка: BR-RTR обычно использует 10.10.0.2/30"
-            echo "             HQ-RTR использует 10.10.0.1/30"
-            ;;
-    esac
-    
-    echo ""
-    read -p "  Внутренний IP GRE туннеля [$suggested_gre_ip]: " input_gre_ip
-    GRE_IP="${input_gre_ip:-$suggested_gre_ip}"
-    
-    # Вычисляем сеть
-    if [[ "$GRE_IP" =~ / ]]; then
-        local ip_part=$(echo "$GRE_IP" | cut -d'/' -f1)
-        local cidr=$(echo "$GRE_IP" | cut -d'/' -f2)
-        # Сеть для /30
-        local ip_parts=(${ip_part//./ })
-        local last_octet=$((ip_parts[3] & 252))  # Обнуляем последние 2 бита
-        GRE_NETWORK="${ip_parts[0]}.${ip_parts[1]}.${ip_parts[2]}.$last_octet/$cidr"
-    else
-        GRE_NETWORK="10.10.0.0/30"
-        GRE_IP="$GRE_IP/30"
-    fi
-    
-    # ==========================================
-    # Шаг 5: Ключ туннеля (опционально)
-    # ==========================================
-    echo ""
-    print_menu "Шаг 5: Ключ GRE туннеля (опционально)"
-    echo "  Ключ обеспечивает дополнительную защиту и идентификацию туннеля"
-    echo "  ВАЖНО: На обоих роутерах ключ должен быть ОДИНАКОВЫМ или отсутствовать!"
-    echo ""
-    read -p "  Ключ туннеля (Enter чтобы пропустить): " GRE_KEY
-    
-    # ==========================================
-    # Итоговая сводка
-    # ==========================================
-    echo ""
-    print_section "Параметры GRE туннеля"
-    
-    echo -e "${CYAN}"
-    echo "┌─────────────────────────────────────────────────────────────────┐"
-    echo "│                    КОНФИГУРАЦИЯ GRE ТУННЕЛЯ                     │"
-    echo "├─────────────────────────────────────────────────────────────────┤"
-    printf "│ %-30s │ %-30s │\n" "Имя интерфейса" "$GRE_INTERFACE"
-    printf "│ %-30s │ %-30s │\n" "Локальный внешний IP" "$GRE_LOCAL_IP"
-    printf "│ %-30s │ %-30s │\n" "Удалённый внешний IP" "$GRE_REMOTE_IP"
-    printf "│ %-30s │ %-30s │\n" "Внутренний IP туннеля" "$GRE_IP"
-    printf "│ %-30s │ %-30s │\n" "Сеть туннеля" "$GRE_NETWORK"
-    printf "│ %-30s │ %-30s │\n" "Ключ туннеля" "${GRE_KEY:-не задан}"
-    echo "├─────────────────────────────────────────────────────────────────┤"
-    echo "│ На втором роутере должны быть настройки:                        │"
-    printf "│ %-30s │ %-30s │\n" "  Внешний IP (локальный)" "$GRE_REMOTE_IP"
-    printf "│ %-30s │ %-30s │\n" "  Внешний IP (удалённый)" "$GRE_LOCAL_IP"
-    printf "│ %-30s │ %-30s │\n" "  Внутренний IP туннеля" "$suggested_remote_gre/30"
-    printf "│ %-30s │ %-30s │\n" "  Ключ туннеля" "${GRE_KEY:-не задан}"
-    echo "└─────────────────────────────────────────────────────────────────┘"
-    echo -e "${NC}"
-    
-    read -p "Создать GRE туннель с этими параметрами? (y/n): " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        print_warning "Создание GRE туннеля отменено"
-        return 1
-    fi
-    
-    # ==========================================
-    # Создание туннеля
-    # ==========================================
-    create_gre_tunnel
-    
-    return $?
-}
-
-create_gre_tunnel() {
-    print_section "Создание GRE туннеля"
-    
-    # 1. Удаляем туннель если существует
-    if ip link show "$GRE_INTERFACE" &>/dev/null; then
-        print_info "Удаление существующего интерфейса $GRE_INTERFACE..."
-        ip link set "$GRE_INTERFACE" down 2>/dev/null
-        ip tunnel del "$GRE_INTERFACE" 2>/dev/null
-        sleep 1
-    fi
-    
-    # 2. Создаём туннель
-    print_info "Создание GRE туннеля $GRE_INTERFACE..."
-    
-    local tunnel_cmd="ip tunnel add $GRE_INTERFACE mode gre local $GRE_LOCAL_IP remote $GRE_REMOTE_IP"
-    if [[ -n "$GRE_KEY" ]]; then
-        tunnel_cmd+=" key $GRE_KEY"
-    fi
-    
-    print_info "Выполняем: $tunnel_cmd"
-    
-    if eval "$tunnel_cmd"; then
-        print_success "GRE интерфейс создан"
-    else
-        print_error "Не удалось создать GRE интерфейс"
-        return 1
-    fi
-    
-    # 3. Настраиваем IP адрес
-    print_info "Настройка IP адреса $GRE_IP..."
-    ip addr add "$GRE_IP" dev "$GRE_INTERFACE"
-    
-    # 4. Включаем интерфейс
-    print_info "Включение интерфейса..."
-    ip link set "$GRE_INTERFACE" up
-    
-    # 5. Проверяем результат
-    sleep 1
-    if ip link show "$GRE_INTERFACE" &>/dev/null; then
-        print_success "GRE туннель создан и активирован!"
-        echo ""
-        ip addr show "$GRE_INTERFACE"
-    else
-        print_error "Не удалось активировать GRE туннель"
-        return 1
-    fi
-    
-    # 6. Создаём постоянную конфигурацию
-    create_gre_permanent_config
-    
-    # 7. Проверка связности
-    echo ""
-    print_info "Проверка связности GRE туннеля..."
-    
-    # Определяем IP для проверки
-    local test_ip=""
-    case $ROUTER_ROLE in
-        "HQ-RTR") test_ip="10.10.0.2" ;;
-        "BR-RTR") test_ip="10.10.0.1" ;;
-    esac
-    
-    print_warning "Для проверки туннеля второй роутер тоже должен быть настроен!"
-    print_info "Попробуем пинг $test_ip (удалённая сторона туннеля)..."
-    
-    if ping -c 1 -W 2 "$test_ip" &>/dev/null; then
-        print_success "GRE туннель работает! Ping успешен."
-    else
-        print_warning "Ping не прошёл. Настройте второй роутер и повторите:"
-        echo "  ping $test_ip"
-    fi
-    
-    log_message "GRE туннель создан: $GRE_INTERFACE"
-    CREATE_GRE=true
+    echo "----------------------------------------"
+    echo "Найден внешний интерфейс: $EXTERNAL_INTERFACE"
+    echo "IP-адрес: $EXTERNAL_IP/$EXTERNAL_PREFIX"
+    echo "----------------------------------------"
     
     return 0
 }
 
-create_gre_permanent_config() {
-    print_info "Создание постоянной конфигурации..."
+# Определение удаленного IP-адреса для туннеля
+detect_remote_ip() {
+    log_info "Определение удаленного IP-адреса для туннеля..."
     
-    # Метод 1: /etc/net/interfaces для ALT Linux
-    if [[ -f "$INTERFACES_FILE" ]]; then
-        # Резервное копирование
-        cp "$INTERFACES_FILE" "${INTERFACES_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
-        
-        # Извлекаем IP без маски
-        local gre_ip_only=$(echo "$GRE_IP" | cut -d'/' -f1)
-        
-        # Добавляем конфигурацию GRE
-        cat >> "$INTERFACES_FILE" << EOF
-
-# GRE Tunnel $GRE_INTERFACE - added by ospf-setup script
-IFACE_OPTS="$GRE_INTERFACE"
-iface $GRE_INTERFACE inet static
-    address $gre_ip_only
-    netmask 255.255.255.252
-    pre-up ip tunnel add $GRE_INTERFACE mode gre local $GRE_LOCAL_IP remote $GRE_REMOTE_IP${GRE_KEY:+ key $GRE_KEY}
-    post-down ip tunnel del $GRE_INTERFACE
-EOF
-        
-        print_success "Конфигурация добавлена в $INTERFACES_FILE"
-    fi
+    # Определяем роль маршрутизатора по IP-адресу
+    case "$EXTERNAL_IP" in
+        172.16.1.*)
+            # HQ-RTR (сеть 172.16.1.0/28)
+            ROUTER_ROLE="HQ-RTR"
+            REMOTE_IP="172.16.2.2"
+            TUNNEL_LOCAL="10.10.0.1"
+            TUNNEL_REMOTE="10.10.0.2"
+            TUNNEL_PREFIX="30"
+            log_info "Определена роль: HQ-RTR"
+            ;;
+        172.16.2.*)
+            # BR-RTR (сеть 172.16.2.0/28)
+            ROUTER_ROLE="BR-RTR"
+            REMOTE_IP="172.16.1.2"
+            TUNNEL_LOCAL="10.10.0.2"
+            TUNNEL_REMOTE="10.10.0.1"
+            TUNNEL_PREFIX="30"
+            log_info "Определена роль: BR-RTR"
+            ;;
+        172.16.4.*)
+            # Альтернативная конфигурация HQ-RTR
+            ROUTER_ROLE="HQ-RTR"
+            REMOTE_IP="172.16.5.2"
+            TUNNEL_LOCAL="10.0.0.1"
+            TUNNEL_REMOTE="10.0.0.2"
+            TUNNEL_PREFIX="30"
+            log_info "Определена роль: HQ-RTR (альтернативная сеть)"
+            ;;
+        172.16.5.*)
+            # Альтернативная конфигурация BR-RTR
+            ROUTER_ROLE="BR-RTR"
+            REMOTE_IP="172.16.4.2"
+            TUNNEL_LOCAL="10.0.0.2"
+            TUNNEL_REMOTE="10.0.0.1"
+            TUNNEL_PREFIX="30"
+            log_info "Определена роль: BR-RTR (альтернативная сеть)"
+            ;;
+        *)
+            log_error "Не удалось определить роль маршрутизатора для IP: $EXTERNAL_IP"
+            echo "Введите удаленный IP-адрес вручную:"
+            read -r REMOTE_IP
+            echo "Введите локальный туннельный IP-адрес (например, 10.10.0.1):"
+            read -r TUNNEL_LOCAL
+            echo "Введите удаленный туннельный IP-адрес (например, 10.10.0.2):"
+            read -r TUNNEL_REMOTE
+            TUNNEL_PREFIX="30"
+            ROUTER_ROLE="CUSTOM"
+            ;;
+    esac
     
-    # Метод 2: Systemd сервис для надёжности
-    create_gre_systemd_service
+    echo "----------------------------------------"
+    echo "Роль маршрутизатора: $ROUTER_ROLE"
+    echo "Удаленный IP: $REMOTE_IP"
+    echo "Локальный туннельный IP: $TUNNEL_LOCAL/$TUNNEL_PREFIX"
+    echo "Удаленный туннельный IP: $TUNNEL_REMOTE"
+    echo "----------------------------------------"
 }
 
-create_gre_systemd_service() {
-    local service_file="/etc/systemd/system/gre-tunnel.service"
-    
-    # Извлекаем IP без маски
-    local gre_ip_only=$(echo "$GRE_IP" | cut -d'/' -f1)
-    
-    cat > "$service_file" << EOF
-[Unit]
-Description=GRE Tunnel $GRE_INTERFACE
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-
-# Удаляем если существует
-ExecStartPre=-/usr/bin/ip tunnel del $GRE_INTERFACE
-
-# Создаём туннель
-ExecStart=/usr/bin/ip tunnel add $GRE_INTERFACE mode gre local $GRE_LOCAL_IP remote $GRE_REMOTE_IP${GRE_KEY:+ key $GRE_KEY}
-ExecStart=/usr/bin/ip addr add $GRE_IP dev $GRE_INTERFACE
-ExecStart=/usr/bin/ip link set $GRE_INTERFACE up
-
-# Удаляем при остановке
-ExecStop=/usr/bin/ip link set $GRE_INTERFACE down
-ExecStop=/usr/bin/ip tunnel del $GRE_INTERFACE
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    systemctl daemon-reload
-    systemctl enable gre-tunnel.service
-    
-    print_success "Systemd сервис создан: $service_file"
-}
-
-select_gre_interface() {
-    print_section "Проверка GRE туннеля"
-    
-    # Автоматический поиск GRE интерфейса
-    local existing_gre=$(find_gre_interface)
-    
-    if [[ -n "$existing_gre" ]]; then
-        print_success "Обнаружен существующий GRE интерфейс: $existing_gre"
-        GRE_INTERFACE="$existing_gre"
-        GRE_IP=$(get_interface_ip "$GRE_INTERFACE")
-        GRE_NETWORK=$(get_interface_network "$GRE_INTERFACE")
-        
-        # Проверяем, есть ли IP
-        if [[ -z "$GRE_IP" ]]; then
-            print_warning "Интерфейс существует, но IP адрес не настроен!"
-            read -p "Настроить IP адрес для $GRE_INTERFACE? (y/n) [y]: " setup_ip
-            [[ "$setup_ip" == "" ]] && setup_ip="y"
-            
-            if [[ "$setup_ip" == "y" ]]; then
-                # Предлагаем IP
-                local suggested_ip=""
-                case $ROUTER_ROLE in
-                    "HQ-RTR") suggested_ip="10.10.0.1/30" ;;
-                    "BR-RTR") suggested_ip="10.10.0.2/30" ;;
-                esac
-                
-                read -p "  IP адрес для $GRE_INTERFACE [$suggested_ip]: " input_ip
-                GRE_IP="${input_ip:-$suggested_ip}"
-                
-                ip addr add "$GRE_IP" dev "$GRE_INTERFACE"
-                ip link set "$GRE_INTERFACE" up
-                GRE_NETWORK=$(get_interface_network "$GRE_INTERFACE")
-                
-                print_success "IP адрес настроен: $GRE_IP"
-            fi
-        fi
-        
-        echo -e "\nДетали GRE туннеля:"
-        echo "  Интерфейс: $GRE_INTERFACE"
-        echo "  IP-адрес: $GRE_IP"
-        echo "  Сеть: $GRE_NETWORK"
-        
-        # Показываем детали туннеля
-        echo ""
-        print_info "Конфигурация туннеля:"
-        ip tunnel show "$GRE_INTERFACE" 2>/dev/null || echo "  Не удалось получить информацию"
-        
-        read -p "Использовать этот интерфейс? (y/n) [y]: " use_auto
-        [[ "$use_auto" == "" ]] && use_auto="y"
-        
-        if [[ "$use_auto" == "y" || "$use_auto" == "Y" ]]; then
-            print_success "Выбран GRE интерфейс: $GRE_INTERFACE"
-            CREATE_GRE=false
-            return 0
-        fi
-    else
-        print_warning "GRE интерфейс НЕ обнаружен"
-        echo ""
-        print_info "Для работы OSPF между офисами необходим GRE туннель."
-        print_info "Сейчас мы создадим его с нуля."
-    fi
-    
-    # GRE не найден или не подходит - предлагаем создать
+# Выбор пароля для аутентификации туннеля
+select_password() {
     echo ""
-    echo "Доступные действия:"
-    echo -e "  ${GREEN}1)${NC} Создать новый GRE туннель (рекомендуется)"
-    echo -e "  ${GREEN}2)${NC} Указать имя существующего интерфейса вручную"
-    echo -e "  ${GREEN}3)${NC} Отмена настройки"
+    echo "========================================"
+    echo "    ВЫБОР ПАРОЛЯ АУТЕНТИФИКАЦИИ ТУННЕЛЯ"
+    echo "========================================"
     echo ""
+    echo "Выберите опцию для пароля аутентификации:"
+    echo "  1) Использовать пароль по умолчанию: P@ssw0rd"
+    echo "  2) Ввести свой пароль"
+    echo "  3) Сгенерировать случайный пароль"
+    echo ""
+    echo -n "Ваш выбор [1-3]: "
+    read -r password_choice
     
-    read -p "Выберите действие [1]: " action
-    [[ "$action" == "" ]] && action="1"
-    
-    case $action in
+    case "$password_choice" in
         1)
-            create_gre_tunnel_interactive
-            return $?
+            TUNNEL_PASSWORD="P@ssw0rd"
+            log_info "Выбран пароль по умолчанию"
             ;;
         2)
-            read -p "Введите имя интерфейса (например, gre1): " GRE_INTERFACE
-            if ip link show "$GRE_INTERFACE" &>/dev/null; then
-                GRE_IP=$(get_interface_ip "$GRE_INTERFACE")
-                GRE_NETWORK=$(get_interface_network "$GRE_INTERFACE")
-                
-                if [[ -z "$GRE_IP" ]]; then
-                    print_error "У интерфейса нет IP адреса!"
-                    return 1
-                fi
-                
-                print_success "Выбран интерфейс: $GRE_INTERFACE ($GRE_IP)"
-                CREATE_GRE=false
-                return 0
-            else
-                print_error "Интерфейс $GRE_INTERFACE не существует"
-                print_info "Будет создан новый туннель..."
-                create_gre_tunnel_interactive
-                return $?
+            echo -n "Введите пароль для аутентификации туннеля: "
+            read -r TUNNEL_PASSWORD
+            if [ -z "$TUNNEL_PASSWORD" ]; then
+                log_error "Пароль не может быть пустым. Используется пароль по умолчанию."
+                TUNNEL_PASSWORD="P@ssw0rd"
             fi
+            log_info "Установлен пользовательский пароль"
             ;;
         3)
-            print_warning "Отмена настройки"
-            exit 0
+            TUNNEL_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9@#$%' | head -c 16)
+            log_info "Сгенерирован случайный пароль"
             ;;
         *)
-            print_error "Неверный выбор"
-            return 1
+            TUNNEL_PASSWORD="P@ssw0rd"
+            log_info "Неверный выбор. Используется пароль по умолчанию."
             ;;
     esac
+    
+    echo ""
+    echo "----------------------------------------"
+    echo "Пароль аутентификации туннеля: $TUNNEL_PASSWORD"
+    echo "----------------------------------------"
+    echo ""
 }
 
-#===============================================================================
-# Интерактивные функции выбора
-#===============================================================================
-
-select_router_role() {
-    print_section "Выбор роли маршрутизатора"
+# Загрузка модуля GRE
+load_gre_module() {
+    log_info "Загрузка модуля GRE..."
     
-    echo "Выберите роль данного маршрутизатора:"
-    echo -e "  ${GREEN}1)${NC} HQ-RTR (Маршрутизатор главного офиса)"
-    echo -e "  ${GREEN}2)${NC} BR-RTR (Маршрутизатор филиала)"
-    echo ""
-    
-    local valid_choice=false
-    while [[ "$valid_choice" == false ]]; do
-        read -p "Ваш выбор [1]: " role_choice
-        [[ "$role_choice" == "" ]] && role_choice="1"
-        
-        case $role_choice in
-            1)
-                ROUTER_ROLE="HQ-RTR"
-                valid_choice=true
-                ;;
-            2)
-                ROUTER_ROLE="BR-RTR"
-                valid_choice=true
-                ;;
-            *)
-                print_error "Неверный выбор. Введите 1 или 2."
-                ;;
-        esac
-    done
-    
-    print_success "Выбрана роль: $ROUTER_ROLE"
-    log_message "Выбрана роль: $ROUTER_ROLE"
-}
-
-select_networks() {
-    print_section "Выбор сетей для OSPF"
-    print_info "Выберите сети, которые будут анонсироваться через OSPF"
-    print_warning "GRE туннель будет добавлен автоматически"
-    echo ""
-    
-    NETWORKS=()
-    local interfaces=($(get_all_interfaces))
-    
-    echo "Доступные сети:"
-    echo "────────────────────────────────────────────────────────────────────"
-    
-    local network_list=()
-    local i=1
-    
-    for iface in "${interfaces[@]}"; do
-        [[ "$iface" == "lo" ]] && continue
-        [[ "$iface" == "$GRE_INTERFACE" ]] && continue  # GRE добавим позже
-        
-        local network=$(get_interface_network "$iface")
-        local ip=$(get_interface_ip "$iface")
-        
-        if [[ -n "$network" ]]; then
-            network_list+=("$network|$iface|$ip")
-            echo "  $i) $network (интерфейс: $iface, IP: $ip)"
-            ((i++))
-        fi
-    done
-    
-    echo ""
-    echo -e "${YELLOW}Автоматический выбор сетей на основе роли $ROUTER_ROLE${NC}"
-    read -p "Использовать автоматический выбор? (y/n) [y]: " auto_select
-    [[ "$auto_select" == "" ]] && auto_select="y"
-    
-    if [[ "$auto_select" == "y" || "$auto_select" == "Y" ]]; then
-        # Автоматически выбираем все сети кроме внешних
-        for net_info in "${network_list[@]}"; do
-            local network=$(echo "$net_info" | cut -d'|' -f1)
-            NETWORKS+=("$network")
-        done
-        print_success "Автоматически выбраны сети: ${NETWORKS[*]}"
+    modprobe gre
+    if [ $? -eq 0 ]; then
+        echo "Модуль GRE успешно загружен"
     else
-        # Ручной выбор
-        print_info "Введите номера сетей через запятую (например: 1,2,3) или 'all' для всех:"
-        read -p "Выбор: " selection
-        
-        if [[ "$selection" == "all" ]]; then
-            for net_info in "${network_list[@]}"; do
-                NETWORKS+=("$(echo "$net_info" | cut -d'|' -f1)")
-            done
-        else
-            IFS=',' read -ra selections <<< "$selection"
-            for idx in "${selections[@]}"; do
-                idx=$(echo "$idx" | tr -d ' ')
-                if [[ $idx -ge 1 && $idx -le ${#network_list[@]} ]]; then
-                    NETWORKS+=("$(echo "${network_list[$((idx-1))]}" | cut -d'|' -f1)")
-                fi
-            done
-        fi
-    fi
-    
-    # Добавляем сеть GRE туннеля
-    if [[ -n "$GRE_NETWORK" ]]; then
-        NETWORKS+=("$GRE_NETWORK")
-        print_info "Добавлена сеть GRE туннеля: $GRE_NETWORK"
-    fi
-    
-    print_success "Итого сетей для OSPF: ${#NETWORKS[@]}"
-    for net in "${NETWORKS[@]}"; do
-        echo "  - $net"
-    done
-}
-
-select_router_id() {
-    print_section "Настройка Router ID"
-    
-    # Предлагаем IP на основе роли
-    local suggested_id=""
-    case $ROUTER_ROLE in
-        "HQ-RTR")
-            suggested_id="172.16.1.1"
-            ;;
-        "BR-RTR")
-            suggested_id="172.16.2.1"
-            ;;
-    esac
-    
-    echo "Рекомендуемый Router ID для $ROUTER_ROLE: $suggested_id"
-    read -p "Router ID [$suggested_id]: " input_id
-    ROUTER_ID="${input_id:-$suggested_id}"
-    
-    print_success "Router ID установлен: $ROUTER_ID"
-    log_message "Router ID: $ROUTER_ID"
-}
-
-select_ospf_password() {
-    print_section "Настройка аутентификации OSPF"
-    print_warning "Аутентификация обязательна для защиты OSPF"
-    echo ""
-    
-    local default_pass="P@ssw0rd"
-    read -p "Пароль для OSPF аутентификации [$default_pass]: " input_pass
-    OSPF_PASSWORD="${input_pass:-$default_pass}"
-    
-    print_success "Пароль OSPF установлен"
-    log_message "Пароль OSPF настроен"
-}
-
-select_ospf_network_type() {
-    print_section "Выбор типа сети OSPF"
-    
-    echo -e "${YELLOW}Тип сети OSPF определяет, как маршрутизаторы обмениваются информацией${NC}"
-    echo ""
-    echo "Доступные типы сетей:"
-    echo -e "  ${GREEN}1)${NC} point-to-point  (Рекомендуется для GRE туннелей)"
-    echo "      - Не требует выбора DR/BDR"
-    echo "      - Быстрее устанавливает соседство"
-    echo "      - Идеально для соединения точка-точка"
-    echo ""
-    echo -e "  ${GREEN}2)${NC} broadcast"
-    echo "      - Требует выбора DR/BDR"
-    echo "      - Используется в Ethernet сетях"
-    echo "      - Может вызвать проблемы в GRE туннелях"
-    echo ""
-    
-    print_warning "Важно: ОБА маршрутизатора должны иметь ОДИНАКОВЫЙ тип сети!"
-    print_warning "        Если HQ-RTR использует point-to-point, то BR-RTR тоже должен!"
-    echo ""
-    
-    read -p "Выберите тип сети [1]: " net_type_choice
-    [[ "$net_type_choice" == "" ]] && net_type_choice="1"
-    
-    case $net_type_choice in
-        1)
-            OSPF_NETWORK_TYPE="point-to-point"
-            ;;
-        2)
-            OSPF_NETWORK_TYPE="broadcast"
-            ;;
-        *)
-            OSPF_NETWORK_TYPE="point-to-point"
-            ;;
-    esac
-    
-    print_success "Выбран тип сети OSPF: $OSPF_NETWORK_TYPE"
-    log_message "Тип сети OSPF: $OSPF_NETWORK_TYPE"
-}
-
-#===============================================================================
-# Функции установки и настройки FRR
-#===============================================================================
-
-install_frr() {
-    print_section "Установка FRR (Free Range Routing)"
-    
-    # Проверяем, установлен ли FRR
-    if rpm -q frr &>/dev/null; then
-        print_success "FRR уже установлен: $(rpm -q frr)"
-        return 0
-    fi
-    
-    print_info "Установка FRR..."
-    
-    # Обновление репозиториев и установка
-    apt-get update
-    
-    if apt-get install -y frr; then
-        print_success "FRR успешно установлен"
-        log_message "FRR установлен"
-    else
-        print_error "Не удалось установить FRR"
-        return 1
-    fi
-}
-
-configure_frr_daemons() {
-    print_section "Настройка демонов FRR"
-    
-    local daemons_file="/etc/frr/daemons"
-    
-    # Проверяем наличие файла
-    if [[ ! -f "$daemons_file" ]]; then
-        print_error "Файл $daemons_file не найден"
+        log_error "Не удалось загрузить модуль GRE"
         return 1
     fi
     
-    # Включаем OSPF
-    print_info "Включение OSPF демона..."
-    sed -i 's/^ospfd=no/ospfd=yes/' "$daemons_file"
-    sed -i 's/^#ospfd=yes/ospfd=yes/' "$daemons_file"
-    
-    # Проверяем результат
-    if grep -q "^ospfd=yes" "$daemons_file"; then
-        print_success "OSPF демон включен"
-        log_message "ospfd=yes в $daemons_file"
-    else
-        print_warning "Не удалось включить OSPF, добавляем вручную..."
-        echo "ospfd=yes" >> "$daemons_file"
+    # Добавляем модуль в автозагрузку
+    if ! grep -q "^gre" /etc/modules 2>/dev/null; then
+        echo "gre" >> /etc/modules
+        echo "Модуль GRE добавлен в автозагрузку"
     fi
+    
+    # Проверка загрузки модуля
+    echo ""
+    echo "Проверка загруженных модулей:"
+    lsmod | grep gre
+    echo ""
 }
 
-configure_frr_service() {
-    print_section "Настройка службы FRR"
+# Создание конфигурации туннельного интерфейса
+create_tunnel_config() {
+    log_info "Создание конфигурации туннеля..."
     
-    # Включаем и запускаем службу
-    systemctl enable frr
-    systemctl restart frr
+    TUNNEL_IFACE="gre1"
+    TUNNEL_DIR="/etc/net/ifaces/$TUNNEL_IFACE"
+    
+    # Создание директории для туннельного интерфейса
+    mkdir -p "$TUNNEL_DIR"
+    
+    # Создание файла options
+    cat > "$TUNNEL_DIR/options" << EOF
+TYPE=iptun
+TUNTYPE=gre
+TUNLOCAL=$EXTERNAL_IP
+TUNREMOTE=$REMOTE_IP
+TUNOPTIONS='ttl 64'
+EOF
+    
+    echo "Создан файл: $TUNNEL_DIR/options"
+    cat "$TUNNEL_DIR/options"
+    echo ""
+    
+    # Создание файла ipv4address
+    cat > "$TUNNEL_DIR/ipv4address" << EOF
+$TUNNEL_LOCAL/$TUNNEL_PREFIX
+EOF
+    
+    echo "Создан файл: $TUNNEL_DIR/ipv4address"
+    cat "$TUNNEL_DIR/ipv4address"
+    echo ""
+    
+    log_success "Конфигурация туннеля создана"
+}
+
+# Перезапуск сетевой службы
+restart_network() {
+    log_info "Перезапуск сетевой службы..."
+    
+    systemctl restart network
+    
+    if [ $? -eq 0 ]; then
+        echo "Сетевая служба успешно перезапущена"
+    else
+        log_error "Ошибка при перезапуске сетевой службы"
+        return 1
+    fi
     
     sleep 2
-    
-    if systemctl is-active --quiet frr; then
-        print_success "Служба FRR активна"
-        log_message "Служба FRR запущена"
-    else
-        print_error "Служба FRR не запущена"
-        systemctl status frr --no-pager
-        return 1
-    fi
 }
 
-configure_ospf() {
-    print_section "Настройка OSPF"
+# Проверка туннельного интерфейса
+verify_tunnel() {
+    log_info "Проверка туннельного интерфейса..."
     
-    print_info "Генерация конфигурации OSPF..."
-    
-    # Информация о типе сети
-    print_info "Тип сети OSPF для $GRE_INTERFACE: $OSPF_NETWORK_TYPE"
-    print_warning "Важно: оба маршрутизатора должны иметь одинаковый тип сети OSPF!"
+    echo ""
+    echo "Состояние интерфейсов:"
+    ip -br a | grep -E "(gre|$TUNNEL_IFACE)"
     echo ""
     
-    # ==========================================
-    # ВАЖНО: Сначала настраиваем интерфейс GRE
-    # ==========================================
-    print_info "Настройка OSPF на интерфейсе $GRE_INTERFACE..."
-    
-    # Проверяем текущее состояние passive
-    local current_passive=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null | grep -i "passive")
-    if [[ -n "$current_passive" ]]; then
-        print_warning "Обнаружен режим PASSIVE на интерфейсе! Будет отключён..."
-    fi
-    
-    # Настраиваем интерфейс - ВАЖНО: no ip ospf passive должен быть ПЕРВЫМ!
-    vtysh << EOF
-configure terminal
-interface $GRE_INTERFACE
-no ip ospf passive
-ip ospf authentication
-ip ospf authentication-key $OSPF_PASSWORD
-ip ospf network $OSPF_NETWORK_TYPE
-exit
-exit
-EOF
-    
-    # ==========================================
-    # Настраиваем router OSPF
-    # ==========================================
-    print_info "Настройка OSPF процесса (Router ID: $ROUTER_ID)..."
-    
-    vtysh << EOF
-configure terminal
-router ospf
-ospf router-id $ROUTER_ID
-area 0 authentication
-exit
-exit
-EOF
-    
-    # Добавляем сети в OSPF
-    for net in "${NETWORKS[@]}"; do
-        print_info "Добавление сети $net в area 0..."
-        vtysh -c "configure terminal" -c "router ospf" -c "network $net area 0" -c "exit" -c "exit"
-    done
-    
-    # ==========================================
-    # КРИТИЧНО: Повторно убеждаемся что passive отключён
-    # ==========================================
-    print_info "Проверка и отключение passive режима..."
-    
-    vtysh << EOF
-configure terminal
-interface $GRE_INTERFACE
-no ip ospf passive
-exit
-exit
-EOF
-    
-    # Сохраняем конфигурацию
-    vtysh -c "write memory"
-    vtysh -c "write"
-    
-    # ==========================================
-    # Проверка применения конфигурации
-    # ==========================================
+    echo "Детальная информация о туннеле:"
+    ip a show "$TUNNEL_IFACE" 2>/dev/null || echo "Интерфейс $TUNNEL_IFACE не найден"
     echo ""
-    print_info "Проверка применения конфигурации..."
     
-    # Проверяем OSPF на интерфейсе
-    local ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
-    
-    if [[ -z "$ospf_intf_output" ]]; then
-        print_error "OSPF НЕ активирован на $GRE_INTERFACE!"
-        print_warning "Сеть интерфейса не добавлена в OSPF"
-        
-        # Пробуем добавить сеть принудительно
-        local gre_net=$(get_interface_network "$GRE_INTERFACE")
-        if [[ -n "$gre_net" ]]; then
-            print_info "Принудительное добавление сети $gre_net..."
-            vtysh -c "configure terminal" -c "router ospf" -c "network $gre_net area 0" -c "exit" -c "exit"
-            vtysh -c "write"
-            sleep 2
-            ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
-        fi
-    fi
-    
-    if [[ -n "$ospf_intf_output" ]]; then
-        print_success "OSPF активирован на $GRE_INTERFACE"
-        echo ""
-        
-        # Показываем ключевые параметры
-        echo "  Параметры OSPF на интерфейсе:"
-        echo "$ospf_intf_output" | while read line; do
-            if echo "$line" | grep -qE "Network Type|Hello|Dead|State|Passive|Enabled"; then
-                echo "    $line"
-            fi
-        done
-        echo ""
-        
-        # КРИТИЧНАЯ ПРОВЕРКА: Passive режим
-        if echo "$ospf_intf_output" | grep -qi "passive interface"; then
-            print_error "═══════════════════════════════════════════════════════════════"
-            print_error "  ВНИМАНИЕ: Интерфейс всё ещё в режиме PASSIVE!"
-            print_error "  OSPF НЕ БУДЕТ отправлять Hello пакеты!"
-            print_error "═══════════════════════════════════════════════════════════════"
-            
-            print_info "Принудительное отключение passive..."
-            vtysh -c "configure terminal" -c "interface $GRE_INTERFACE" -c "no ip ospf passive" -c "end"
-            vtysh -c "write"
-            sleep 1
-            
-            # Проверяем ещё раз
-            ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
-            if echo "$ospf_intf_output" | grep -qi "passive interface"; then
-                print_error "Не удалось отключить passive режим!"
-            else
-                print_success "Режим passive успешно отключён"
-            fi
-        else
-            print_success "Режим passive отключён - OSPF будет отправлять Hello пакеты"
-        fi
-    else
-        print_error "Не удалось активировать OSPF на интерфейсе!"
-    fi
-    
-    log_message "OSPF настроен с Router ID: $ROUTER_ID, тип сети: $OSPF_NETWORK_TYPE"
+    echo "Маршруты:"
+    ip r | grep -E "(gre|10\.)"
+    echo ""
 }
 
-verify_ospf() {
-    print_section "Проверка OSPF"
+# Проверка связности туннеля
+test_tunnel_connectivity() {
+    log_info "Проверка связности туннеля..."
     
-    # ==========================================
-    # 1. Проверка состояния интерфейса GRE
-    # ==========================================
     echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  1. ПРОВЕРКА GRE ИНТЕРФЕЙСА"
-    print_info "═══════════════════════════════════════════════════════════════"
+    echo "Пинг удаленного туннельного адреса ($TUNNEL_REMOTE):"
+    ping -c 4 "$TUNNEL_REMOTE"
     
-    local gre_state=$(ip link show "$GRE_INTERFACE" 2>/dev/null | grep -oP 'state \K\w+')
-    local gre_ip=$(ip -4 addr show "$GRE_INTERFACE" 2>/dev/null | grep -oP 'inet \K[\d./]+')
-    local gre_mtu=$(ip link show "$GRE_INTERFACE" 2>/dev/null | grep -oP 'mtu \K\d+')
-    
-    echo "  Интерфейс: $GRE_INTERFACE"
-    echo "  Состояние: $gre_state"
-    echo "  IP адрес: $gre_ip"
-    echo "  MTU: $gre_mtu"
-    
-    if [[ "$gre_state" != "UNKNOWN" && "$gre_state" != "UP" ]]; then
-        print_error "GRE интерфейс не UP! Состояние: $gre_state"
-        print_warning "Проверьте настройки GRE туннеля"
-        return 1
-    else
-        print_success "GRE интерфейс UP"
-    fi
-    
-    # ==========================================
-    # 2. Проверка связности через GRE
-    # ==========================================
     echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  2. ПРОВЕРКА СВЯЗНОСТИ GRE ТУННЕЛЯ"
-    print_info "═══════════════════════════════════════════════════════════════"
+}
+
+# Установка и настройка OSPF (FRR)
+setup_ospf() {
+    log_info "Настройка динамической маршрутизации OSPF..."
     
-    local remote_gre_ip=""
-    case $ROUTER_ROLE in
-        "HQ-RTR") remote_gre_ip="10.10.0.2" ;;
-        "BR-RTR") remote_gre_ip="10.10.0.1" ;;
-    esac
-    
-    if [[ -n "$remote_gre_ip" ]]; then
-        print_info "Пинг удалённой стороны GRE ($remote_gre_ip)..."
-        
-        # Детальный пинг
-        ping -c 3 -W 2 "$remote_gre_ip"
-        local ping_result=$?
-        
-        if [[ $ping_result -eq 0 ]]; then
-            print_success "GRE туннель работает! Ping успешен."
-        else
-            print_error "═══════════════════════════════════════════════════════════════"
-            print_error "  GRE ТУННЕЛЬ НЕ РАБОТАЕТ! PING НЕ ПРОШЁЛ!"
-            print_error "═══════════════════════════════════════════════════════════════"
-            echo ""
-            print_error "ОСНОВНАЯ ПРИЧИНА: Без работающего GRE туннеля OSPF НЕ БУДЕТ работать!"
-            echo ""
-            print_info "Проверьте на обоих роутерах:"
-            echo "  1. GRE туннель создан: ip tunnel show"
-            echo "  2. Интерфейс UP: ip link show $GRE_INTERFACE"
-            echo "  3. Local/Remote IP правильные"
-            echo ""
-            
-            # Показываем текущую конфигурацию GRE
-            print_info "Текущая конфигурация GRE туннеля:"
-            ip tunnel show "$GRE_INTERFACE" 2>/dev/null || echo "  Туннель не найден"
-            
-            read -p "Продолжить диагностику OSPF? (y/n): " continue_ospf
-            [[ "$continue_ospf" != "y" ]] && return 1
-        fi
-    fi
-    
-    # ==========================================
-    # 3. Проверка OSPF процесса
-    # ==========================================
     echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  3. ПРОВЕРКА OSPF ПРОЦЕССА"
-    print_info "═══════════════════════════════════════════════════════════════"
+    echo "Настроить OSPF для динамической маршрутизации? [y/N]: "
+    read -r setup_ospf_choice
     
-    # Проверяем, запущен ли ospfd
-    if ! vtysh -c "show ip ospf" &>/dev/null; then
-        print_error "OSPF процесс НЕ ЗАПУЩЕН!"
-        print_info "Проверка службы FRR..."
-        systemctl status frr --no-pager | head -10
+    if [[ "$setup_ospf_choice" =~ ^[Yy]$ ]]; then
+        log_info "Установка FRR..."
         
-        print_info "Попытка перезапуска FRR..."
+        apt-get update
+        apt-get install -y frr
+        
+        # Включение OSPF демона
+        sed -i 's/ospfd=no/ospfd=yes/' /etc/frr/daemons
+        
+        # Запуск FRR
+        systemctl enable --now frr
         systemctl restart frr
-        sleep 3
-        
-        if vtysh -c "show ip ospf" &>/dev/null; then
-            print_success "OSPF запущен после перезапуска"
-        else
-            print_error "Не удалось запустить OSPF!"
-            return 1
-        fi
-    fi
-    
-    vtysh -c "show ip ospf" 2>/dev/null
-    
-    # ==========================================
-    # 4. Проверка OSPF на интерфейсе
-    # ==========================================
-    echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  4. ПРОВЕРКА OSPF НА ИНТЕРФЕЙСЕ $GRE_INTERFACE"
-    print_info "═══════════════════════════════════════════════════════════════"
-    
-    local ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
-    
-    if [[ -z "$ospf_intf_output" ]]; then
-        print_error "OSPF НЕ активен на интерфейсе $GRE_INTERFACE!"
-        print_warning "Сеть интерфейса не добавлена в OSPF или интерфейс DOWN"
         
         echo ""
-        print_info "Принудительное добавление сети в OSPF..."
-        local gre_network=$(get_interface_network "$GRE_INTERFACE")
+        echo "FRR установлен и запущен"
+        echo ""
+        echo "Настройка OSPF выполняется через vtysh:"
+        echo "----------------------------------------"
+        echo "vtysh"
+        echo "conf t"
+        echo "router ospf"
+        echo "ospf router-id $TUNNEL_LOCAL"
+        echo "network 10.10.0.0/30 area 0"
         
-        if [[ -n "$gre_network" ]]; then
-            print_info "Добавляем сеть $gre_network в area 0..."
-            vtysh << EOF
-configure terminal
-router ospf
-network $gre_network area 0
-end
-EOF
-            vtysh -c "write"
-            sleep 2
-            
-            # Проверяем ещё раз
-            ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
-            
-            if [[ -z "$ospf_intf_output" ]]; then
-                print_error "Не удалось активировать OSPF на интерфейсе!"
-                
-                # Проверяем все интерфейсы OSPF
-                print_info "Список всех интерфейсов в OSPF:"
-                vtysh -c "show ip ospf interface" 2>/dev/null
-                return 1
-            fi
+        # Определяем сети для анонса
+        if [ "$ROUTER_ROLE" = "HQ-RTR" ]; then
+            echo "network 192.168.100.0/27 area 0"
+            echo "network 192.168.200.64/28 area 0"
+        else
+            echo "network 192.168.3.0/28 area 0"
         fi
-    fi
-    
-    # Показываем OSPF интерфейс
-    echo "$ospf_intf_output"
-    echo ""
-    
-    # ==========================================
-    # 5. КРИТИЧНЫЕ ПРОВЕРКИ
-    # ==========================================
-    echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  5. КРИТИЧНЫЕ ПРОВЕРКИ"
-    print_info "═══════════════════════════════════════════════════════════════"
-    
-    # Проверка Passive
-    local is_passive=false
-    if echo "$ospf_intf_output" | grep -qi "passive interface"; then
-        is_passive=true
-        print_error "❌ PASSIVE: Интерфейс в режиме PASSIVE!"
+        
+        echo "area 0 authentication"
+        echo "exit"
+        echo "interface $TUNNEL_IFACE"
+        echo "ip ospf authentication-key $TUNNEL_PASSWORD"
+        echo "ip ospf authentication"
+        echo "no ip ospf passive"
+        echo "exit"
+        echo "exit"
+        echo "wr"
+        echo "----------------------------------------"
+        echo ""
+        
+        log_success "Базовая настройка OSPF подготовлена"
     else
-        print_success "✓ PASSIVE: Режим отключён"
-    fi
-    
-    # Проверка Network Type
-    local net_type=$(echo "$ospf_intf_output" | grep -oP 'Network Type: \K[^\s,]+' | head -1)
-    if [[ -n "$net_type" ]]; then
-        if [[ "$net_type" == "POINT_TO_POINT" ]] || [[ "$net_type" == "POINT-TO-POINT" ]]; then
-            print_success "✓ Network Type: $net_type (корректно для GRE)"
-        else
-            print_warning "⚠ Network Type: $net_type"
-            print_warning "  Рекомендуется POINT_TO_POINT для GRE туннелей"
-        fi
-    fi
-    
-    # Проверка Hello/Dead таймеров
-    local hello_timer=$(echo "$ospf_intf_output" | grep -oP 'Hello: \K\d+')
-    local dead_timer=$(echo "$ospf_intf_output" | grep -oP 'Dead: \K\d+')
-    echo "  Hello Timer: ${hello_timer}s"
-    echo "  Dead Timer: ${dead_timer}s"
-    
-    # ==========================================
-    # 6. ИСПРАВЛЕНИЕ PASSIVE РЕЖИМА
-    # ==========================================
-    if [[ "$is_passive" == true ]]; then
-        echo ""
-        print_error "═══════════════════════════════════════════════════════════════"
-        print_error "  ИСПРАВЛЕНИЕ PASSIVE РЕЖИМА"
-        print_error "═══════════════════════════════════════════════════════════════"
-        
-        print_info "Отключение passive на интерфейсе..."
-        vtysh << EOF
-configure terminal
-interface $GRE_INTERFACE
-no ip ospf passive
-end
-EOF
-        
-        # Проверяем глобальный passive
-        local global_passive=$(vtysh -c "show running-config" 2>/dev/null | grep -A 30 "router ospf" | grep -i "passive-interface default\|passive-interface $GRE_INTERFACE")
-        
-        if [[ -n "$global_passive" ]]; then
-            print_warning "Обнаружен глобальный passive-interface:"
-            echo "$global_passive"
-            
-            # Если passive-interface default - нужно отключить для gre1
-            if echo "$global_passive" | grep -q "passive-interface default"; then
-                print_info "Обнаружен 'passive-interface default', отключаем для $GRE_INTERFACE..."
-                vtysh << EOF
-configure terminal
-router ospf
-no passive-interface $GRE_INTERFACE
-end
-EOF
-            fi
-            
-            # Удаляем конкретный passive-interface
-            vtysh << EOF
-configure terminal
-router ospf
-no passive-interface $GRE_INTERFACE
-end
-EOF
-        fi
-        
-        vtysh -c "write"
-        sleep 2
-        
-        # Проверяем результат
-        ospf_intf_output=$(vtysh -c "show ip ospf interface $GRE_INTERFACE" 2>/dev/null)
-        if echo "$ospf_intf_output" | grep -qi "passive interface"; then
-            print_error "НЕ УДАЛОСЬ отключить passive! Выполните вручную:"
-            echo "  vtysh"
-            echo "  conf t"
-            echo "  int $GRE_INTERFACE"
-            echo "  no ip ospf passive"
-            echo "  end"
-            echo "  wr"
-        else
-            print_success "Passive режим успешно отключён!"
-        fi
-    fi
-    
-    # ==========================================
-    # 7. Ожидание соседей
-    # ==========================================
-    echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  6. ПОИСК СОСЕДЕЙ OSPF"
-    print_info "═══════════════════════════════════════════════════════════════"
-    
-    # Показываем текущих соседей
-    print_info "Текущие соседи OSPF:"
-    vtysh -c "show ip ospf neighbor" 2>/dev/null
-    
-    echo ""
-    print_info "Ожидание появления соседей (макс. 60 секунд)..."
-    print_warning "Убедитесь, что ВТОРОЙ маршрутизатор тоже настроен!"
-    
-    local max_attempts=30
-    local attempt=0
-    local neighbors_found=false
-    
-    while [[ $attempt -lt $max_attempts ]]; do
-        local neighbor_output=$(vtysh -c "show ip ospf neighbor" 2>/dev/null)
-        
-        if echo "$neighbor_output" | grep -qE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"; then
-            neighbors_found=true
-            print_success "Обнаружен сосед OSPF!"
-            break
-        fi
-        
-        ((attempt++))
-        printf "\r  Попытка %2d/%d - соседи не обнаружены  " $attempt $max_attempts
-        sleep 2
-    done
-    echo ""
-    
-    # ==========================================
-    # 8. Результат
-    # ==========================================
-    echo ""
-    print_info "═══════════════════════════════════════════════════════════════"
-    print_info "  РЕЗУЛЬТАТ"
-    print_info "═══════════════════════════════════════════════════════════════"
-    
-    echo ""
-    print_info "Таблица соседей OSPF:"
-    vtysh -c "show ip ospf neighbor" 2>/dev/null
-    
-    if [[ "$neighbors_found" == true ]]; then
-        echo ""
-        print_success "═══════════════════════════════════════════════════════════════"
-        print_success "  OSPF СОСЕДИ НАЙДЕНЫ!"
-        print_success "═══════════════════════════════════════════════════════════════"
-        
-        echo ""
-        print_info "Маршруты OSPF:"
-        vtysh -c "show ip route ospf" 2>/dev/null
-    else
-        echo ""
-        print_error "═══════════════════════════════════════════════════════════════"
-        print_error "  СОСЕДИ OSPF НЕ ОБНАРУЖЕНЫ"
-        print_error "═══════════════════════════════════════════════════════════════"
-        
-        # Показываем чек-лист для проверки
-        show_ospf_troubleshooting
+        log_info "Пропуск настройки OSPF"
     fi
 }
 
-show_ospf_troubleshooting() {
+# Вывод итоговой информации
+print_summary() {
     echo ""
-    print_warning "═══════════════════════════════════════════════════════════════"
-    print_warning "  ДИАГНОСТИКА - ПРОВЕРЬТЕ НА ОБЕИХ РОУТЕРАХ"
-    print_warning "═══════════════════════════════════════════════════════════════"
-    
+    echo "========================================"
+    echo "         ИТОГОВАЯ ИНФОРМАЦИЯ"
+    echo "========================================"
     echo ""
-    echo "Выполните эти команды на ОБЕИХ маршрутизаторах и сравните:"
+    echo "Роль маршрутизатора: $ROUTER_ROLE"
     echo ""
-    
-    # Генерируем команды для второго роутера
-    echo "┌─────────────────────────────────────────────────────────────────┐"
-    echo "│ КОМАНДЫ ДЛЯ ПРОВЕРКИ (выполнить на обоих роутерах):            │"
-    echo "├─────────────────────────────────────────────────────────────────┤"
-    echo "│ 1. Проверка GRE:                                                │"
-    echo "│    ping 10.10.0.1   (с BR-RTR)                                 │"
-    echo "│    ping 10.10.0.2   (с HQ-RTR)                                 │"
-    echo "│                                                                 │"
-    echo "│ 2. Проверка OSPF на интерфейсе:                                 │"
-    echo "│    vtysh -c 'show ip ospf interface $GRE_INTERFACE'            │"
-    echo "│                                                                 │"
-    echo "│ 3. Проверка passive (НЕ должно быть!):                          │"
-    echo "│    vtysh -c 'show ip ospf interface $GRE_INTERFACE' | grep -i passive │"
-    echo "│                                                                 │"
-    echo "│ 4. Проверка типа сети (должен быть одинаковый):                 │"
-    echo "│    vtysh -c 'show ip ospf interface $GRE_INTERFACE' | grep -i network │"
-    echo "│                                                                 │"
-    echo "│ 5. Проверка аутентификации:                                     │"
-    echo "│    vtysh -c 'show run' | grep -A5 'interface $GRE_INTERFACE'   │"
-    echo "└─────────────────────────────────────────────────────────────────┘"
-    
+    echo "Внешний интерфейс: $EXTERNAL_INTERFACE"
+    echo "Локальный IP: $EXTERNAL_IP/$EXTERNAL_PREFIX"
+    echo "Удаленный IP: $REMOTE_IP"
     echo ""
-    print_warning "ВАЖНО - Параметры должны совпадать:"
+    echo "Туннельный интерфейс: $TUNNEL_IFACE"
+    echo "Локальный туннельный IP: $TUNNEL_LOCAL/$TUNNEL_PREFIX"
+    echo "Удаленный туннельный IP: $TUNNEL_REMOTE"
     echo ""
-    echo "  ┌────────────────────┬─────────────────┬─────────────────┐"
-    echo "  │ Параметр           │ HQ-RTR          │ BR-RTR          │"
-    echo "  ├────────────────────┼─────────────────┼─────────────────┤"
-    echo "  │ Network Type       │ POINT_TO_POINT  │ POINT_TO_POINT  │"
-    echo "  │ Passive            │ NO              │ NO              │"
-    echo "  │ Hello Timer        │ 10              │ 10              │"
-    echo "  │ Dead Timer         │ 40              │ 40              │"
-    echo "  │ Password           │ $OSPF_PASSWORD"
-    echo "  │ Router ID          │ 172.16.1.1      │ 172.16.2.1      │"
-    echo "  │ GRE IP             │ 10.10.0.1/30    │ 10.10.0.2/30    │"
-    echo "  └────────────────────┴─────────────────┴─────────────────┘"
-    
+    echo "Пароль аутентификации: $TUNNEL_PASSWORD"
     echo ""
-    print_info "Текущая конфигурация OSPF на этом роутере:"
-    echo "────────────────────────────────────────────────────────────────────"
-    vtysh -c "show running-config" 2>/dev/null | grep -A 50 "router ospf" | head -30
-    echo "────────────────────────────────────────────────────────────────────"
-    
-    # Показываем логи
+    echo "Конфигурационные файлы:"
+    echo "  - $TUNNEL_DIR/options"
+    echo "  - $TUNNEL_DIR/ipv4address"
     echo ""
-    print_info "Последние ошибки OSPF из лога:"
-    echo "────────────────────────────────────────────────────────────────────"
-    tail -50 /var/log/frr/frr.log 2>/dev/null | grep -i "error\|warn\|fail\|mismatch\|auth" | tail -10
-    echo "────────────────────────────────────────────────────────────────────"
-    
-    # Предлагаем отладку
+    echo "Проверка туннеля:"
+    echo "  ping $TUNNEL_REMOTE"
     echo ""
-    read -p "Запустить отладку OSPF Hello пакетов? (y/n): " run_debug
-    if [[ "$run_debug" == "y" ]]; then
-        print_info "═══════════════════════════════════════════════════════════════"
-        print_info "  ОТЛАДКА OSPF HELLO ПАКЕТОВ"
-        print_info "═══════════════════════════════════════════════════════════════"
-        print_info "Будут отображаться отправленные и полученные Hello пакеты..."
-        print_info "Если пакеты отправляются, но не получаются - проблема в GRE или втором роутере"
-        echo ""
-        
-        vtysh << EOF
-terminal monitor
-debug ospf nsm
-debug ospf packet hello send detail
-debug ospf packet hello recv detail
-EOF
-        
-        print_info "Отладка запущена на 15 секунд. Проверьте второй роутер..."
-        sleep 15
-        
-        vtysh << EOF
-no debug ospf nsm
-no debug ospf packet hello send detail
-no debug ospf packet hello recv detail
-EOF
-        
-        print_info "Отладка завершена"
-    fi
+    echo "========================================"
 }
 
-#===============================================================================
-# Генерация отчёта
-#===============================================================================
+#-------------------------------------------------------------------------------
+# ОСНОВНАЯ ЛОГИКА
+#-------------------------------------------------------------------------------
 
-generate_report() {
-    print_section "Генерация отчёта"
-    
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local hostname=$(get_hostname)
-    local frr_version=$(vtysh -c "show version" 2>/dev/null | head -1)
-    
-    local report_content="
-═══════════════════════════════════════════════════════════════════════════════
-                         ОТЧЁТ О НАСТРОЙКЕ OSPF
-                    Динамическая маршрутизация между офисами
-═══════════════════════════════════════════════════════════════════════════════
+clear
 
-Дата и время: $timestamp
-Имя хоста: $hostname
+echo "==============================================================================="
+echo "                 СКРИПТ НАСТРОЙКИ GRE-ТУННЕЛЯ НА ALTLINUX SERVER"
+echo "==============================================================================="
+echo ""
+echo "Данный скрипт выполнит:"
+echo "  1. Автоматическое определение IP-адресов"
+echo "  2. Создание GRE-туннеля между офисами"
+echo "  3. Настройку парольной аутентификации"
+echo "  4. Проверку работоспособности туннеля"
+echo ""
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. ОБЩИЕ СВЕДЕНИЯ
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Проверка прав root
+if [ "$(id -u)" -ne 0 ]; then
+    log_error "Скрипт должен выполняться от имени root"
+    exit 1
+fi
 
-Роль маршрутизатора: $ROUTER_ROLE
-Версия FRR: $frr_version
-Router ID: $ROUTER_ID
+# Шаг 1: Определение IP-адресов
+detect_external_ip
+if [ $? -ne 0 ]; then
+    exit 1
+fi
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-2. НАСТРОЙКА GRE ТУННЕЛЯ
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+detect_remote_ip
 
-Интерфейс GRE: $GRE_INTERFACE
-IP-адрес GRE: $GRE_IP
-Сеть GRE туннеля: $GRE_NETWORK
-Локальный внешний IP: ${GRE_LOCAL_IP:-N/A}
-Удалённый внешний IP: ${GRE_REMOTE_IP:-N/A}
-Ключ туннеля: ${GRE_KEY:-не задан}
-GRE создан скриптом: $CREATE_GRE
+# Шаг 2: Выбор пароля
+select_password
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-3. НАСТРОЙКА OSPF
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Подтверждение продолжения
+echo ""
+echo "Продолжить настройку туннеля? [Y/n]: "
+read -r continue_choice
 
-Протокол: OSPFv2 (Open Shortest Path First)
-Тип протокола: Link State
-Номер области (Area): 0 (Backbone)
-Тип сети OSPF: $OSPF_NETWORK_TYPE
+if [[ "$continue_choice" =~ ^[Nn]$ ]]; then
+    log_info "Настройка отменена пользователем"
+    exit 0
+fi
 
-Анонсируемые сети:
-"
-    
-    for net in "${NETWORKS[@]}"; do
-        report_content+="  • $net
-"
-    done
-    
-    report_content+="
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-4. ЗАЩИТА ПРОТОКОЛА OSPF
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Шаг 3: Загрузка модуля GRE
+load_gre_module
 
-Тип аутентификации: Simple Password (Type 1)
-Пароль: $OSPF_PASSWORD
-Применено на интерфейсе: $GRE_INTERFACE
-Тип сети на интерфейсе: $OSPF_NETWORK_TYPE
+# Шаг 4: Создание конфигурации
+create_tunnel_config
 
-Команды настройки аутентификации:
-  router ospf
-    area 0 authentication
-  interface $GRE_INTERFACE
-    ip ospf authentication
-    ip ospf authentication-key $OSPF_PASSWORD
-    ip ospf network $OSPF_NETWORK_TYPE
-    no ip ospf passive
+# Шаг 5: Перезапуск сети
+restart_network
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-5. КОНФИГУРАЦИЯ FRR
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Шаг 6: Проверка
+verify_tunnel
 
-"
-    
-    # Получаем текущую конфигурацию
-    local frr_config=$(vtysh -c "show running-config" 2>/dev/null)
-    report_content+="$frr_config
+# Шаг 7: Проверка связности
+echo "Выполнить тест связности туннеля? [Y/n]: "
+read -r test_choice
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-6. СОСЕДИ OSPF
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if [[ ! "$test_choice" =~ ^[Nn]$ ]]; then
+    test_tunnel_connectivity
+fi
 
-"
-    
-    local ospf_neighbors=$(vtysh -c "show ip ospf neighbor" 2>/dev/null)
-    report_content+="$ospf_neighbors
+# Шаг 8: Настройка OSPF
+setup_ospf
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-7. МАРШРУТЫ OSPF
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Вывод итоговой информации
+print_summary
 
-"
-    
-    local ospf_routes=$(vtysh -c "show ip ospf route" 2>/dev/null)
-    report_content+="$ospf_routes
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-8. ПРИМЕЧАНИЯ
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-• OSPF настроен только на GRE интерфейсе (динамическая маршрутизация через туннель)
-• Аутентификация обеспечивает защиту от несанкционированных маршрутизаторов
-• Маршрутизаторы обмениваются маршрутами только через защищённый туннель
-• Passive интерфейсы не участвуют в OSPF (только анонсируют сети)
-
-Для проверки связности выполните:
-  ping <IP_адрес_удалённой_сети>
-
-Для просмотра состояния OSPF:
-  vtysh -c \"show ip ospf neighbor\"
-  vtysh -c \"show ip ospf route\"
-  vtysh -c \"show ip route ospf\"
-
-═══════════════════════════════════════════════════════════════════════════════
-                          КОНЕЦ ОТЧЁТА
-═══════════════════════════════════════════════════════════════════════════════
-"
-    
-    # Сохраняем отчёт
-    echo "$report_content" > "$REPORT_FILE"
-    print_success "Отчёт сохранён: $REPORT_FILE"
-    log_message "Отчёт сохранён в $REPORT_FILE"
-    
-    # Также создаём HTML версию отчёта
-    generate_html_report
-}
-
-generate_html_report() {
-    local html_file="/root/ospf-config-report.html"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local hostname=$(get_hostname)
-    local frr_config=$(vtysh -c "show running-config" 2>/dev/null)
-    local ospf_neighbors=$(vtysh -c "show ip ospf neighbor" 2>/dev/null)
-    
-    cat > "$html_file" << EOF
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Отчёт о настройке OSPF - $ROUTER_ROLE</title>
-    <style>
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            max-width: 1000px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-            color: #333;
-        }
-        .header {
-            background: linear-gradient(135deg, #1a5276, #2980b9);
-            color: white;
-            padding: 30px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            text-align: center;
-        }
-        .header h1 {
-            margin: 0;
-            font-size: 28px;
-        }
-        .header p {
-            margin: 10px 0 0 0;
-            opacity: 0.9;
-        }
-        .section {
-            background: white;
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        }
-        .section h2 {
-            color: #1a5276;
-            border-bottom: 2px solid #3498db;
-            padding-bottom: 10px;
-            margin-top: 0;
-        }
-        .info-grid {
-            display: grid;
-            grid-template-columns: 200px 1fr;
-            gap: 10px;
-        }
-        .info-label {
-            font-weight: bold;
-            color: #2c3e50;
-        }
-        .info-value {
-            color: #555;
-        }
-        .network-list {
-            list-style: none;
-            padding: 0;
-        }
-        .network-list li {
-            padding: 8px 15px;
-            background: #ecf0f1;
-            margin: 5px 0;
-            border-radius: 5px;
-            border-left: 4px solid #3498db;
-        }
-        pre {
-            background: #2c3e50;
-            color: #ecf0f1;
-            padding: 15px;
-            border-radius: 5px;
-            overflow-x: auto;
-            font-size: 13px;
-        }
-        .status-ok {
-            color: #27ae60;
-            font-weight: bold;
-        }
-        .warning {
-            background: #fcf8e3;
-            border: 1px solid #faebcc;
-            padding: 15px;
-            border-radius: 5px;
-            color: #8a6d3b;
-        }
-        .footer {
-            text-align: center;
-            color: #7f8c8d;
-            margin-top: 20px;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>Отчёт о настройке OSPF</h1>
-        <p>Динамическая маршрутизация между офисами</p>
-    </div>
-    
-    <div class="section">
-        <h2>1. Общие сведения</h2>
-        <div class="info-grid">
-            <div class="info-label">Дата и время:</div>
-            <div class="info-value">$timestamp</div>
-            <div class="info-label">Имя хоста:</div>
-            <div class="info-value">$hostname</div>
-            <div class="info-label">Роль маршрутизатора:</div>
-            <div class="info-value">$ROUTER_ROLE</div>
-            <div class="info-label">Router ID:</div>
-            <div class="info-value">$ROUTER_ID</div>
-        </div>
-    </div>
-    
-    <div class="section">
-        <h2>2. Настройка GRE туннеля</h2>
-        <div class="info-grid">
-            <div class="info-label">Интерфейс:</div>
-            <div class="info-value">$GRE_INTERFACE</div>
-            <div class="info-label">IP-адрес:</div>
-            <div class="info-value">$GRE_IP</div>
-            <div class="info-label">Сеть туннеля:</div>
-            <div class="info-value">$GRE_NETWORK</div>
-            <div class="info-label">Локальный внешний IP:</div>
-            <div class="info-value">${GRE_LOCAL_IP:-N/A}</div>
-            <div class="info-label">Удалённый внешний IP:</div>
-            <div class="info-value">${GRE_REMOTE_IP:-N/A}</div>
-            <div class="info-label">Ключ туннеля:</div>
-            <div class="info-value">${GRE_KEY:-не задан}</div>
-        </div>
-    </div>
-    
-    <div class="section">
-        <h2>3. Настройка OSPF</h2>
-        <div class="info-grid">
-            <div class="info-label">Протокол:</div>
-            <div class="info-value">OSPFv2 (Open Shortest Path First)</div>
-            <div class="info-label">Тип протокола:</div>
-            <div class="info-value">Link State</div>
-            <div class="info-label">Область (Area):</div>
-            <div class="info-value">0 (Backbone)</div>
-        </div>
-        <h3>Анонсируемые сети:</h3>
-        <ul class="network-list">
-EOF
-    
-    for net in "${NETWORKS[@]}"; do
-        echo "            <li>$net</li>" >> "$html_file"
-    done
-    
-    cat >> "$html_file" << EOF
-        </ul>
-    </div>
-    
-    <div class="section">
-        <h2>4. Защита протокола OSPF</h2>
-        <div class="info-grid">
-            <div class="info-label">Тип аутентификации:</div>
-            <div class="info-value">Simple Password (Type 1)</div>
-            <div class="info-label">Пароль:</div>
-            <div class="info-value">$OSPF_PASSWORD</div>
-            <div class="info-label">Интерфейс:</div>
-            <div class="info-value">$GRE_INTERFACE</div>
-        </div>
-        <div class="warning">
-            <strong>Важно:</strong> Аутентификация обеспечивает защиту от подключения 
-            несанкционированных маршрутизаторов к OSPF домену.
-        </div>
-    </div>
-    
-    <div class="section">
-        <h2>5. Конфигурация FRR</h2>
-        <pre>$frr_config</pre>
-    </div>
-    
-    <div class="section">
-        <h2>6. Соседи OSPF</h2>
-        <pre>$ospf_neighbors</pre>
-    </div>
-    
-    <div class="section">
-        <h2>7. Команды проверки</h2>
-        <pre># Проверка соседей OSPF
-vtysh -c "show ip ospf neighbor"
-
-# Просмотр маршрутов OSPF
-vtysh -c "show ip ospf route"
-
-# Таблица маршрутизации
-vtysh -c "show ip route ospf"
-
-# Проверка связности
-ping &lt;IP_удалённой_сети&gt;</pre>
-    </div>
-    
-    <div class="footer">
-        <p>Отчёт сгенерирован автоматически скриптом настройки OSPF</p>
-    </div>
-</body>
-</html>
-EOF
-    
-    print_success "HTML отчёт сохранён: $html_file"
-}
-
-#===============================================================================
-# Отображение сводки
-#===============================================================================
-
-show_summary() {
-    print_section "СВОДКА НАСТРОЙКИ"
-    
-    echo -e "${CYAN}"
-    echo "┌─────────────────────────────────────────────────────────────────┐"
-    echo "│                    ПАРАМЕТРЫ КОНФИГУРАЦИИ                       │"
-    echo "├─────────────────────────────────────────────────────────────────┤"
-    printf "│ %-30s │ %-30s │\n" "Роль маршрутизатора" "$ROUTER_ROLE"
-    printf "│ %-30s │ %-30s │\n" "Router ID" "$ROUTER_ID"
-    printf "│ %-30s │ %-30s │\n" "GRE интерфейс" "$GRE_INTERFACE"
-    printf "│ %-30s │ %-30s │\n" "GRE IP-адрес" "$GRE_IP"
-    printf "│ %-30s │ %-30s │\n" "Локальный внешний IP" "${GRE_LOCAL_IP:-существует}"
-    printf "│ %-30s │ %-30s │\n" "Удалённый внешний IP" "${GRE_REMOTE_IP:-существует}"
-    printf "│ %-30s │ %-30s │\n" "Ключ GRE туннеля" "${GRE_KEY:-не задан}"
-    printf "│ %-30s │ %-30s │\n" "Тип сети OSPF" "$OSPF_NETWORK_TYPE"
-    printf "│ %-30s │ %-30s │\n" "Пароль OSPF" "$OSPF_PASSWORD"
-    printf "│ %-30s │ %-30s │\n" "Количество сетей" "${#NETWORKS[@]}"
-    echo "├─────────────────────────────────────────────────────────────────┤"
-    echo "│ СЕТИ ДЛЯ АНОНСИРОВАНИЯ:                                         │"
-    for net in "${NETWORKS[@]}"; do
-        printf "│   %-60s │\n" "$net"
-    done
-    echo "└─────────────────────────────────────────────────────────────────┘"
-    echo -e "${NC}"
-    
-    # Предупреждение о типе сети
-    echo ""
-    print_warning "═══════════════════════════════════════════════════════════════"
-    print_warning "  ВАЖНО: Убедитесь, что на другом маршрутизаторе:"
-    print_warning "  • Такой же тип сети OSPF: $OSPF_NETWORK_TYPE"
-    print_warning "  • Такой же пароль OSPF: $OSPF_PASSWORD"
-    print_warning "  • Правильно настроен GRE туннель"
-    print_warning "═══════════════════════════════════════════════════════════════"
-}
-
-confirm_and_apply() {
-    print_section "Подтверждение"
-    
-    read -p "Применить конфигурацию? (y/n): " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        print_warning "Настройка отменена пользователем"
-        exit 0
-    fi
-}
-
-#===============================================================================
-# Основная функция
-#===============================================================================
-
-main() {
-    # Инициализация
-    print_header
-    check_root
-    check_alt_linux
-    
-    # Отображение информации об интерфейсах
-    list_interfaces_with_details
-    
-    # Интерактивный выбор параметров
-    select_router_role
-    select_gre_interface  # Включает создание GRE если не существует
-    select_networks
-    select_router_id
-    select_ospf_password
-    select_ospf_network_type  # Выбор типа сети OSPF
-    
-    # Отображение сводки
-    show_summary
-    
-    # Подтверждение
-    confirm_and_apply
-    
-    # Установка и настройка
-    install_frr
-    configure_frr_daemons
-    configure_frr_service
-    
-    # Пауза для инициализации FRR
-    print_info "Ожидание инициализации FRR..."
-    sleep 3
-    
-    configure_ospf
-    
-    # Проверка
-    verify_ospf
-    
-    # Генерация отчёта
-    generate_report
-    
-    # Финальное сообщение
-    print_section "НАСТРОЙКА ЗАВЕРШЕНА"
-    print_success "OSPF динамическая маршрутизация настроена!"
-    echo ""
-    print_info "Отчёты сохранены:"
-    echo "  - Текстовый: $REPORT_FILE"
-    echo "  - HTML: /root/ospf-config-report.html"
-    
-    # Показываем инструкции для второго роутера
-    echo ""
-    print_warning "═══════════════════════════════════════════════════════════════════════"
-    print_warning "  ИНСТРУКЦИЯ ДЛЯ НАСТРОЙКИ ВТОРОГО РОУТЕРА"
-    print_warning "═══════════════════════════════════════════════════════════════════════"
-    
-    # Определяем параметры для второго роутера
-    local other_role=""
-    local other_router_id=""
-    local other_gre_ip=""
-    local other_local_ext=""
-    local other_remote_ext=""
-    
-    case $ROUTER_ROLE in
-        "HQ-RTR")
-            other_role="BR-RTR"
-            other_router_id="172.16.2.1"
-            other_gre_ip="10.10.0.2/30"
-            other_local_ext="$GRE_REMOTE_IP"
-            other_remote_ext="$GRE_LOCAL_IP"
-            ;;
-        "BR-RTR")
-            other_role="HQ-RTR"
-            other_router_id="172.16.1.1"
-            other_gre_ip="10.10.0.1/30"
-            other_local_ext="$GRE_REMOTE_IP"
-            other_remote_ext="$GRE_LOCAL_IP"
-            ;;
-    esac
-    
-    echo ""
-    echo -e "${CYAN}На втором роутере ($other_role) выполните этот скрипт с параметрами:${NC}"
-    echo ""
-    echo "  Роль: $other_role"
-    echo "  Router ID: $other_router_id"
-    echo "  GRE IP: $other_gre_ip"
-    echo "  Локальный внешний IP: $other_local_ext"
-    echo "  Удалённый внешний IP: $other_remote_ext"
-    echo "  Ключ GRE: ${GRE_KEY:-не задан}"
-    echo "  Пароль OSPF: $OSPF_PASSWORD"
-    echo "  Тип сети OSPF: $OSPF_NETWORK_TYPE"
-    echo ""
-    
-    print_warning "═══════════════════════════════════════════════════════════════════════"
-    print_warning "  ВАЖНО: Параметры должны СОВПАДАТЬ на обоих роутерах:"
-    print_warning "═══════════════════════════════════════════════════════════════════════"
-    echo ""
-    echo "  ┌────────────────────────┬─────────────────┬─────────────────┐"
-    echo "  │ Параметр               │ Этот роутер     │ Второй роутер   │"
-    echo "  ├────────────────────────┼─────────────────┼─────────────────┤"
-    printf "  │ Роль                   │ %-15s │ %-15s │\n" "$ROUTER_ROLE" "$other_role"
-    printf "  │ Router ID              │ %-15s │ %-15s │\n" "$ROUTER_ID" "$other_router_id"
-    printf "  │ GRE IP                 │ %-15s │ %-15s │\n" "$GRE_IP" "$other_gre_ip"
-    printf "  │ Тип сети OSPF          │ %-15s │ %-15s │\n" "$OSPF_NETWORK_TYPE" "$OSPF_NETWORK_TYPE"
-    printf "  │ Пароль OSPF            │ %-15s │ %-15s │\n" "$OSPF_PASSWORD" "$OSPF_PASSWORD"
-    printf "  │ Passive                │ %-15s │ %-15s │\n" "NO" "NO"
-    echo "  └────────────────────────┴─────────────────┴─────────────────┘"
-    echo ""
-    
-    print_info "После настройки второго роутера проверьте:"
-    echo "  1. Ping через GRE туннель: ping ${other_gre_ip%%/*}"
-    echo "  2. Соседи OSPF: vtysh -c 'show ip ospf neighbor'"
-    echo "  3. Маршруты OSPF: vtysh -c 'show ip route ospf'"
-    echo ""
-    print_info "Полезные команды:"
-    echo "  vtysh -c 'show ip ospf neighbor'   # Соседи OSPF"
-    echo "  vtysh -c 'show ip ospf route'      # Маршруты OSPF"
-    echo "  vtysh -c 'show ip route ospf'      # Таблица маршрутизации"
-    echo "  ip tunnel show                     # Статус GRE туннеля"
-}
-
-#===============================================================================
-# Запуск
-#===============================================================================
-
-main "$@"
+log_success "Настройка GRE-туннеля завершена!"
+echo ""
