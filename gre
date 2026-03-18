@@ -7,33 +7,31 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "=================================================="
-echo "       Настройка GRE-туннеля (HQ-RTR / BR-RTR)    "
+echo "       Настройка GRE-туннеля (Interactive)        "
 echo "=================================================="
 echo ""
 
-# Выбор маршрутизатора
+# 1. Выбор роли маршрутизатора
 echo "Выберите настраиваемый маршрутизатор:"
-echo "1) HQ-RTR (Локальный: 172.16.4.2, Туннель: 10.0.0.1)"
-echo "2) BR-RTR (Локальный: 172.16.5.2, Туннель: 10.0.0.2)"
-read -p "Введите номер варианта (1 или 2): " choice
+echo "1) HQ-RTR"
+echo "2) BR-RTR"
+read -p "Ваш выбор (1 или 2): " role_choice
 
-# Инициализация переменных
-IFACE_DIR="/etc/net/ifaces/gre0"
-
-case $choice in
+# Установка значений по умолчанию в зависимости от выбора
+case $role_choice in
     1)
-        LOCAL_IP="172.16.4.2"
-        REMOTE_IP="172.16.5.2"
-        TUNNEL_IP="10.0.0.1/30"
-        HOSTNAME="HQ-RTR"
-        PING_TARGET="10.0.0.2"
+        def_local_wan="172.16.4.2"
+        def_remote_wan="172.16.5.2"
+        def_local_tun="10.0.0.1/30"
+        def_remote_tun="10.0.0.2"
+        host_name="HQ-RTR"
         ;;
     2)
-        LOCAL_IP="172.16.5.2"
-        REMOTE_IP="172.16.4.2"
-        TUNNEL_IP="10.0.0.2/30"
-        HOSTNAME="BR-RTR"
-        PING_TARGET="10.0.0.1"
+        def_local_wan="172.16.5.2"
+        def_remote_wan="172.16.4.2"
+        def_local_tun="10.0.0.2/30"
+        def_remote_tun="10.0.0.1"
+        host_name="BR-RTR"
         ;;
     *)
         echo "Неверный выбор. Выход."
@@ -42,56 +40,90 @@ case $choice in
 esac
 
 echo ""
-echo "--- Настройка $HOSTNAME ---"
-echo "Локальный внешний IP: $LOCAL_IP"
-echo "Удаленный внешний IP: $REMOTE_IP"
-echo "Адрес туннеля: $TUNNEL_IP"
+echo "--- Ввод параметров для $host_name ---"
+echo "(Нажмите ENTER, чтобы использовать значение по умолчанию в скобках)"
+
+# 2. Ввод внешних адресов (WAN)
+read -p "Локальный внешний IP (LOCALADDR) [$def_local_wan]: " local_wan
+local_wan=${local_wan:-$def_local_wan}
+
+read -p "Удаленный внешний IP (REMOTEADDR) [$def_remote_wan]: " remote_wan
+remote_wan=${remote_wan:-$def_remote_wan}
+
+# 3. Ввод адресов туннеля
 echo ""
+echo "Настройка адресации внутри туннеля:"
+
+read -p "Локальный адрес туннеля (CIDR) [$def_local_tun]: " local_tun
+local_tun=${local_tun:-$def_local_tun}
+
+# Для пинга спрашиваем адрес соседа (удаленный конец туннеля)
+# Извлекаем подсеть из введенного адреса, если нужно, или просто спрашиваем
+read -p "Адрес туннеля удаленного шлюза (для проверки пинга) [$def_remote_tun]: " remote_tun
+remote_tun=${remote_tun:-$def_remote_tun}
+
+echo ""
+echo "Проверка введенных данных:"
+echo "------------------------------------------------"
+echo "Роль:            $host_name"
+echo "Внешний IP:      $local_wan (локальный) <-> $remote_wan (удаленный)"
+echo "Туннельный IP:   $local_tun (локальный) <-> $remote_tun (удаленный)"
+echo "------------------------------------------------"
+read -p "Все верно? Продолжить? (y/n): " confirm
+
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo "Отмена операции."
+    exit 0
+fi
+
+# --- Начало конфигурации ---
+
+IFACE_DIR="/etc/net/ifaces/gre0"
 
 # 1. Загрузка модуля
-echo "[Шаг 1] Загрузка модуля GRE..."
+echo ""
+echo "[1/4] Загрузка модуля GRE..."
 modprobe gre
 if ! grep -q "^gre" /etc/modules; then
     echo "gre" >> /etc/modules
-    echo "Модуль gre добавлен в /etc/modules."
+    echo "-> Модуль gre добавлен в /etc/modules."
 else
-    echo "Модуль gre уже есть в /etc/modules."
+    echo "-> Модуль gre уже есть в автозагрузке."
 fi
 
-# 2. Создание директории интерфейса
-echo "[Шаг 2] Создание конфигурации интерфейса..."
+# 2. Создание директории
+echo "[2/4] Создание файлов конфигурации..."
 mkdir -p "$IFACE_DIR"
 
-# 3. Запись файла options
-echo "Запись $IFACE_DIR/options ..."
+# 3. Запись options
 cat > "$IFACE_DIR/options" <<EOF
 TYPE=gre
 BOOTPROTO=static
-REMOTEADDR=$REMOTE_IP
-LOCALADDR=$LOCAL_IP
+REMOTEADDR=$remote_wan
+LOCALADDR=$local_wan
 TTL=64
 EOF
+echo "-> Файл options записан."
 
-# 4. Запись файла ipv4address
-echo "Запись $IFACE_DIR/ipv4address ..."
-echo "$TUNNEL_IP" > "$IFACE_DIR/ipv4address"
+# 4. Запись ipv4address
+echo "$local_tun" > "$IFACE_DIR/ipv4address"
+echo "-> Файл ipv4address записан."
 
-# 5. Применение настроек
+# 5. Применение
 echo ""
-echo "[Шаг 3] Перезапуск сети..."
-echo "Выполняется: systemctl restart network"
+echo "[3/4] Перезапуск сетевой службы..."
 systemctl restart network
 
 # 6. Проверка
 echo ""
-echo "[Шаг 4] Проверка состояния интерфейса..."
+echo "[4/4] Проверка интерфейса gre0:"
 ip a show gre0
 
 echo ""
-read -p "Выполнить пинг туннельного адреса соседа ($PING_TARGET)? (y/n): " ping_ask
+read -p "Выполнить пинг удаленного конца туннеля ($remote_tun)? (y/n): " ping_ask
 if [[ "$ping_ask" =~ ^[Yy]$ ]]; then
-    echo "Пингуем $PING_TARGET..."
-    ping -c 4 $PING_TARGET
+    echo "Пингуем $remote_tun..."
+    ping -c 4 $remote_tun
 fi
 
 echo ""
