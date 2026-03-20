@@ -7,7 +7,6 @@
 IFACES=()
 for i in /sys/class/net/*; do
     name=$(basename "$i")
-    # Фильтр: физическое устройство (есть папка device), не loopback, не vlan
     if [[ "$name" != "lo" && "$name" != *.* && -d "$i/device" ]]; then
         IFACES+=("$name")
     fi
@@ -36,27 +35,22 @@ ONBOOT=yes
 EOF
 touch "/etc/net/ifaces/$IFACE/ipv4address"
 
-# 4. Ввод данных для IP-адресации
-while true; do
-    read -p "Введите первые два октета подсети (например 192.168): " BASE_IP
-    # Простая проверка формата
-    if [[ "$BASE_IP" =~ ^[0-9]+\.[0-9]+$ ]]; then
-        break
-    else
-        echo "Ошибка формата. Введите два числа через точку (например: 10.10)."
-    fi
-done
+# 4. Ввод базовых данных
+read -p "Введите первые два октета подсети (например 192.168): " BASE_IP
+read -p "Введите последний октет IP хоста (например 1): " HOST_ID
+read -p "Введите список VLAN ID (через пробел: 100 200 999): " VLANS
 
-read -p "Введите последний октет IP хоста (например 1 или 254): " HOST_ID
-read -p "Введите маску (нажмите Enter для 24): " MASK
-MASK=${MASK:-24}
-
-# 5. Ввод и настройка VLAN
-read -p "Введите список VLAN ID (через пробел): " VLANS
-
+# 5. Настройка VLAN в цикле
 for VID in $VLANS; do
-    # Проверка на число
     [[ ! "$VID" =~ ^[0-9]+$ ]] && echo "Пропуск неверного ID: $VID" && continue
+    
+    # Автоматический расчет 3-го октета: VLAN 100 -> 10, VLAN 999 -> 99
+    # (целочисленное деление на 10)
+    OCTET_3=$((VID / 10))
+    FULL_IP="${BASE_IP}.${OCTET_3}.${HOST_ID}"
+
+    # Запрос маски для каждого VLAN (так как они разные в вашем примере)
+    read -p "Введите маску для VLAN $VID (например 26, 28, 29): " MASK
     
     VLAN_IF="${IFACE}.${VID}"
     mkdir -p "/etc/net/ifaces/$VLAN_IF"
@@ -72,26 +66,27 @@ SYSTEMD_CONTROLLED=no
 ONBOOT=yes
 EOF
 
-    # ИСПРАВЛЕНИЕ: Убрана опечатка, путь теперь верный
-    # Автоматическая установка IP адреса: BASE_IP.VID.HOST_ID
-    echo "${BASE_IP}.${VID}.${HOST_ID}/${MASK}" > "/etc/net/ifaces/$VLAN_IF/ipv4address"
+    # Запись IP адреса (ИСПРАВЛЕНО: путь к файлу без ошибок)
+    echo "${FULL_IP}/${MASK}" > "/etc/net/ifaces/$VLAN_IF/ipv4address"
     
-    echo "VLAN $VID настроен: IP ${BASE_IP}.${VID}.${HOST_ID}/${MASK}"
+    # Вывод в требуемом формате (Таблица)
+    # Пример: HQ-RTR (VLAN100) 192.168.10.1/26 192.168.10.1
+    echo "$(hostname) (VLAN${VID}) ${FULL_IP}/${MASK} ${FULL_IP}"
 done
 
 # 6. Автоматическое поднятие портов
-echo "Применение настроек..."
+echo ""
+echo "Применение настроек и поднятие интерфейсов..."
+
 ifdown "$IFACE" 2>/dev/null
 ifup "$IFACE" 2>/dev/null
 
 for VID in $VLANS; do
     if [[ "$VID" =~ ^[0-9]+$ ]]; then
         VLAN_IF="${IFACE}.${VID}"
-        # Сначала отключаем, потом включаем для применения нового IP
         ifdown "$VLAN_IF" 2>/dev/null
         ifup "$VLAN_IF" 2>/dev/null
     fi
 done
 
-echo "Готово. Проверка статуса:"
-ip -br a | grep "$IFACE"
+echo "Готово."
