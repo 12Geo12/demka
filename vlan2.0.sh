@@ -1,318 +1,83 @@
 #!/bin/bash
 
-# ==============================================================================
-# Скрипт настройки VLAN для ALT Linux (Интерактивный выбор интерфейса и кол-ва VLAN)
-# ==============================================================================
-
 # Проверка прав root
-if [ "$EUID" -ne 0 ]; then 
-  echo "Пожалуйста, запустите скрипт от имени root (sudo ./setup_vlans.sh)"
-  exit 1
-fi
+[ "$(id -u)" -ne 0 ] && echo "Запустите скрипт от root." && exit 1
 
-# Проверка существования директории ALT Net
-if [ ! -d "/etc/net/ifaces" ]; then
-    echo "Ошибка: Директория /etc/net/ifaces не найдена."
-    echo "Этот скрипт предназначен для ALT Linux."
-    exit 1
-fi
+# --- 1. АВТОМАТИЧЕСКИЙ ВЫБОР ИНТЕРФЕЙСА ---
 
-# ==============================================================================
-# ФУНКЦИИ
-# ==============================================================================
+# Сбор списка физических интерфейсов (исключаем lo и vlan)
+IFACES=()
+for i in /sys/class/net/*; do
+    name=$(basename "$i")
+    # Физическое устройство имеет папку 'device', vlan содержит '.', lo - loopback
+    if [[ "$name" != "lo" && "$name" != *.* && -d "$i/device" ]]; then
+        IFACES+=("$name")
+    fi
+done
 
-# Расчет маски по количеству хостов
-calculate_cidr() {
-    local hosts=$1
-    local bits=1
-    while (( (1 << bits) - 2 < hosts )); do
-        ((bits++))
-    done
-    echo $((32 - bits))
-}
+if [ ${#IFACES[@]} -eq 0 ]; then echo "Ошибка: Интерфейсы не найдены."; exit 1; fi
 
-# Создание конфига VLAN
-create_vlan_config() {
-    local vlan_name=$1      # Имя/Описание
-    local vlan_id=$2        # Номер VLAN
-    local iface=$3          # Физический интерфейс
-    local network_octet=$4  # Третий октет
-    local hosts=$5          # Кол-во хостов
-    local base_net=$6       # Базовая сеть (192.168)
-    
-    local cidr=$(calculate_cidr $hosts)
-    local vlan_iface_name="${iface}.${vlan_id}"
-    local vlan_dir="/etc/net/ifaces/${vlan_iface_name}"
-    local network_ip="${base_net}.${network_octet}.0"
-    local ip_address="${network_ip%.*}.1/$cidr" # Исправлено: шлюз (.1), а не сервер (.2)
-    local full_network="${network_ip}/${cidr}"
-    
-    echo "    -> Создание $vlan_iface_name ($vlan_name)..."
-    
-    # 1. Создаем директорию
-    mkdir -p "$vlan_dir"
-    
-    # 2. Создаем корректный конфиг options (перезаписываем, если есть)
-    cat > "$vlan_dir/options" <<EOF
-BOOTPROTO=static
-TYPE=vlan
-ONBOOT=yes
-HOST=${iface}
-VID=${vlan_id}
-DISABLED=no
-CONFIG_IPV4=yes
-EOF
+echo "Выберите физический интерфейс:"
+PS3="Номер интерфейса > "
+select IFACE in "${IFACES[@]}"; do
+    [ -n "$IFACE" ] && break || echo "Неверный выбор."
+done
 
-    # 3. Создаем ipv4address
-    echo "$ip_address" > "$vlan_dir/ipv4address"
-    
-    echo "       Сеть: $full_network, IP: $ip_address (шлюз)"
-}
+# --- 2. НАСТРОЙКА ФИЗИЧЕСКОГО ПОРТА ---
 
-# Функция поднятия физического интерфейса
-activate_physical_interface() {
-    local iface=$1
-    local phys_dir="/etc/net/ifaces/${iface}"
-    
-    echo ""
-    echo "--- Настройка физического интерфейса ${iface} ---"
-    
-    # Создаем директорию если её нет
-    mkdir -p "$phys_dir"
-    
-    # Создаем корректный options файл для физического интерфейса
-    cat > "$phys_dir/options" <<EOF
-BOOTPROTO=static
+# Создание конфигурации родительского интерфейса (TYPE=eth)
+mkdir -p "/etc/net/ifaces/$IFACE"
+
+cat > "/etc/net/ifaces/$IFACE/options" <<EOF
 TYPE=eth
-ONBOOT=yes
-DISABLED=no
+CONFIG_WIRELESS=no
+BOOTPROTO=static
+SYSTEMD_BOOTPROTO=static
 CONFIG_IPV4=yes
+DISABLED=no
+NM_CONTROLLED=no
+SYSTEMD_CONTROLLED=no
+ONBOOT=yes
 EOF
 
-    # Убедимся, что интерфейс не заблокирован
-    echo "Включаем интерфейс ${iface}..."
-    ip link set dev ${iface} up
+# Создаем пустой файл адреса для корректной работы static
+touch "/etc/net/ifaces/$IFACE/ipv4address"
+
+# --- 3. НАСТРОЙКА VLAN ---
+
+read -p "Введите VLAN ID (через пробел): " VLANS
+
+for VID in $VLANS; do
+    # Проверка на число
+    [[ ! "$VID" =~ ^[0-9]+$ ]] && echo "Пропуск неверного ID: $VID" && continue
     
-    # Проверяем статус
-    if ip link show ${iface} | grep -q "UP"; then
-        echo "✓ Интерфейс ${iface} успешно поднят"
-        return 0
-    else
-        echo "⚠ Не удалось поднять интерфейс ${iface}"
-        return 1
-    fi
-}
-
-# ==============================================================================
-# ВЫБОР ФИЗИЧЕСКОГО ИНТЕРФЕЙСА
-# ==============================================================================
-
-echo "========================================================"
-echo "  Поиск доступных интерфейсов"
-echo "========================================================"
-
-# Получаем список интерфейсов, исключая lo, docker, veth, virbr
-mapfile -t IFACES < <(ip -o link show | awk -F': ' '{print $2}' | grep -v -E "^(lo|docker|veth|virbr|sit)")
-
-if [ ${#IFACES[@]} -eq 0 ]; then
-    echo "Ошибка: Не найдено подходящих сетевых интерфейсов."
-    exit 1
-fi
-
-# Выводим список
-echo "Доступные интерфейсы:"
-for i in "${!IFACES[@]}"; do
-    # Получаем статус UP/DOWN и MAC для наглядности
-    STATUS=$(ip -o link show "${IFACES[$i]}" | awk '{print $9}')
-    MAC=$(ip -o link show "${IFACES[$i]}" | awk '{print $17}')
-    printf "  [%d] %s (Status: %s, MAC: %s)\n" "$((i+1))" "${IFACES[$i]}" "$STATUS" "$MAC"
-done
-
-# Запрос выбора
-while true; do
-    read -p "Выберите номер интерфейса для настройки: " SELECTION
-    if [[ "$SELECTION" =~ ^[0-9]+$ ]] && [ "$SELECTION" -ge 1 ] && [ "$SELECTION" -le ${#IFACES[@]} ]; then
-        PHYS_IFACE="${IFACES[$((SELECTION-1))]}"
-        break
-    else
-        echo "Неверный ввод. Пожалуйста, введите число от 1 до ${#IFACES[@]}."
-    fi
-done
-
-echo "Выбран интерфейс: $PHYS_IFACE"
-
-# ==============================================================================
-# ОБЩИЕ ПАРАМЕТРЫ
-# ==============================================================================
-
-read -p "Введите первые два октета сети [192.168]: " BASE_NETWORK_INPUT
-BASE_NETWORK=${BASE_NETWORK_INPUT:-192.168}
-
-# ==============================================================================
-# ВВОД ДАННЫХ ПО VLAN
-# ==============================================================================
-
-echo ""
-read -p "Сколько VLAN нужно создать? [2]: " VLAN_COUNT
-VLAN_COUNT=${VLAN_COUNT:-2}
-
-# Массивы для хранения данных
-declare -a VLANS_ID
-declare -a VLANS_NAME
-declare -a VLANS_HOSTS
-declare -a VLANS_OCTET
-
-echo ""
-echo "--------------------------------------------------------"
-echo "  Настройка параметров для $VLAN_COUNT VLAN(s)"
-echo "--------------------------------------------------------"
-
-for (( i=1; i<=VLAN_COUNT; i++ )); do
-    echo ""
-    echo "--- VLAN #$i ---"
+    VLAN_IF="${IFACE}.${VID}"
+    mkdir -p "/etc/net/ifaces/$VLAN_IF"
     
-    # Имя/Описание
-    read -p "Название/Описание (например, Office): " V_NAME
+    cat > "/etc/net/ifaces/$VLAN_IF/options" <<EOF
+TYPE=vlan
+HOST=$IFACE
+VID=$VID
+DISABLED=no
+NM_CONTROLLED=no
+SYSTEMD_CONTROLLED=no
+ONBOOT=yes
+EOF
     
-    # ID VLAN
-    while true; do
-        read -p "VLAN ID (число): " V_ID
-        if [[ "$V_ID" =~ ^[0-9]+$ ]] && [ "$V_ID" -ge 1 ] && [ "$V_ID" -le 4094 ]; then
-            break
-        else
-            echo "Ошибка: VLAN ID должен быть числом от 1 до 4094."
-        fi
-    done
-
-    # Третий октет подсети
-    while true; do
-        read -p "3-й октет подсети (для ${BASE_NETWORK}.X.0) [${i}0]: " V_OCTET
-        V_OCTET=${V_OCTET:-$((i*10))}
-        if [[ "$V_OCTET" =~ ^[0-9]+$ ]] && [ "$V_OCTET" -ge 0 ] && [ "$V_OCTET" -le 255 ]; then
-            break
-        else
-            echo "Ошибка: Октет должен быть числом от 0 до 255."
-        fi
-    done
-
-    # Кол-во хостов
-    read -p "Требуемое кол-во хостов [254]: " V_HOSTS
-    V_HOSTS=${V_HOSTS:-254}
-
-    # Сохраняем данные
-    VLANS_NAME+=("$V_NAME")
-    VLANS_ID+=("$V_ID")
-    VLANS_OCTET+=("$V_OCTET")
-    VLANS_HOSTS+=("$V_HOSTS")
+    # Упрощенный вывод
+    echo "VLAN $VID настроен."
 done
 
-# ==============================================================================
-# ПОДТВЕРЖДЕНИЕ
-# ==============================================================================
+# --- 4. АВТОМАТИЧЕСКОЕ ПОДНЯТИЕ ПОРТОВ ---
 
-echo ""
-echo "========================================================"
-echo "  Проверка конфигурации перед применением"
-echo "========================================================"
-echo "Физический интерфейс: $PHYS_IFACE"
-echo "Базовая сеть: $BASE_NETWORK.0.0"
-echo ""
-
-printf "%-5s %-15s %-10s %-20s %-10s\n" "ID" "Название" "VLAN ID" "Сеть" "Хостов"
-echo "-----------------------------------------------------------"
-
-for (( i=0; i<VLAN_COUNT; i++ )); do
-    cidr=$(calculate_cidr ${VLANS_HOSTS[$i]})
-    printf "%-5s %-15s %-10s %-20s %-10s\n" \
-        "#$((i+1))" \
-        "${VLANS_NAME[$i]}" \
-        "${VLANS_ID[$i]}" \
-        "${BASE_NETWORK}.${VLANS_OCTET[$i]}.0/${cidr}" \
-        "${VLANS_HOSTS[$i]}"
-done
-
-echo ""
-read -p "Продолжить настройку? (y/n): " CONFIRM
-
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    echo "Настройка отменена."
-    exit 0
-fi
-
-# ==============================================================================
-# ПРИМЕНЕНИЕ НАСТРОЕК
-# ==============================================================================
-
-echo ""
 echo "Применение настроек..."
-echo "------------------------------------------------"
 
-# Сначала поднимаем физический интерфейс
-activate_physical_interface "$PHYS_IFACE"
+# Поднимаем физический интерфейс
+ifup "$IFACE" 2>/dev/null
 
-# Затем создаем VLAN интерфейсы
-for (( i=0; i<VLAN_COUNT; i++ )); do
-    create_vlan_config "${VLANS_NAME[$i]}" "${VLANS_ID[$i]}" "$PHYS_IFACE" "${VLANS_OCTET[$i]}" "${VLANS_HOSTS[$i]}" "$BASE_NETWORK"
+# Поднимаем все созданные VLAN
+for VID in $VLANS; do
+    [[ "$VID" =~ ^[0-9]+$ ]] && ifup "${IFACE}.${VID}" 2>/dev/null
 done
 
-echo ""
-echo "------------------------------------------------"
-echo "Конфигурация завершена!"
-echo ""
-
-# Дополнительно проверяем, что интерфейсы загружены модулем 8021q
-if ! lsmod | grep -q 8021q; then
-    echo "Загружаем модуль ядра 8021q..."
-    modprobe 8021q
-    # Добавляем в автозагрузку
-    echo "8021q" >> /etc/modules-load.d/network.conf 2>/dev/null
-fi
-
-# Перезапуск сети
-echo ""
-read -p "Перезапустить сетевую службу сейчас? (y/n): " RESTART_NET
-
-if [[ "$RESTART_NET" =~ ^[Yy]$ ]]; then
-    echo "Перезапуск службы сети..."
-    
-    # Сохраняем правила, если есть iptables
-    if command -v iptables-save &> /dev/null; then
-        mkdir -p /etc/sysconfig
-        iptables-save > /etc/sysconfig/iptables 2>/dev/null
-    fi
-    
-    # Перезапускаем сеть
-    if command -v systemctl &> /dev/null; then
-        systemctl restart network
-    else
-        /etc/init.d/network restart
-    fi
-    
-    if [ $? -eq 0 ]; then
-        echo "✓ Сеть перезагружена успешно."
-    else
-        echo "⚠ Произошла ошибка при перезагрузке."
-    fi
-fi
-
-# Итоговый вывод
-echo ""
-echo "========================================================"
-echo "  Итоговый список интерфейсов"
-echo "========================================================"
-# Показываем физический интерфейс и созданные VLAN
-ip -brief addr show | grep -E "$PHYS_IFACE|${PHYS_IFACE}\." | sort
-
-echo ""
-echo "Проверка состояния интерфейсов:"
-for iface in $(ip -brief addr show | grep -E "$PHYS_IFACE|${PHYS_IFACE}\." | awk '{print $1}'); do
-    state=$(ip -brief addr show $iface | awk '{print $2}')
-    if [ "$state" == "UP" ]; then
-        echo "✓ $iface: $state"
-    else
-        echo "⚠ $iface: $state"
-    fi
-done
-
-echo ""
-echo "Готово!"
+echo "Готово. Интерфейсы подняты."
