@@ -1,33 +1,28 @@
 #!/bin/bash
 
-# Проверка прав root
-[ "$(id -u)" -ne 0 ] && echo "Запустите скрипт от root." && exit 1
+# 1. Проверка прав
+[ "$(id -u)" -ne 0 ] && echo "Требуются права root." && exit 1
 
-# --- 1. АВТОМАТИЧЕСКИЙ ВЫБОР ИНТЕРФЕЙСА ---
-
-# Сбор списка физических интерфейсов (исключаем lo и vlan)
+# 2. Автоматический поиск и выбор физического интерфейса
 IFACES=()
 for i in /sys/class/net/*; do
     name=$(basename "$i")
-    # Физическое устройство имеет папку 'device', vlan содержит '.', lo - loopback
+    # Фильтр: физическое устройство (есть папка device), не loopback, не vlan
     if [[ "$name" != "lo" && "$name" != *.* && -d "$i/device" ]]; then
         IFACES+=("$name")
     fi
 done
 
-if [ ${#IFACES[@]} -eq 0 ]; then echo "Ошибка: Интерфейсы не найдены."; exit 1; fi
+[ ${#IFACES[@]} -eq 0 ] && echo "Ошибка: Интерфейсы не найдены." && exit 1
 
 echo "Выберите физический интерфейс:"
-PS3="Номер интерфейса > "
+PS3="Номер > "
 select IFACE in "${IFACES[@]}"; do
     [ -n "$IFACE" ] && break || echo "Неверный выбор."
 done
 
-# --- 2. НАСТРОЙКА ФИЗИЧЕСКОГО ПОРТА ---
-
-# Создание конфигурации родительского интерфейса (TYPE=eth)
+# 3. Настройка физического интерфейса (TYPE=eth)
 mkdir -p "/etc/net/ifaces/$IFACE"
-
 cat > "/etc/net/ifaces/$IFACE/options" <<EOF
 TYPE=eth
 CONFIG_WIRELESS=no
@@ -39,21 +34,24 @@ NM_CONTROLLED=no
 SYSTEMD_CONTROLLED=no
 ONBOOT=yes
 EOF
-
-# Создаем пустой файл адреса для корректной работы static
 touch "/etc/net/ifaces/$IFACE/ipv4address"
 
-# --- 3. НАСТРОЙКА VLAN ---
+# 4. Ввод данных для IP-адресации
+read -p "Введите первые два октета подсети (например 192.168): " BASE_IP
+read -p "Введите последний октет IP хоста (например 1 или 254): " HOST_ID
+# По умолчанию маска /24, можно изменить при необходимости
+MASK="24"
 
-read -p "Введите VLAN ID (через пробел): " VLANS
+# 5. Ввод и настройка VLAN
+read -p "Введите список VLAN ID (через пробел): " VLANS
 
 for VID in $VLANS; do
-    # Проверка на число
     [[ ! "$VID" =~ ^[0-9]+$ ]] && echo "Пропуск неверного ID: $VID" && continue
     
     VLAN_IF="${IFACE}.${VID}"
     mkdir -p "/etc/net/ifaces/$VLAN_IF"
     
+    # Конфигурация VLAN
     cat > "/etc/net/ifaces/$VLAN_IF/options" <<EOF
 TYPE=vlan
 HOST=$IFACE
@@ -63,19 +61,16 @@ NM_CONTROLLED=no
 SYSTEMD_CONTROLLED=no
 ONBOOT=yes
 EOF
+
+    # Автоматическая установка IP адреса: BASE_IP.VID.HOST_ID
+    echo "${BASE_IP}.${VID}.${HOST_ID}/${MASK}" > "/etc/net/ifaces/$VLAN_IF}/ipv4address"
     
-    # Упрощенный вывод
-    echo "VLAN $VID настроен."
+    echo "VLAN $VID настроен: IP ${BASE_IP}.${VID}.${HOST_ID}/${MASK}"
 done
 
-# --- 4. АВТОМАТИЧЕСКОЕ ПОДНЯТИЕ ПОРТОВ ---
-
+# 6. Автоматическое поднятие портов
 echo "Применение настроек..."
-
-# Поднимаем физический интерфейс
 ifup "$IFACE" 2>/dev/null
-
-# Поднимаем все созданные VLAN
 for VID in $VLANS; do
     [[ "$VID" =~ ^[0-9]+$ ]] && ifup "${IFACE}.${VID}" 2>/dev/null
 done
