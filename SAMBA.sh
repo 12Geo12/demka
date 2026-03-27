@@ -1,208 +1,162 @@
 #!/bin/bash
 
 # ==========================================
-# Скрипт настройки Samba AD для ALT Linux
-# Автор: AI Assistant
+# Исправленный скрипт настройки Samba AD для ALT Linux
 # ==========================================
 
-# Цветовые коды для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Функция для красивого вывода заголовков
 print_header() {
     echo -e "${CYAN}================================================${NC}"
     echo -e "${CYAN} $1${NC}"
     echo -e "${CYAN}================================================${NC}"
 }
 
-# Функция статуса
 status() {
     if [ $1 -eq 0 ]; then
         echo -e "[${GREEN}OK${NC}] $2"
     else
         echo -e "[${RED}FAIL${NC}] $2"
-        # Если критическая ошибка, выходим
         if [ "$3" == "critical" ]; then
             exit 1
         fi
     fi
 }
 
-# Проверка прав root
 if [ "$EUID" -ne 0 ]; then 
-    echo -e "${RED}Пожалуйста, запустите этот скрипт от имени root (su -).${NC}"
+    echo -e "${RED}Запустите от root!${NC}"
     exit 1
 fi
 
 # ==========================================
-# 1. Установка и настройка Samba (базовая)
+# 1. Установка ВСЕХ необходимых пакетов
 # ==========================================
-print_header "1. Установка Samba"
+print_header "1. Установка пакетов Samba DC"
 
-# Установка пакетов (классические имена в ALT)
-apt-get update > /dev/null 2>&1
-apt-get install -y samba samba-client samba-common samba-common-tools acl
+# Обновляем списки и ставим полный набор для контроллера домена
+apt-get update
+apt-get install -y samba samba-dc samba-client samba-common acl
 
-status $? "Установка пакетов Samba завершена."
+# Проверяем, появилась ли команда samba-tool
+if ! command -v samba-tool &> /dev/null; then
+    echo -e "${RED}Ошибка: samba-tool не найден даже после установки. Проверьте репозитории.${NC}"
+    exit 1
+fi
+status $? "Пакеты установлены, samba-tool доступен"
 
-# Запрашиваем параметры домена интерактивно
-echo -e "${YELLOW}Настройка домена. Введите параметры:${NC}"
-read -p "Имя домена (например, HQ): " DOMAIN_INPUT
-read -p "IP-адрес этого сервера (для DNS): " SERVER_IP
+# ==========================================
+# 2. Подготовка конфигурации
+# ==========================================
+print_header "2. Подготовка smb.conf"
 
-# Приводим к верхнему регистру и формируем имена
+# Запрос данных
+read -p "Введите имя домена (например, HQ): " DOMAIN_INPUT
+read -p "Введите IP-адрес этого сервера: " SERVER_IP
+
 REALM=$(echo "$DOMAIN_INPUT" | tr '[:lower:]' '[:upper:]')
 DOMAIN_SHORT=$(echo "$DOMAIN_INPUT" | tr '[:upper:]' '[:lower:]')
 
-echo -e "Будет настроен домен: ${GREEN}$REALM${NC} ($DOMAIN_SHORT)"
+# Останавливаем службы перед изменениями
+systemctl stop smb nmb winbind 2>/dev/null
 
-# Проверяем, сконфигурирован ли уже домен
-if testparm -s 2>/dev/null | grep -q "security = ADS"; then
-    echo -e "${YELLOW}Домен уже сконфигурирован. Пропускаем provision.${NC}"
-else
-    print_header "1.1. Provisioning Active Directory"
-    
-    # Резервное копирование конфига
-    cp /etc/samba/smb.conf /etc/samba/smb.conf.bak
+# Удаляем старую базу данных (если была неудачная попытка), чтобы избежать конфликтов
+rm -rf /var/lib/samba/private/* /var/lib/samba/sysvol/* /var/lib/samba/*.tdb /var/lib/samba/*.ldb 2>/dev/null
 
-    # Интерактивный provision. 
-    # В ALT Linux samba-tool provisioning interactive работает корректно.
-    # Мы используем --use-rfc2307 для совместимости с UID/GID.
-    echo "Запускаю samba-tool provisioning..."
-    samba-tool domain provision --realm="$REALM" --domain="$DOMAIN_SHORT" --server-role=dc --dns-backend=SAMBA_INTERNAL --use-rfc2307 --adminpass='P@ssw0rd'
-    
-    # В ALT Kerberos конфиг часто лежит отдельно, копируем
-    cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
-    
-    status $? "Создание домена завершено" "critical"
-fi
+# Создаем каталоги, если их нет
+mkdir -p /var/lib/samba/private
+mkdir -p /var/lib/samba/sysvol
 
-# Запуск службы
-print_header "1.2. Запуск служб"
-systemctl enable smb nmb winbind
-systemctl restart smb nmb winbind
-status $? "Службы Samba запущены"
-
-# ==========================================
-# 2. Создание пользователей и групп HQ
-# ==========================================
-print_header "2. Создание группы и пользователей HQ"
-
-# Создание группы hq
-samba-tool group list | grep -q "^hq$" && echo -e "[${GREEN}OK${NC}] Группа hq уже существует" || {
-    samba-tool group add hq
-    status $? "Группа hq создана"
-}
-
-# Создание 5 пользователей формата user№.hq
-for i in {1..5}; do
-    USERNAME="user${i}.hq"
-    PASS="P@ssw0rd${i}" # Стандартный пароль для скрипта
-    
-    # Проверяем существование
-    if id "$USERNAME" &>/dev/null || samba-tool user list | grep -q "^$USERNAME$"; then
-        echo -e "[${YELLOW}SKIP${NC}] Пользователь $USERNAME уже существует"
-    else
-        samba-tool user create "$USERNAME" "$PASS"
-        status $? "Создан пользователь $USERNAME"
-    fi
-    
-    # Добавление в группу hq
-    samba-tool group addmembers hq "$USERNAME" 2>/dev/null
-done
-
-# ==========================================
-# 3. Импорт пользователей из CSV
-# ==========================================
-print_header "3. Импорт пользователей из CSV"
-CSV_FILE="/opt/users.csv"
-
-if [ -f "$CSV_FILE" ]; then
-    echo "Файл $CSV_FILE найден. Начинаю обработку..."
-    
-    # Чтение CSV (формат: user,pass)
-    while IFS=',' read -r username password; do
-        # Пропуск пустых строк
-        [ -z "$username" ] && continue
-        
-        # Проверяем, существует ли пользователь
-        if samba-tool user list | grep -q "^$username$"; then
-            echo -e "[${YELLOW}EXISTS${NC}] Пользователь $username найден в базе."
-            
-            # Запрос действия для существующего
-            read -p "Обновить пароль для $username? (y/n): " choice
-            if [[ "$choice" =~ ^[Yy]$ ]]; then
-                samba-tool user setpassword "$username" --newpassword="$password"
-                status $? "Пароль обновлен для $username"
-            else
-                echo "Пропуск обновления пароля."
-            fi
-        else
-            # Создание нового
-            samba-tool user create "$username" "$password"
-            status $? "Создан новый пользователь $username (из CSV)"
-            
-            # Если имя содержит .hq, добавляем в группу
-            if [[ "$username" == *".hq" ]]; then
-                samba-tool group addmembers hq "$username"
-                status $? "$username добавлен в группу hq"
-            fi
-        fi
-    done < "$CSV_FILE"
-else
-    echo -e "${RED}Файл $CSV_FILE не найден. Пропускаем импорт.${NC}"
-fi
-
-# ==========================================
-# 4. Настройка SUDO для группы hq
-# ==========================================
-print_header "4. Настройка привилегий SUDO"
-
-# В ALT Linux sudo настраивается через файлы в /etc/sudoers.d/
-# Это позволяет выполнять команды: cat, grep, id без пароля (или с паролем пользователя)
-SUDOERS_FILE="/etc/sudoers.d/hq-permissions"
-
-echo "Настраиваю права sudo для группы hq..."
-
-# Проверяем наличие группы hq в системе (POSIX группа)
-# Для winbind нам нужно убедиться, что группа видна системе через NSS
-# Обычно в ALT Linux winbind настраивается автоматически через /etc/nsswitch.conf
-
-cat <<EOF > $SUDOERS_FILE
-# Права для группы hq (Samba AD)
-# Разрешены только команды: cat, grep, id
-
-Cmnd_Alias HQ_CMDS = /usr/bin/cat, /usr/bin/grep, /usr/bin/id
-
-# Группа hq (через winbind часто выглядит как DOMAIN\hq или просто hq)
-# Синтаксис %hq должен работать при корректной настройке NSS
-%hq ALL=(ALL) HQ_CMDS
+# КРИТИЧЕСКИ ВАЖНО: Создаем минимальный smb.conf ПЕРЕД provisioning
+# Без этого samba-tool provisioning не работает
+cat <<EOF > /etc/samba/smb.conf
+[global]
+   workgroup = $DOMAIN_SHORT
+   realm = $REALM
+   netbios name = $(hostname -s | tr '[:lower:]' '[:upper:]')
+   server role = active directory domain controller
+   idmap_ldb:use rfc2307 = yes
+   
+   # Пути (стандартные для ALT Linux)
+   private dir = /var/lib/samba/private
+   lock directory = /var/lib/samba
+   state directory = /var/lib/samba
+   cache directory = /var/lib/samba
+   
+   log file = /var/log/samba/log.%m
+   log level = 1
 EOF
 
-# Установка правильных прав на файл sudoers
-chmod 440 $SUDOERS_FILE
-
-status $? "Файл $SUDOERS_FILE создан"
-
-# Проверка корректности синтаксиса sudoers
-visudo -c > /dev/null 2>&1
-status $? "Проверка синтаксиса sudoers" "critical"
+status $? "Создан временный smb.conf"
 
 # ==========================================
-# Завершение
+# 3. Provisioning (Создание домена)
 # ==========================================
-print_header "Настройка завершена"
-echo -e "Информация о домене:"
-echo -e " Realm: ${GREEN}$REALM${NC}"
-echo -e " Domain: ${GREEN}$DOMAIN_SHORT${NC}"
-echo -e " Admin: ${GREEN}Administrator${NC}"
-echo ""
-echo -e "Для ввода машины HQ-CLI в домен выполните на ней:"
-echo -e "${YELLOW}1. Укажите DNS сервер (IP этого сервера BR-SRV).${NC}"
-echo -e "${YELLOW}2. system-auth write ad $REALM${NC}"
-echo ""
-echo -e "${GREEN}Скрипт завершил работу успешно.${NC}"
+print_header "3. Provisioning Active Directory"
+
+echo "Создание базы данных домена..."
+# Используем samba-tool с явным указанием конфига
+samba-tool domain provision \
+    --configfile=/etc/samba/smb.conf \
+    --realm="$REALM" \
+    --domain="$DOMAIN_SHORT" \
+    --server-role=dc \
+    --dns-backend=SAMBA_INTERNAL \
+    --adminpass='P@ssw0rd' \
+    --use-rfc2307
+
+if [ $? -eq 0 ]; then
+    status 0 "Домен успешно создан!"
+else
+    status 1 "Ошибка при создании домена"
+    exit 1
+fi
+
+# Копируем Kerberos конфиг
+cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+status $? "Kerberos конфиг скопирован"
+
+# Запуск служб
+systemctl enable smb nmb winbind
+systemctl start smb nmb winbind
+status $? "Службы запущены"
+
+# ==========================================
+# 4. Пользователи, Группы, SUDO, CSV
+# ==========================================
+print_header "4. Создание пользователей и прав"
+
+# Создаем группу
+samba-tool group add hq 2>/dev/null || echo "Группа hq уже есть"
+
+# Создаем 5 пользователей
+for i in {1..5}; do
+    U="user${i}.hq"
+    P="P@ssw0rd${i}"
+    samba-tool user create "$U" "$P" 2>/dev/null || echo "Пользователь $U уже есть"
+    samba-tool group addmembers hq "$U" 2>/dev/null
+done
+
+# Импорт из CSV
+CSV="/opt/users.csv"
+if [ -f "$CSV" ]; then
+    echo "Импорт из $CSV..."
+    while IFS=',' read -r u p; do
+        [ -z "$u" ] && continue
+        samba-tool user create "$u" "$p" 2>/dev/null && echo "Создан: $u" || echo "Существует: $u"
+    done < "$CSV"
+fi
+
+# Настройка SUDO
+echo "Настройка sudo..."
+SUDO_F="/etc/sudoers.d/hq-permissions"
+echo "Cmnd_Alias HQ_CMDS = /usr/bin/cat, /usr/bin/grep, /usr/bin/id" > $SUDO_F
+echo "%hq ALL=(ALL) HQ_CMDS" >> $SUDO_F
+chmod 440 $SUDO_F
+
+print_header "Готово!"
+echo "Домен: $REALM"
+echo "Admin: Administrator / P@ssw0rd"
