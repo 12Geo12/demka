@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Финальный исправленный скрипт настройки Samba AD
-# Исправлена ошибка с Realm/NetBIOS именами
+# ИСПРАВЛЕННЫЙ СКРИПТ (ошибка smb.conf)
 # ==========================================
 
 RED='\033[0;31m'
@@ -36,71 +35,62 @@ fi
 # ==========================================
 # 1. Установка пакетов
 # ==========================================
-print_header "1. Установка пакетов"
+print_header "1. Установка пакетов Samba DC"
 
 apt-get update
 apt-get install -y samba samba-dc samba-client samba-common acl
 
 if ! command -v samba-tool &> /dev/null; then
-    echo -e "${RED}samba-tool не найден. Проверьте установку пакетов.${NC}"
+    echo -e "${RED}Ошибка: samba-tool не установлен.${NC}"
     exit 1
 fi
 status $? "Пакеты установлены"
 
 # ==========================================
-# 2. Подготовка конфигурации
+# 2. Подготовка (ОЧЕНЬ ВАЖНЫЙ ЭТАП)
 # ==========================================
-print_header "2. Подготовка smb.conf"
+print_header "2. Очистка старых данных"
+
+# Останавливаем службы
+systemctl stop smb nmb winbind 2>/dev/null
+
+# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ:
+# Удаляем ВСЕ старые конфиги и базы данных.
+# Это обязательно для чистого Provisioning.
+
+echo "Удаление старых баз данных и конфигов..."
+rm -f /etc/samba/smb.conf
+rm -rf /var/lib/samba/private/*
+rm -rf /var/lib/samba/sysvol/*
+rm -f /var/lib/samba/*.tdb
+rm -f /var/lib/samba/*.ldb
+
+mkdir -p /var/lib/samba/private
+mkdir -p /var/lib/samba/sysvol
+status 0 "Очистка завершена"
+
+# ==========================================
+# 3. Ввод данных и Provisioning
+# ==========================================
+print_header "3. Настройка домена"
 
 read -p "Введите полное имя домена (например, au-team.irpo): " REALM_INPUT
 read -p "Введите IP-адрес этого сервера: " SERVER_IP
 
-# --- ИСПРАВЛЕНИЕ ОШИБКИ ---
-# Приводим Realm к верхнему регистру (AU-TEAM.IRPO)
+# Формируем имена
+# Realm: AU-TEAM.IRPO
 REALM=$(echo "$REALM_INPUT" | tr '[:lower:]' '[:upper:]')
-# Берем ТОЛЬКО ПЕРВУЮ часть до точки для короткого имени (AU)
-# Было: DOMAIN_SHORT=$(echo "$REALM" | tr '[:upper:]' '[:lower:]') - это вызывало баг
+# Domain (Short): AU-TEAM (берем первую часть до точки и приводим к верхнему регистру)
 DOMAIN_SHORT=$(echo "$REALM_INPUT" | cut -d. -f1 | tr '[:lower:]' '[:upper:]')
 
-echo -e "Конфигурация:"
-echo -e " Realm (Full): ${GREEN}$REALM${NC}"
-echo -e " Domain (Short): ${GREEN}$DOMAIN_SHORT${NC}"
-# --------------------------
+echo -e "Realm: ${GREEN}$REALM${NC}"
+echo -e "Short Domain: ${GREEN}$DOMAIN_SHORT${NC}"
 
-systemctl stop smb nmb winbind 2>/dev/null
-
-# Очистка старых данных (важно при повторном запуске!)
-rm -rf /var/lib/samba/private/* /var/lib/samba/sysvol/* /var/lib/samba/*.tdb /var/lib/samba/*.ldb 2>/dev/null
-mkdir -p /var/lib/samba/private
-mkdir -p /var/lib/samba/sysvol
-
-# Создаем временный конфиг
-cat <<EOF > /etc/samba/smb.conf
-[global]
-   workgroup = $DOMAIN_SHORT
-   realm = $REALM
-   netbios name = $(hostname -s | tr '[:lower:]' '[:upper:]')
-   server role = active directory domain controller
-   idmap_ldb:use rfc2307 = yes
-   
-   private dir = /var/lib/samba/private
-   lock directory = /var/lib/samba
-   state directory = /var/lib/samba
-   cache directory = /var/lib/samba
-   
-   log file = /var/log/samba/log.%m
-   log level = 1
-EOF
-
-status $? "Конфигурация подготовлена"
-
-# ==========================================
-# 3. Provisioning
-# ==========================================
-print_header "3. Создание домена (Provisioning)"
+# Запуск provisioning
+# ВАЖНО: Запускаем БЕЗ опции --configfile, чтобы samba-tool создал конфиг сам с нуля.
+echo "Запуск samba-tool domain provision..."
 
 samba-tool domain provision \
-    --configfile=/etc/samba/smb.conf \
     --realm="$REALM" \
     --domain="$DOMAIN_SHORT" \
     --server-role=dc \
@@ -108,50 +98,63 @@ samba-tool domain provision \
     --adminpass='P@ssw0rd' \
     --use-rfc2307
 
-if [ $? -eq 0 ]; then
-    status 0 "Домен успешно создан"
-else
-    status 1 "Ошибка создания домена" "critical"
+if [ $? -ne 0 ]; then
+    status 1 "Ошибка при создании домена" "critical"
+fi
+status 0 "Домен создан успешно"
+
+# Перемещаем конфиг, созданный samba-tool, если он лежит не там
+if [ -f "/var/lib/samba/private/smb.conf" ]; then
+    cp /var/lib/samba/private/smb.conf /etc/samba/smb.conf
 fi
 
-# Настройка Kerberos и запуск
+# Kerberos
 cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+
+# Запуск служб
 systemctl enable smb nmb winbind
 systemctl start smb nmb winbind
-status $? "Службы запущены"
+status $? "Службы Samba запущены"
 
 # ==========================================
-# 4. Пользователи и SUDO
+# 4. Пользователи и Права
 # ==========================================
-print_header "4. Пользователи и права"
+print_header "4. Создание пользователей и групп"
 
-# Группа
-samba-tool group add hq 2>/dev/null || echo "[SKIP] Группа hq уже есть"
+# Группа HQ
+samba-tool group add hq 2>/dev/null
+status $? "Группа hq создана (или уже существует)"
 
 # 5 пользователей
 for i in {1..5}; do
-    U="user${i}.hq"
-    P="P@ssw0rd${i}"
-    samba-tool user create "$U" "$P" 2>/dev/null || echo "[SKIP] $U уже есть"
-    samba-tool group addmembers hq "$U" 2>/dev/null
+    USERNAME="user${i}.hq"
+    PASS="P@ssw0rd${i}"
+    samba-tool user create "$USERNAME" "$PASS" 2>/dev/null
+    samba-tool group addmembers hq "$USERNAME" 2>/dev/null
+    echo "Пользователь $USERNAME добавлен"
 done
 
-# Импорт CSV
+# Импорт из CSV
 CSV="/opt/users.csv"
 if [ -f "$CSV" ]; then
-    echo "Импорт из CSV..."
-    while IFS=',' read -r u p; do
-        [ -z "$u" ] && continue
-        samba-tool user create "$u" "$p" 2>/dev/null && echo "Создан: $u" || echo "Уже есть: $u"
+    echo "Обработка файла $CSV..."
+    while IFS=',' read -r user pass; do
+        [ -z "$user" ] && continue
+        samba-tool user create "$user" "$pass" 2>/dev/null && echo "Создан: $user" || echo "Существует: $user"
     done < "$CSV"
 fi
 
-# SUDO
-SUDO_F="/etc/sudoers.d/hq-permissions"
-echo "Cmnd_Alias HQ_CMDS = /usr/bin/cat, /usr/bin/grep, /usr/bin/id" > $SUDO_F
-echo "%hq ALL=(ALL) HQ_CMDS" >> $SUDO_F
-chmod 440 $SUDO_F
+# Настройка SUDO
+echo "Настройка sudo для группы hq..."
+SUDO_FILE="/etc/sudoers.d/hq-permissions"
+cat <<EOF > $SUDO_FILE
+Cmnd_Alias HQ_CMDS = /usr/bin/cat, /usr/bin/grep, /usr/bin/id
+%hq ALL=(ALL) HQ_CMDS
+EOF
+chmod 440 $SUDO_FILE
+status 0 "SUDO настроен"
 
-print_header "ЗАВЕРШЕНО"
-echo "Домен: $REALM ($DOMAIN_SHORT)"
-echo "Admin: Administrator / P@ssw0rd"
+print_header "Настройка завершена!"
+echo "Домен: $REALM"
+echo "Логин админа: Administrator"
+echo "Пароль админа: P@ssw0rd"
