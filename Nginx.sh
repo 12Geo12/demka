@@ -1,43 +1,32 @@
 #!/bin/bash
 
 # ==========================================
-# Конфигурация
+# Конфигурация для ALT Linux
 # ==========================================
 MOODLE_DOMAIN="moodle.au-team.irpo"
 WIKI_DOMAIN="wiki.au-team.irpo"
-
-# Укажите порты, на которых реально работают ваши сервисы
-# (Обычно это localhost:8080, localhost:8081 или docker-контейнеры)
 MOODLE_PORT="8080"
 WIKI_PORT="8081"
 
-# ==========================================
-# Проверка прав суперпользователя
-# ==========================================
-if [ "$EUID" -ne 0 ]; then 
-  echo "Ошибка: Пожалуйста, запускайте скрипт от имени root (sudo)."
-  exit 1
-fi
-
-echo ">>> Начало настройки Nginx Reverse Proxy..."
-
-# ==========================================
-# 1. Установка Nginx (если не установлен)
-# ==========================================
-if ! command -v nginx &> /dev/null; then
-    echo ">>> Nginx не найден. Установка..."
-    apt-get update
-    apt-get install nginx -y
+# Определяем правильную директорию
+if [ -d "/etc/nginx/sites-available.d" ]; then
+    CONF_DIR="/etc/nginx/sites-available.d"
+elif [ -d "/etc/nginx/conf.d" ]; then
+    CONF_DIR="/etc/nginx/conf.d"
 else
-    echo ">>> Nginx уже установлен."
+    # Создаем директорию если нет
+    CONF_DIR="/etc/nginx/conf.d"
+    mkdir -p $CONF_DIR
 fi
 
+echo ">>> Используем директорию: $CONF_DIR"
+
 # ==========================================
-# 2. Создание конфигурационных файлов
+# Создаем конфигурационные файлы
 # ==========================================
 
 # Конфиг для Moodle
-cat > /etc/nginx/sites-available/$MOODLE_DOMAIN <<EOF
+cat > $CONF_DIR/$MOODLE_DOMAIN.conf <<EOF
 server {
     listen 80;
     server_name $MOODLE_DOMAIN;
@@ -53,7 +42,7 @@ server {
 EOF
 
 # Конфиг для MediaWiki
-cat > /etc/nginx/sites-available/$WIKI_DOMAIN <<EOF
+cat > $CONF_DIR/$WIKI_DOMAIN.conf <<EOF
 server {
     listen 80;
     server_name $WIKI_DOMAIN;
@@ -68,23 +57,11 @@ server {
 }
 EOF
 
-echo ">>> Конфигурационные файлы созданы."
+echo ">>> Конфигурационные файлы созданы в $CONF_DIR"
 
 # ==========================================
-# 3. Активация сайтов (создание симлинков)
+# Добавляем в /etc/hosts
 # ==========================================
-ln -sf /etc/nginx/sites-available/$MOODLE_DOMAIN /etc/nginx/sites-enabled/
-ln -sf /etc/nginx/sites-available/$WIKI_DOMAIN /etc/nginx/sites-enabled/
-
-# Удаляем дефолтный конфиг, чтобы не мешал (опционально)
-rm -f /etc/nginx/sites-enabled/default
-
-echo ">>> Сайты активированы."
-
-# ==========================================
-# 4. Настройка локального DNS (hosts)
-# ==========================================
-# Добавляем записи в hosts, чтобы сервер сам понимал эти домены
 if ! grep -q "$MOODLE_DOMAIN" /etc/hosts; then
     echo "127.0.0.1 $MOODLE_DOMAIN" >> /etc/hosts
 fi
@@ -93,24 +70,21 @@ if ! grep -q "$WIKI_DOMAIN" /etc/hosts; then
     echo "127.0.0.1 $WIKI_DOMAIN" >> /etc/hosts
 fi
 
-echo ">>> Записи добавлены в /etc/hosts."
-
 # ==========================================
-# 5. Проверка и перезагрузка Nginx
+# Проверяем и перезапускаем nginx
 # ==========================================
-echo ">>> Проверка конфигурации nginx..."
+echo ">>> Проверка конфигурации..."
 nginx -t
 
 if [ $? -eq 0 ]; then
-    echo ">>> Конфигурация верна. Перезагрузка службы..."
+    echo ">>> Перезапуск nginx..."
     systemctl restart nginx
-    systemctl enable nginx
-    echo ">>> Настройка завершена успешно!"
+    echo ">>> Настройка завершена!"
     echo ""
-    echo "Теперь проверьте доступность:"
+    echo "Проверьте доступность:"
     echo "1. http://$MOODLE_DOMAIN"
     echo "2. http://$WIKI_DOMAIN"
 else
-    echo ">>> Ошибка в конфигурации Nginx! Проверьте логи."
+    echo ">>> Ошибка в конфигурации!"
     exit 1
 fi
