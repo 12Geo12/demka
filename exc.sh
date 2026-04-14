@@ -1,154 +1,222 @@
 #!/bin/bash
 
+# Цвета для вывода
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
 # Проверка root
 if [ "$EUID" -ne 0 ]; then
-  echo "Запустите скрипт через sudo!"
-  exit
+  echo -e "${RED}Ошибка: Запустите скрипт через sudo!${NC}"
+  exit 1
 fi
+
+# Проверка необходимых утилит
+for cmd in ip ping iptables dig nslookup; do
+    if ! command -v $cmd &> /dev/null; then
+        echo -e "${YELLOW}Предупреждение: Утилита $cmd не найдена. Некоторые функции могут не работать.${NC}"
+    fi
+done
 
 clear
 echo "========================================"
-echo "    ИСПРАВЛЕННЫЙ СКРИПТ НАСТРОЙКИ"
+echo "    ИСПРАВЛЕННЫЙ СКРИПТ НАСТРОЙКИ Linux"
 echo "========================================"
 
 # --- ШАГ 1: Выбор интерфейса ---
 echo ""
-echo "[1] ВАЖНО: Выберите интерфейс для ИНТЕРНЕТА"
-echo "Список активных интерфейсов:"
-ip link show | grep -E "^[0-9]+:" | awk '{print $2}' | tr -d ':'
+echo -e "${GREEN}[1] Выбор сетевого интерфейса для ИНТЕРНЕТА${NC}"
+echo "Доступные интерфейсы:"
+ip -o link show | awk '{print $2}' | tr -d ':' | grep -v lo
 
 echo ""
-echo "Если вы в VMware и интернет работает через NAT,"
-echo "обычно это интерфейс с самым низким номером (eth0 или ens33)."
+echo "Подсказка: В VMware NAT обычно использует eth0 или ens33."
 read -p "Введите имя интерфейса (например, ens33): " WAN_IF
 
-# Проверка, что интерфейс существует
+# Проверка существования интерфейса
 if ! ip link show "$WAN_IF" &> /dev/null; then
-    echo "ОШИБКА: Интерфейс $WAN_IF не найден. Перезапустите скрипт и введите верное имя."
+    echo -e "${RED}ОШИБКА: Интерфейс '$WAN_IF' не найден в системе.${NC}"
     exit 1
 fi
 
 # --- ШАГ 2: Настройка IP и Шлюза ---
 echo ""
-echo "[2] Настройка IP-адреса и Шлюза"
-echo "Внимание: Шлюз должен быть доступен, иначе интернета не будет!"
-read -p "Введите IP-адрес с маской (пример: 192.168.1.100/24): " IP_CIDR
-read -p "Введите Шлюз/Gateway (пример: 192.168.1.1): " GATEWAY
+echo -e "${GREEN}[2] Настройка статического IP и Шлюза${NC}"
+echo "Пример IP: 192.168.1.10/24"
+echo "Пример Шлюза: 192.168.1.1"
 
-# Настраиваем IP
-ip addr flush dev $WAN_IF
-ip addr add $IP_CIDR dev $WAN_IF
-ip link set $WAN_IF up
+read -p "Введите IP-адрес с маской (CIDR): " IP_CIDR
+read -p "Введите IP Шлюза (Gateway): " GATEWAY
 
-# Настраиваем маршрут
-echo "Пробую добавить маршрут по умолчанию..."
-ip route replace default via $GATEWAY dev $WAN_IF
+# Простая валидация (проверка на наличие символа / для CIDR)
+if [[ ! "$IP_CIDR" =~ / ]]; then
+    echo -e "${RED}Ошибка: IP адрес должен быть указан с маской (например, 192.168.1.10/24).${NC}"
+    exit 1
+fi
 
-# --- ШАГ 3: ПРОВЕРКА ШЛЮЗА ---
+echo "Применяю настройки сети..."
+# Очищаем старые адреса
+ip addr flush dev "$WAN_IF"
+# Добавляем новый адрес
+ip addr add "$IP_CIDR" dev "$WAN_IF"
+# Поднимаем интерфейс
+ip link set "$WAN_IF" up
+# Добавляем маршрут по умолчанию
+ip route replace default via "$GATEWAY" dev "$WAN_IF"
+
+echo -e "${GREEN}Сетевые настройки применены.${NC}"
+
+# --- ШАГ 3: ПРОВЕРКА СВЯЗИ ---
 echo ""
-echo "[3] Проверка связи с шлюзом ($GATEWAY)..."
-if ping -c 2 -W 2 $GATEWAY > /dev/null; then
-    echo "УСПЕХ: Шлюз доступен. Интернет должен работать."
+echo -e "${GREEN}[3] Проверка связи со шлюзом ($GATEWAY)...${NC}"
+if ping -c 2 -W 2 "$GATEWAY" > /dev/null 2>&1; then
+    echo -e "${GREEN}УСПЕХ: Шлюз пингуется.${NC}"
 else
-    echo ""
-    echo "!!! ВНИМАНИЕ: Шлюз ($GATEWAY) НЕ ДОСТУПЕН !!!"
-    echo "На скриншоте была именно эта ошибка."
+    echo -e "${RED}!!! ВНИМАНИЕ: Шлюз ($GATEWAY) НЕ ОТВЕЧАЕТ !!!${NC}"
     echo "Возможные причины:"
-    echo "1. Вы ввели неверный IP шлюза."
-    echo "2. В VMware сетевой адаптер не в режиме NAT."
-    echo "3. IP адрес машины находится в другой подсети, чем шлюз."
-    echo ""
-    read -p "Нажмите Enter, чтобы продолжить всё равно (интернет может не работать)... "
+    echo "1. Неверный IP шлюза."
+    echo "2. VMWare Network Adapter выключен или не в режиме NAT/Bridge."
+    echo "3. Ваш IP адрес не из той же подсети, что и шлюз."
+    read -p "Нажмите Enter, чтобы продолжить (интернет может не работать)..."
 fi
 
 # --- ШАГ 4: Настройка DNS ---
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
-echo "nameserver 8.8.4.4" >> /etc/resolv.conf
-
-# --- ШАГ 5: Пользователи и Пароли ---
 echo ""
-echo "[4] Настройка пользователей"
-read -sp "Новый пароль для root: " ROOT_PASS
-echo
-echo "Создание пользователей (Enter - завершить):"
-USERS=()
+echo -e "${GREEN}[4] Настройка DNS (Google Public DNS)${NC}"
+# Сохраняем старый resolv.conf на всякий случай
+cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null
+
+cat > /etc/resolv.conf <<EOF
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+EOF
+
+# Защита от перезаписи DHCP-клиентом (опционально, требует прав root)
+chattr +i /etc/resolv.conf 2>/dev/null
+echo "DNS настроены. Файл защищен от изменения атрибутами."
+
+# --- ШАГ 5: Пользователи ---
+echo ""
+echo -e "${GREEN}[5] Управление пользователями${NC}"
+read -sp "Введите новый пароль для root: " ROOT_PASS
+echo ""
+echo "$ROOT_PASS" | passwd --stdin root &> /dev/null || echo "$ROOT_PASS" | chpasswd <<< "root:$ROOT_PASS"
+echo -e "${GREEN}Пароль root обновлен.${NC}"
+
+echo "Создание новых пользователей (оставьте поле логина пустым для завершения):"
 while true; do
-    read -p "Логин: " U_NAME
+    read -p "Логин нового пользователя: " U_NAME
     [ -z "$U_NAME" ] && break
+    
+    if id "$U_NAME" &>/dev/null; then
+        echo -e "${YELLOW}Пользователь $U_NAME уже существует. Пропуск.${NC}"
+        continue
+    fi
+
     read -sp "Пароль для $U_NAME: " U_PASS
-    echo
-    USERS+=("$U_NAME:$U_PASS")
+    echo ""
+    
+    useradd -m -s /bin/bash "$U_NAME"
+    echo "$U_NAME:$U_PASS" | chpasswd
+    echo -e "${GREEN}Пользователь $U_NAME создан.${NC}"
 done
 
 # --- ШАГ 6: Блокировка сайтов ---
 echo ""
-echo "[5] Блокировка сайтов (через пробел)"
-read -p "Сайты (напр. twitter.com tiktok.com): " SITES_INPUT
+echo -e "${GREEN}[6] Блокировка сайтов${NC}"
+echo "Введите домены через пробел (например: vk.com ok.ru)"
+read -p "Сайты для блокировки: " SITES_INPUT
+
 BLOCKED_SITES=($SITES_INPUT)
+BLOCKED_IPS=()
 
-# --- ШАГ 7: ПРИМЕНЕНИЕ НАСТРОЕК (NAT + FIREWALL) ---
-echo ""
-echo "========================================"
-echo "ПРИМЕНЕНИЕ ПРАВИЛ IPTABLES И NAT..."
-echo "========================================"
-
-# 1. Включаем Forwarding (для NAT)
-echo 1 > /proc/sys/net/ipv4/ip_forward
-
-# 2. Полная очистка правил
-iptables -F
-iptables -X
-iptables -t nat -F
-
-# 3. НАСТРОЙКА NAT (САМОЕ ГЛАВНОЕ)
-# Разрешаем трафик на самой машине
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A INPUT -p icmp -j ACCEPT
-# Разрешаем SSH (если нужно, иначе можете закрыть)
-iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-
-# Разрешаем исходящий трафик (OUTPUT) по умолчанию
-iptables -P OUTPUT ACCEPT
-
-# НАСТРОЙКА МАСКАРАДИНГА (NAT)
-# Это правило позволяет пакетам уходить в интернет, заменяя их IP на IP интерфейса
-iptables -t nat -A POSTROUTING -o $WAN_IF -j MASQUERADE
-
-# Разрешаем пересылку (FORWARD) пакетов
-iptables -A FORWARD -i $WAN_IF -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A FORWARD -o $WAN_IF -j ACCEPT
-
-# 4. БЛОКИРОВКА САЙТОВ
-# Мы блокируем ДОСТУП к IP этих сайтов в цепочке OUTPUT
 if [ ${#BLOCKED_SITES[@]} -gt 0 ]; then
-    echo "Блокируем сайты..."
+    echo "Резолвим домены в IP..."
     for site in "${BLOCKED_SITES[@]}"; do
-        # Получаем IP
-        # dig есть не везде, используем getent, если есть, иначе nslookup
-        if command -v dig &> /dev/null; then
-            SITE_IP=$(dig +short $site | grep -E '^[0-9]' | head -n 1)
-        else
-            SITE_IP=$(nslookup $site 2>/dev/null | grep -A 1 'Name:' | tail -n 1 | awk '{print $2}')
+        # Получаем все IPv4 адреса для домена
+        IPS=$(dig +short A "$site" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        
+        if [ -z "$IPS" ]; then
+            # Пробуем nslookup если dig не сработал
+            IPS=$(nslookup "$site" 2>/dev/null | grep -A 1 "Name:" | tail -n 1 | awk '{print $2}')
         fi
 
-        if [ -n "$SITE_IP" ]; then
-            echo "  Блокирую $site -> IP $SITE_IP"
-            iptables -A OUTPUT -d $SITE_IP -j REJECT
-            # Блокируем и FORWARD, если машина используется как шлюз для других
-            iptables -A FORWARD -d $SITE_IP -j REJECT
+        if [ -n "$IPS" ]; then
+            for ip in $IPS; do
+                BLOCKED_IPS+=("$ip")
+                echo "  -> $site разрешен в $ip"
+            done
         else
-            echo "  Не могу найти IP для $site (проверьте интернет)"
+            echo -e "${YELLOW}  Не удалось получить IP для $site${NC}"
         fi
     done
 fi
 
-# Сохранение
-iptables-save > /etc/iptables.rules
+# --- ШАГ 7: IPTABLES (FIREWALL & NAT) ---
+echo ""
+echo "========================================"
+echo "    ПРИМЕНЕНИЕ ПРАВИЛ FIREWALL          "
+echo "========================================"
+
+# 1. Включаем форвардинг пакетов
+echo 1 > /proc/sys/net/ipv4/ip_forward
+sysctl -w net.ipv4.ip_forward=1 &>/dev/null
+
+# 2. Очищаем старые правила
+iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t mangle -F
+
+# 3. Политики по умолчанию (DROP для входящих и форварда, ACCEPT для исходящих)
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
+
+# 4. Разрешаем локальный трафик и установленные соединения
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# 5. Разрешаем SSH (порт 22), ICMP (ping)
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+iptables -A INPUT -p icmp -j ACCEPT
+
+# 6. НАСТРОЙКА NAT (MASQUERADE)
+# Позволяет машинам за этим сервером выходить в интернет
+iptables -t nat -A POSTROUTING -o "$WAN_IF" -j MASQUERADE
+
+# 7. Правила FORWARD (для работы шлюза)
+# Разрешаем проход трафика из внутренней сети в интернет и обратно
+iptables -A FORWARD -i "$WAN_IF" -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -o "$WAN_IF" -j ACCEPT
+
+# 8. БЛОКИРОВКА САЙТОВ
+if [ ${#BLOCKED_IPS[@]} -gt 0 ]; then
+    echo "Применяю блокировку IP..."
+    # Удаляем дубликаты IP
+    UNIQUE_IPS=($(echo "${BLOCKED_IPS[@]}" | tr ' ' '\n' | sort -u))
+    
+    for ip in "${UNIQUE_IPS[@]}"; do
+        iptables -A OUTPUT -d "$ip" -j REJECT --reject-with icmp-net-unreachable
+        iptables -A FORWARD -d "$ip" -j REJECT --reject-with icmp-net-unreachable
+    done
+    echo -e "${GREEN}Блокировка применена.${NC}"
+fi
+
+# 9. Сохранение правил
+if command -v iptables-save &> /dev/null; then
+    iptables-save > /etc/iptables.rules
+    echo "Правила сохранены в /etc/iptables.rules"
+    
+    # Для Debian/Ubuntu можно активировать автозагрузку правил (требует пакета iptables-persistent)
+    # Для CentOS/RHEL нужно включить службу iptables
+    echo "Чтобы правила сохранялись после перезагрузки, установите iptables-persistent (Debian) или сохраните сервис (CentOS)."
+fi
 
 echo ""
 echo "========================================"
-echo "ГОТОВО."
+echo -e "${GREEN}НАСТРОЙКА ЗАВЕРШЕНА УСПЕШНО!${NC}"
 echo "========================================"
 echo "Проверьте интернет: ping 8.8.8.8"
-echo "Проверьте шлюз: ping $GATEWAY"
+echo "Проверьте DNS: ping google.com"
