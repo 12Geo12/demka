@@ -1,151 +1,165 @@
 #!/bin/bash
 
-# ==========================================
-# НАСТРОЙКИ (МЕНЯЙТЕ ЗДЕСЬ)
-# ==========================================
+# Проверка на запуск от root
+if [ "$EUID" -ne 0 ]; then
+  echo "Пожалуйста, запустите скрипт от имени root (используйте sudo)."
+  exit
+fi
 
-# 1. Сетевые интерфейсы
-# WAN_IF - это интерфейс, через который идет интернет (смотрит в мир/роутер)
-# В VMware это обычно eth0 или ens33, если NAT настроен на самой машине.
-# Если машина стоит за роутером, выберите интерфейс с шлюзом.
-WAN_IF="eth0" 
+echo "=================================================="
+echo "   СКРИПТ НАСТРОЙКИ ДЛЯ ЭКЗАМЕНА (ПМ.03 Вариант 13)"
+echo "=================================================="
+echo ""
 
-# LAN_IF - это интерфейс, если нужно раздавать интернет внутрь (для простоты оставьте как WAN_IF)
-LAN_IF="eth0"
+# --- 1. НАСТРОЙКА СЕТИ ---
+echo "[ШАГ 1] Настройка сетевого интерфейса"
+echo "Список доступных интерфейсов:"
+ip link show | grep -E "^[0-9]+:" | awk '{print $2}' | tr -d ':'
 
-# 2. IP, Маска и Шлюз (Из вашего задания "как на рабочей станции")
-# ВНИМАНИЕ: Скрипт задает статический IP. Если у вас DHCP, закомментируйте блок настройки IP ниже.
-IP_ADDR="192.168.1.100"
-NETMASK="255.255.255.0"
-GATEWAY="192.168.1.1"
+read -p "Введите имя интерфейса (например, eth0 или ens33): " IFACE
+read -p "Введите IP-адрес (например, 192.168.1.100/24): " IP_CIDR
+read -p "Введите Шлюз (Gateway, например, 192.168.1.1): " GATEWAY
+read -p "Введите DNS (например, 8.8.8.8): " DNS_SERVER
 
-# 3. Пользователи и пароли (Из вашего задания)
-USERS=(
-    "alt1:Pass1"
-    "alt2:Pass2"
-)
-ROOT_PASS="Root123"
+# --- 2. НАСТРОЙКА ПАРОЛЯ ROOT ---
+echo ""
+echo "[ШАГ 2] Настройка пароля суперпользователя (root)"
+read -sp "Введите новый пароль для root: " ROOT_PASS
+echo
 
-# 4. Список запрещенных сайтов (DNS имена)
-BLOCKED_SITES=(
-    "twitter.com"
-    "tiktok.com"
-)
+# --- 3. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЕЙ ---
+echo ""
+echo "[ШАГ 3] Создание пользователей"
+echo "Вводите пользователей по одному. Оставьте имя пустым и нажмите Enter, чтобы завершить."
 
-# ==========================================
-# ВЫПОЛНЕНИЕ СКРИПТА
-# ==========================================
+USERS=()
+while true; do
+    read -p "Введите имя логина (или Enter для завершения): " USERNAME
+    if [ -z "$USERNAME" ]; then
+        break
+    fi
+    read -sp "Введите пароль для пользователя $USERNAME: " USER_PASS
+    echo
+    USERS+=("$USERNAME:$USER_PASS")
+done
 
-echo "--- Начало настройки экзаменационного задания ---"
+# --- 4. БЛОКИРОВКА САЙТОВ ---
+echo ""
+echo "[ШАГ 4] Блокировка DNS-имен (Firewall)"
+echo "Введите сайты для блокировки через пробел (например: twitter.com tiktok.com vk.com)"
+read -p "Сайты для блокировки: " SITES_INPUT
 
-# 1. Настройка сетевого интерфейса
-echo "[1] Настройка IP-адреса ($IP_ADDR) и шлюза ($GATEWAY)..."
-# Команда ifconfig может требовать установки net-tools, используем ip (базовый инструмент)
-ip addr flush dev $WAN_IF
-ip addr add $IP_ADDR/$NETMASK dev $WAN_IF
-ip link set $WAN_IF up
+# Преобразуем строку в массив
+BLOCKED_SITES=($SITES_INPUT)
 
-# Настройка шлюза по умолчанию
+# --- ПРИМЕНЕНИЕ НАСТРОЕК ---
+echo ""
+echo "=================================================="
+echo "   ПРИМЕНЕНИЕ НАСТРОЕК..."
+echo "=================================================="
+
+# 1. Применяем настройки сети
+echo "Настраиваю IP: $IP_CIDR на $IFACE..."
+ip addr flush dev $IFACE
+ip addr add $IP_CIDR dev $IFACE
+ip link set $IFACE up
+
+echo "Настраиваю шлюз: $GATEWAY..."
 ip route replace default via $GATEWAY
 
-# Настройка DNS (чтобы resolving работал до блокировки)
-echo "nameserver 8.8.8.8" > /etc/resolv.conf
-echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+echo "Настраиваю DNS: $DNS_SERVER..."
+echo "nameserver $DNS_SERVER" > /etc/resolv.conf
 
-echo "Сеть настроена. Проверьте ping 8.8.8.8."
+# Проверка доступа в интернет (чтобы dig работал)
+echo "Проверяю связь с внешним миром (ping 8.8.8.8)..."
+if ping -c 2 -W 2 8.8.8.8 > /dev/null; then
+    echo "Интернет доступен. Отлично!"
+else
+    echo "ВНИМАНИЕ: Интернет (ping 8.8.8.8) недоступен. Блокировка по доменам может не сработать, но правила применятся."
+fi
 
-# 2. Настройка NAT (Masquerading)
-echo "[2] Включение NAT (MASQUERADE) для выхода в интернет..."
-# Включаем пересылку пакетов
+# 2. Настраиваем NAT (Masquerade)
+echo "Включаю NAT и пересылку пакетов..."
 echo 1 > /proc/sys/net/ipv4/ip_forward
-
-# Очистка старых правил NAT
 iptables -t nat -F POSTROUTING
+iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
+iptables -A FORWARD -i $IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -o $IFACE -j ACCEPT
 
-# Правило: Все, что уходит через WAN_IF, маскируется под его IP
-iptables -t nat -A POSTROUTING -o $WAN_IF -j MASQUERADE
-
-# Разрешаем форвардинг установленных соединений
-iptables -A FORWARD -i $WAN_IF -o $WAN_IF -m state --state RELATED,ESTABLISHED -j ACCEPT
-iptables -A FORWARD -i $WAN_IF -o $WAN_IF -j ACCEPT
-
-echo "NAT настроен."
-
-# 3. Создание пользователей
-echo "[3] Создание пользователей и смена пароля root..."
-
-# Смена пароля root
+# 3. Меняем пароль root
+echo "Устанавливаю пароль root..."
 echo "root:$ROOT_PASS" | chpasswd
 
-# Создание обычных пользователей
+# 4. Создаем пользователей
+echo "Создаю учетные записи..."
 for user_entry in "${USERS[@]}"; do
-    username=$(echo "$user_entry" | cut -d: -f1)
-    password=$(echo "$user_entry" | cut -d: -f2)
+    u_name=$(echo "$user_entry" | cut -d: -f1)
+    u_pass=$(echo "$user_entry" | cut -d: -f2)
     
-    if id "$username" &>/dev/null; then
-        echo "Пользователь $username уже существует. Обновляем пароль..."
-        echo "$username:$password" | chpasswd
+    if id "$u_name" &>/dev/null; then
+        echo " - Пользователь $u_name уже существует. Пароль обновлен."
+        echo "$u_name:$u_pass" | chpasswd
     else
-        echo "Создаем пользователя $username..."
-        useradd -m -s /bin/bash "$username"
-        echo "$username:$password" | chpasswd
+        echo " - Создан пользователь $u_name."
+        useradd -m -s /bin/bash "$u_name"
+        echo "$u_name:$u_pass" | chpasswd
     fi
 done
 
-echo "Пользователи созданы."
-
-# 4. Настройка Firewall (Блокировка сайтов)
-echo "[4] Настройка iptables для блокировки DNS-имен..."
-
-# Очистка цепочки OUTPUT (для исходящих)
+# 5. Настраиваем Firewall (Блокировка)
+echo "Настраиваю блокировку сайтов..."
 iptables -F OUTPUT
-
-# Разрешаем локальный трафик и Established
 iptables -A OUTPUT -o lo -j ACCEPT
 iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-# Разрешаем DNS запросы сами по себе (иначе мы не узнаем IP сайта для блокировки)
-# Но в задании часто требуют запретить доступ САМИМ сайтам. 
-# Логика: Разрешаем DNS запросы, но блокируем соединение к IP этих сайтов.
+# Разрешаем DNS (чтобы резолвить адреса)
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
 
-# Логика блокировки сайтов:
-# Чтобы заблокировать сайт по имени, нам нужно его IP. 
-# Но iptables не работает с доменами динамически в момент запроса легко без доп. софта.
-# Стандартный способ для экзамена: Резолвим IP сейчас и блокируем их.
+if [ ${#BLOCKED_SITES[@]} -gt 0 ]; then
+    for site in "${BLOCKED_SITES[@]}"; do
+        echo " -> Обрабатываю блокировку: $site"
+        # Получаем IP сайта
+        # Используем nslookup или dig. dig точнее, но проверим наличие
+        if command -v dig &> /dev/null; then
+            IPS=$(dig +short $site | grep -E '^[0-9]')
+        elif command -v nslookup &> /dev/null; then
+            IPS=$(nslookup $site | grep -A 1 'Name:' | tail -n 1 | awk '{print $2}')
+        else
+            IPS=""
+        fi
 
-for site in "${BLOCKED_SITES[@]}"; do
-    echo "Обработка сайта: $site"
-    # Получаем IP адреса сайта
-    IPS=$(dig +short $site | grep -E '^[0-9]')
-    
-    if [ -z "$IPS" ]; then
-        echo "  Не удалось получить IP для $site. Проверьте интернет."
-    else
-        for ip in $IPS; do
-            echo "  Блокируем IP $ip (сайт $site)"
-            iptables -A OUTPUT -d $ip -j REJECT
-            # Также блокируем доступ через NAT, если кто-то идет через эту машину как шлюз
-            iptables -A FORWARD -d $ip -j REJECT 
-        done
-    fi
-done
+        if [ -z "$IPS" ]; then
+            echo "    [!] Не удалось определить IP для $site. Возможно, нет интернета."
+        else
+            for ip in $IPS; do
+                echo "    [+] Блокирую IP: $ip"
+                iptables -A OUTPUT -d $ip -j REJECT
+                iptables -A FORWARD -d $ip -j REJECT
+            done
+        fi
+    done
+fi
 
-# Разрешаем всё остальное (интернет должен работать)
+# Разрешаем весь остальной трафик
 iptables -A OUTPUT -j ACCEPT
 iptables -A FORWARD -j ACCEPT
 
-echo "Брандмауэр настроен."
-
-# 5. Сохранение правил
-echo "[5] Сохранение правил iptables..."
-# В Альт Сервер (как и в CentOS/RedHat) используется service iptables save
-if command -v service &> /dev/null; then
-    service iptables save 2>/dev/null || iptables-save > /etc/sysconfig/iptables
-fi
-# Для устойчивости сохраняем и так
+# 6. Сохраняем правила
+echo "Сохраняю правила iptables..."
 iptables-save > /etc/iptables.rules
+# Пытаемся сохранить для системы (команда может отличаться в разных версиях Альт, но saving в файл работает везде)
+if [ -f /etc/sysconfig/iptables ]; then
+    iptables-save > /etc/sysconfig/iptables
+fi
 
-echo "--- Скрипт завершен ---"
-echo "Пользователи: alt1, alt2, root"
-echo "Пароли проверьте по заданию."
-echo "Заблокированные сайты: ${BLOCKED_SITES[*]}"
+echo ""
+echo "=================================================="
+echo "   НАСТРОЙКА ЗАВЕРШЕНА УСПЕШНО!"
+echo "=================================================="
+echo "Интерфейс: $IFACE ($IP_CIDR)"
+echo "Шлюз: $GATEWAY"
+echo "Пользователи созданы: ${#USERS[@]} шт."
+echo "Заблокировано сайтов: ${#BLOCKED_SITES[@]} шт."
+echo ""
+echo "Проверьте настройки командой: ip a"
