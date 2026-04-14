@@ -1,165 +1,154 @@
 #!/bin/bash
 
-# Проверка на запуск от root
+# Проверка root
 if [ "$EUID" -ne 0 ]; then
-  echo "Пожалуйста, запустите скрипт от имени root (используйте sudo)."
+  echo "Запустите скрипт через sudo!"
   exit
 fi
 
-echo "=================================================="
-echo "   СКРИПТ НАСТРОЙКИ ДЛЯ ЭКЗАМЕНА (ПМ.03 Вариант 13)"
-echo "=================================================="
-echo ""
+clear
+echo "========================================"
+echo "    ИСПРАВЛЕННЫЙ СКРИПТ НАСТРОЙКИ"
+echo "========================================"
 
-# --- 1. НАСТРОЙКА СЕТИ ---
-echo "[ШАГ 1] Настройка сетевого интерфейса"
-echo "Список доступных интерфейсов:"
+# --- ШАГ 1: Выбор интерфейса ---
+echo ""
+echo "[1] ВАЖНО: Выберите интерфейс для ИНТЕРНЕТА"
+echo "Список активных интерфейсов:"
 ip link show | grep -E "^[0-9]+:" | awk '{print $2}' | tr -d ':'
 
-read -p "Введите имя интерфейса (например, eth0 или ens33): " IFACE
-read -p "Введите IP-адрес (например, 192.168.1.100/24): " IP_CIDR
-read -p "Введите Шлюз (Gateway, например, 192.168.1.1): " GATEWAY
-read -p "Введите DNS (например, 8.8.8.8): " DNS_SERVER
-
-# --- 2. НАСТРОЙКА ПАРОЛЯ ROOT ---
 echo ""
-echo "[ШАГ 2] Настройка пароля суперпользователя (root)"
-read -sp "Введите новый пароль для root: " ROOT_PASS
-echo
+echo "Если вы в VMware и интернет работает через NAT,"
+echo "обычно это интерфейс с самым низким номером (eth0 или ens33)."
+read -p "Введите имя интерфейса (например, ens33): " WAN_IF
 
-# --- 3. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЕЙ ---
-echo ""
-echo "[ШАГ 3] Создание пользователей"
-echo "Вводите пользователей по одному. Оставьте имя пустым и нажмите Enter, чтобы завершить."
-
-USERS=()
-while true; do
-    read -p "Введите имя логина (или Enter для завершения): " USERNAME
-    if [ -z "$USERNAME" ]; then
-        break
-    fi
-    read -sp "Введите пароль для пользователя $USERNAME: " USER_PASS
-    echo
-    USERS+=("$USERNAME:$USER_PASS")
-done
-
-# --- 4. БЛОКИРОВКА САЙТОВ ---
-echo ""
-echo "[ШАГ 4] Блокировка DNS-имен (Firewall)"
-echo "Введите сайты для блокировки через пробел (например: twitter.com tiktok.com vk.com)"
-read -p "Сайты для блокировки: " SITES_INPUT
-
-# Преобразуем строку в массив
-BLOCKED_SITES=($SITES_INPUT)
-
-# --- ПРИМЕНЕНИЕ НАСТРОЕК ---
-echo ""
-echo "=================================================="
-echo "   ПРИМЕНЕНИЕ НАСТРОЕК..."
-echo "=================================================="
-
-# 1. Применяем настройки сети
-echo "Настраиваю IP: $IP_CIDR на $IFACE..."
-ip addr flush dev $IFACE
-ip addr add $IP_CIDR dev $IFACE
-ip link set $IFACE up
-
-echo "Настраиваю шлюз: $GATEWAY..."
-ip route replace default via $GATEWAY
-
-echo "Настраиваю DNS: $DNS_SERVER..."
-echo "nameserver $DNS_SERVER" > /etc/resolv.conf
-
-# Проверка доступа в интернет (чтобы dig работал)
-echo "Проверяю связь с внешним миром (ping 8.8.8.8)..."
-if ping -c 2 -W 2 8.8.8.8 > /dev/null; then
-    echo "Интернет доступен. Отлично!"
-else
-    echo "ВНИМАНИЕ: Интернет (ping 8.8.8.8) недоступен. Блокировка по доменам может не сработать, но правила применятся."
+# Проверка, что интерфейс существует
+if ! ip link show "$WAN_IF" &> /dev/null; then
+    echo "ОШИБКА: Интерфейс $WAN_IF не найден. Перезапустите скрипт и введите верное имя."
+    exit 1
 fi
 
-# 2. Настраиваем NAT (Masquerade)
-echo "Включаю NAT и пересылку пакетов..."
-echo 1 > /proc/sys/net/ipv4/ip_forward
-iptables -t nat -F POSTROUTING
-iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
-iptables -A FORWARD -i $IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
-iptables -A FORWARD -o $IFACE -j ACCEPT
+# --- ШАГ 2: Настройка IP и Шлюза ---
+echo ""
+echo "[2] Настройка IP-адреса и Шлюза"
+echo "Внимание: Шлюз должен быть доступен, иначе интернета не будет!"
+read -p "Введите IP-адрес с маской (пример: 192.168.1.100/24): " IP_CIDR
+read -p "Введите Шлюз/Gateway (пример: 192.168.1.1): " GATEWAY
 
-# 3. Меняем пароль root
-echo "Устанавливаю пароль root..."
-echo "root:$ROOT_PASS" | chpasswd
+# Настраиваем IP
+ip addr flush dev $WAN_IF
+ip addr add $IP_CIDR dev $WAN_IF
+ip link set $WAN_IF up
 
-# 4. Создаем пользователей
-echo "Создаю учетные записи..."
-for user_entry in "${USERS[@]}"; do
-    u_name=$(echo "$user_entry" | cut -d: -f1)
-    u_pass=$(echo "$user_entry" | cut -d: -f2)
-    
-    if id "$u_name" &>/dev/null; then
-        echo " - Пользователь $u_name уже существует. Пароль обновлен."
-        echo "$u_name:$u_pass" | chpasswd
-    else
-        echo " - Создан пользователь $u_name."
-        useradd -m -s /bin/bash "$u_name"
-        echo "$u_name:$u_pass" | chpasswd
-    fi
+# Настраиваем маршрут
+echo "Пробую добавить маршрут по умолчанию..."
+ip route replace default via $GATEWAY dev $WAN_IF
+
+# --- ШАГ 3: ПРОВЕРКА ШЛЮЗА ---
+echo ""
+echo "[3] Проверка связи с шлюзом ($GATEWAY)..."
+if ping -c 2 -W 2 $GATEWAY > /dev/null; then
+    echo "УСПЕХ: Шлюз доступен. Интернет должен работать."
+else
+    echo ""
+    echo "!!! ВНИМАНИЕ: Шлюз ($GATEWAY) НЕ ДОСТУПЕН !!!"
+    echo "На скриншоте была именно эта ошибка."
+    echo "Возможные причины:"
+    echo "1. Вы ввели неверный IP шлюза."
+    echo "2. В VMware сетевой адаптер не в режиме NAT."
+    echo "3. IP адрес машины находится в другой подсети, чем шлюз."
+    echo ""
+    read -p "Нажмите Enter, чтобы продолжить всё равно (интернет может не работать)... "
+fi
+
+# --- ШАГ 4: Настройка DNS ---
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+
+# --- ШАГ 5: Пользователи и Пароли ---
+echo ""
+echo "[4] Настройка пользователей"
+read -sp "Новый пароль для root: " ROOT_PASS
+echo
+echo "Создание пользователей (Enter - завершить):"
+USERS=()
+while true; do
+    read -p "Логин: " U_NAME
+    [ -z "$U_NAME" ] && break
+    read -sp "Пароль для $U_NAME: " U_PASS
+    echo
+    USERS+=("$U_NAME:$U_PASS")
 done
 
-# 5. Настраиваем Firewall (Блокировка)
-echo "Настраиваю блокировку сайтов..."
-iptables -F OUTPUT
-iptables -A OUTPUT -o lo -j ACCEPT
-iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+# --- ШАГ 6: Блокировка сайтов ---
+echo ""
+echo "[5] Блокировка сайтов (через пробел)"
+read -p "Сайты (напр. twitter.com tiktok.com): " SITES_INPUT
+BLOCKED_SITES=($SITES_INPUT)
 
-# Разрешаем DNS (чтобы резолвить адреса)
-iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+# --- ШАГ 7: ПРИМЕНЕНИЕ НАСТРОЕК (NAT + FIREWALL) ---
+echo ""
+echo "========================================"
+echo "ПРИМЕНЕНИЕ ПРАВИЛ IPTABLES И NAT..."
+echo "========================================"
 
+# 1. Включаем Forwarding (для NAT)
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# 2. Полная очистка правил
+iptables -F
+iptables -X
+iptables -t nat -F
+
+# 3. НАСТРОЙКА NAT (САМОЕ ГЛАВНОЕ)
+# Разрешаем трафик на самой машине
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -p icmp -j ACCEPT
+# Разрешаем SSH (если нужно, иначе можете закрыть)
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+
+# Разрешаем исходящий трафик (OUTPUT) по умолчанию
+iptables -P OUTPUT ACCEPT
+
+# НАСТРОЙКА МАСКАРАДИНГА (NAT)
+# Это правило позволяет пакетам уходить в интернет, заменяя их IP на IP интерфейса
+iptables -t nat -A POSTROUTING -o $WAN_IF -j MASQUERADE
+
+# Разрешаем пересылку (FORWARD) пакетов
+iptables -A FORWARD -i $WAN_IF -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A FORWARD -o $WAN_IF -j ACCEPT
+
+# 4. БЛОКИРОВКА САЙТОВ
+# Мы блокируем ДОСТУП к IP этих сайтов в цепочке OUTPUT
 if [ ${#BLOCKED_SITES[@]} -gt 0 ]; then
+    echo "Блокируем сайты..."
     for site in "${BLOCKED_SITES[@]}"; do
-        echo " -> Обрабатываю блокировку: $site"
-        # Получаем IP сайта
-        # Используем nslookup или dig. dig точнее, но проверим наличие
+        # Получаем IP
+        # dig есть не везде, используем getent, если есть, иначе nslookup
         if command -v dig &> /dev/null; then
-            IPS=$(dig +short $site | grep -E '^[0-9]')
-        elif command -v nslookup &> /dev/null; then
-            IPS=$(nslookup $site | grep -A 1 'Name:' | tail -n 1 | awk '{print $2}')
+            SITE_IP=$(dig +short $site | grep -E '^[0-9]' | head -n 1)
         else
-            IPS=""
+            SITE_IP=$(nslookup $site 2>/dev/null | grep -A 1 'Name:' | tail -n 1 | awk '{print $2}')
         fi
 
-        if [ -z "$IPS" ]; then
-            echo "    [!] Не удалось определить IP для $site. Возможно, нет интернета."
+        if [ -n "$SITE_IP" ]; then
+            echo "  Блокирую $site -> IP $SITE_IP"
+            iptables -A OUTPUT -d $SITE_IP -j REJECT
+            # Блокируем и FORWARD, если машина используется как шлюз для других
+            iptables -A FORWARD -d $SITE_IP -j REJECT
         else
-            for ip in $IPS; do
-                echo "    [+] Блокирую IP: $ip"
-                iptables -A OUTPUT -d $ip -j REJECT
-                iptables -A FORWARD -d $ip -j REJECT
-            done
+            echo "  Не могу найти IP для $site (проверьте интернет)"
         fi
     done
 fi
 
-# Разрешаем весь остальной трафик
-iptables -A OUTPUT -j ACCEPT
-iptables -A FORWARD -j ACCEPT
-
-# 6. Сохраняем правила
-echo "Сохраняю правила iptables..."
+# Сохранение
 iptables-save > /etc/iptables.rules
-# Пытаемся сохранить для системы (команда может отличаться в разных версиях Альт, но saving в файл работает везде)
-if [ -f /etc/sysconfig/iptables ]; then
-    iptables-save > /etc/sysconfig/iptables
-fi
 
 echo ""
-echo "=================================================="
-echo "   НАСТРОЙКА ЗАВЕРШЕНА УСПЕШНО!"
-echo "=================================================="
-echo "Интерфейс: $IFACE ($IP_CIDR)"
-echo "Шлюз: $GATEWAY"
-echo "Пользователи созданы: ${#USERS[@]} шт."
-echo "Заблокировано сайтов: ${#BLOCKED_SITES[@]} шт."
-echo ""
-echo "Проверьте настройки командой: ip a"
+echo "========================================"
+echo "ГОТОВО."
+echo "========================================"
+echo "Проверьте интернет: ping 8.8.8.8"
+echo "Проверьте шлюз: ping $GATEWAY"
