@@ -1,7 +1,7 @@
 #!/bin/bash
 ################################################################################
 # Скрипт настройки DNS сервера (BIND) для ALT Linux Server
-# Версия: 3.0 - Полная адаптация для ALT Linux
+# Версия: 3.1 - Исправлена установка пакетов
 ################################################################################
 
 set -e
@@ -24,11 +24,6 @@ error() { log "${RED}[ERROR]${NC} $1"; exit 1; }
 # Проверка root
 if [[ $EUID -ne 0 ]]; then
     error "Требуется root (используйте sudo)"
-fi
-
-# Проверка ALT Linux
-if ! grep -qi "altlinux\|alt linux" /etc/os-release /etc/altlinux-release 2>/dev/null; then
-    warn "Система может не быть ALT Linux"
 fi
 
 clear
@@ -88,14 +83,29 @@ info "Обновление списков пакетов..."
 apt-get update || error "Не удалось обновить списки пакетов"
 
 info "Установка BIND (ALT Linux)..."
-apt-get install -y bind bind-utils bind-host || error "Не удалось установить BIND"
+# Пробуем установить основные пакеты BIND
+if ! apt-get install -y bind bind-utils; then
+    # Если не получилось, пробуем только bind
+    apt-get install -y bind || error "Не удалось установить BIND"
+fi
+
+# Проверяем наличие утилит
+if ! command -v named &>/dev/null; then
+    error "named не найден. BIND не установлен корректно."
+fi
+
+if ! command -v dig &>/dev/null; then
+    warn "dig не найден. Установите bind-utils отдельно."
+fi
+
+success "BIND установлен"
 
 # Проверка/создание пользователя named
 info "Проверка пользователя named..."
 if ! id named &>/dev/null; then
     warn "Пользователь named не найден, создаем..."
-    useradd -r -s /sbin/nologin -d /etc/named named || \
-    adduser -D -S -H -s /sbin/nologin named || \
+    useradd -r -s /sbin/nologin -d /etc/named named 2>/dev/null || \
+    adduser -D -S -H -s /sbin/nologin named 2>/dev/null || \
     error "Не удалось создать пользователя named"
     success "Пользователь named создан"
 else
@@ -104,7 +114,7 @@ fi
 
 # Проверка/создание группы named
 if ! getent group named &>/dev/null; then
-    groupadd named || true
+    groupadd named 2>/dev/null || true
 fi
 
 # Создание директорий
@@ -116,9 +126,9 @@ mkdir -p /var/run/named
 mkdir -p /etc/named
 
 # Установка прав
-chown -R named:named /var/cache/bind
-chown -R named:named /var/log/bind
-chown -R named:named /var/run/named
+chown -R named:named /var/cache/bind 2>/dev/null || true
+chown -R named:named /var/log/bind 2>/dev/null || true
+chown -R named:named /var/run/named 2>/dev/null || true
 chown -R named:named /etc/bind 2>/dev/null || true
 
 # Резервное копирование
@@ -136,7 +146,7 @@ key "rndc-key" {
 };
 RNDEOF
     chmod 640 /etc/bind/rndc.key
-    chown named:named /etc/bind/rndc.key
+    chown named:named /etc/bind/rndc.key 2>/dev/null || true
     success "rndc.key создан"
 fi
 
@@ -396,8 +406,8 @@ success "Настроен /etc/bind/named.conf.local"
 ln -sf /etc/named.conf /etc/bind/named.conf 2>/dev/null || true
 
 # Установка прав
-chown -R named:named /etc/bind
-chown named:named /etc/named.conf
+chown -R named:named /etc/bind 2>/dev/null || true
+chown named:named /etc/named.conf 2>/dev/null || true
 
 # Проверка конфигурации
 info "Проверка конфигурации..."
@@ -474,43 +484,4 @@ echo "  - Лог:           tail -f /var/log/bind/bind.log"
 echo "  - Остановка:     pkill named"
 echo "  - Запуск:        su -s /bin/bash -c 'named -c /etc/named.conf -g' named &"
 echo ""
-
-# Создание скрипта автозапуска
-cat > /etc/init.d/named-custom << 'INITSCRIPT'
-#!/bin/bash
-# chkconfig: 2345 80 30
-# description: BIND DNS Server
-
-case "$1" in
-    start)
-        echo "Starting named..."
-        su -s /bin/bash -c "named -c /etc/named.conf -g" named &
-        ;;
-    stop)
-        echo "Stopping named..."
-        pkill named
-        ;;
-    restart)
-        $0 stop
-        sleep 2
-        $0 start
-        ;;
-    status)
-        if pgrep named &>/dev/null; then
-            echo "named is running (PID: $(pgrep named))"
-        else
-            echo "named is stopped"
-        fi
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|restart|status}"
-        exit 1
-        ;;
-esac
-INITSCRIPT
-
-chmod +x /etc/init.d/named-custom
-success "Создан скрипт автозапуска: /etc/init.d/named-custom"
-echo ""
-info "Для автозагрузки выполните: chkconfig --add named-custom"
 info "Лог: $LOG_FILE"
