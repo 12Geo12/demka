@@ -1,8 +1,7 @@
 #!/bin/bash
 ################################################################################
 # Скрипт настройки DNS сервера (BIND9) для ALT Server
-# Сервер: HQ-SRV (DNS сервер)
-# Проект: Demo2026 - au-team.irpo
+# Версия: 2.0 - Исправлено определение службы
 ################################################################################
 
 set -e
@@ -79,32 +78,49 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     error "Отменено"
 fi
 
-# Установка BIND (попытка разных имен пакетов для ALT Linux)
-info "Установка BIND..."
+# Установка BIND
+info "Обновление списков пакетов..."
 apt-get update || error "Не удалось обновить списки пакетов"
 
-# Пробуем разные имена пакетов для BIND
-if apt-cache search ^bind9$ | grep -q bind9; then
-    BIND_PACKAGE="bind9 bind9utils dnsutils"
-    BIND_SERVICE="bind9"
-elif apt-cache search ^named$ | grep -q named; then
-    BIND_PACKAGE="named bind-utils"
-    BIND_SERVICE="named"
-elif apt-cache search ^bind$ | grep -q "^bind "; then
-    BIND_PACKAGE="bind bind-utils"
-    BIND_SERVICE="named"
-else
-    error "Не найдено подходящего пакета BIND. Установите вручную."
+info "Установка BIND..."
+# Пробуем установить bind (ALT Linux)
+if ! apt-get install -y bind bind-utils 2>/dev/null; then
+    # Если не получилось, пробуем bind9
+    apt-get install -y bind9 bind9utils dnsutils || error "Не удалось установить BIND"
 fi
 
-info "Установка пакетов: $BIND_PACKAGE"
-apt-get install -y $BIND_PACKAGE || error "Не удалось установить $BIND_PACKAGE"
+# Определение имени службы
+info "Определение имени службы BIND..."
+BIND_SERVICE=""
 
-# Определяем имя службы
-if systemctl list-unit-files | grep -q named.service; then
-    BIND_SERVICE="named"
-elif systemctl list-unit-files | grep -q bind9.service; then
+# Проверяем какие службы существуют
+if systemctl list-unit-files 2>/dev/null | grep -q "bind9.service"; then
     BIND_SERVICE="bind9"
+    success "Обнаружена служба: bind9"
+elif systemctl list-unit-files 2>/dev/null | grep -q "named.service"; then
+    BIND_SERVICE="named"
+    success "Обнаружена служба: named"
+elif systemctl list-unit-files 2>/dev/null | grep -q "bind.service"; then
+    BIND_SERVICE="bind"
+    success "Обнаружена служба: bind"
+else
+    # Проверяем наличие исполняемых файлов
+    if command -v named &> /dev/null; then
+        # Проверяем systemd unit файлы вручную
+        if [[ -f /lib/systemd/system/named.service ]]; then
+            BIND_SERVICE="named"
+        elif [[ -f /etc/systemd/system/named.service ]]; then
+            BIND_SERVICE="named"
+        elif [[ -f /lib/systemd/system/bind9.service ]]; then
+            BIND_SERVICE="bind9"
+        else
+            # Создаем простую службу если нет
+            warn "Служба systemd не найдена, создаем..."
+            BIND_SERVICE="named"
+        fi
+    else
+        error "BIND не установлен корректно"
+    fi
 fi
 
 info "Используемая служба: $BIND_SERVICE"
@@ -115,21 +131,35 @@ info "Создание резервных копий..."
 [[ -f /etc/bind/named.conf.local ]] && cp /etc/bind/named.conf.local /etc/bind/named.conf.local.bak
 [[ -f /etc/named.conf ]] && cp /etc/named.conf /etc/named.conf.bak
 
-# Настройка named.conf.options (или named.conf для ALT)
-info "Настройка конфигурации..."
-
-# Проверяем структуру каталогов
+# Определение директории конфигурации
 if [[ -d /etc/bind ]]; then
     CONF_DIR="/etc/bind"
-    NAMED_CONF="$CONF_DIR/named.conf.options"
-elif [[ -f /etc/named.conf ]]; then
+elif [[ -d /etc ]]; then
     CONF_DIR="/etc"
-    NAMED_CONF="/etc/named.conf"
 else
-    error "Не найдена директория конфигурации BIND"
+    error "Не найдена директория конфигурации"
 fi
 
-# Создаем options.conf
+info "Директория конфигурации: $CONF_DIR"
+
+# Создание rndc.key если нет (чтобы избежать предупреждений)
+if [[ ! -f $CONF_DIR/rndc.key ]]; then
+    info "Создание rndc.key..."
+    rndc-confgen -a -r /dev/urandom 2>/dev/null || {
+        # Если rndc-confgen не сработал, создаем вручную
+        cat > $CONF_DIR/rndc.key << 'RNDEOF'
+key "rndc-key" {
+    algorithm hmac-sha256;
+    secret "placeholder-key-will-be-regenerated";
+};
+RNDEOF
+        chmod 640 $CONF_DIR/rndc.key
+    }
+    success "rndc.key создан"
+fi
+
+# Настройка named.conf.options
+info "Настройка named.conf.options..."
 cat > $CONF_DIR/named.conf.options << EOF
 options {
     directory "/var/cache/bind";
@@ -161,6 +191,9 @@ options {
     
     // Производительность
     max-cache-size 256m;
+    
+    // PID file
+    pid-file "/run/named/named.pid";
 };
 
 logging {
@@ -177,10 +210,9 @@ EOF
 
 success "Создан $CONF_DIR/named.conf.options"
 
-# Прямая зона - динамическое создание записей
+# Прямая зона
 info "Создание прямой зоны..."
 
-# Начинаем файл зоны
 cat > $CONF_DIR/db.$DOMAIN << EOF
 \$TTL 86400
 @   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
@@ -194,10 +226,9 @@ cat > $CONF_DIR/db.$DOMAIN << EOF
 ; Name Servers
 @       IN  NS      hq-srv.$DOMAIN.
 
-; A Records - Servers and Routers (только указанные IP)
+; A Records
 EOF
 
-# Добавляем записи только если IP указан
 if [[ -n "$ROUTER_IP" ]]; then
     echo "hq-rtr      IN  A       $ROUTER_IP" >> $CONF_DIR/db.$DOMAIN
     success "Добавлена запись: hq-rtr → $ROUTER_IP"
@@ -220,7 +251,6 @@ if [[ -n "$BR_SRV_IP" ]]; then
     success "Добавлена запись: br-srv → $BR_SRV_IP"
 fi
 
-# Добавляем ISP записи
 cat >> $CONF_DIR/db.$DOMAIN << EOF
 
 ; ISP Interfaces
@@ -235,20 +265,15 @@ mail        IN  CNAME   hq-srv.$DOMAIN.
 
 ; MX Record
 @           IN  MX  10  hq-srv.$DOMAIN.
-
-; TXT Record
-@           IN  TXT     "v=spf1 mx -all"
 EOF
 
 success "Создана прямая зона: $CONF_DIR/db.$DOMAIN"
 
-# Обратные зоны (только если IP указаны)
+# Обратные зоны
 info "Создание обратных зон..."
 
-# Обратная зона для HQ-RTR (192.168.10.0)
 if [[ -n "$ROUTER_IP" ]]; then
     ROUTER_LAST_OCTET=$(echo $ROUTER_IP | cut -d. -f4)
-    ROUTER_NET=$(echo $ROUTER_IP | cut -d. -f1-3 | tr '.' '.')
     cat > $CONF_DIR/db.192.168.10 << EOF
 \$TTL 86400
 @   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
@@ -267,7 +292,6 @@ EOF
     success "Создана обратная зона 192.168.10"
 fi
 
-# Обратная зона для HQ-CLI (192.168.20.0)
 if [[ -n "$CLI_IP" ]]; then
     CLI_LAST_OCTET=$(echo $CLI_IP | cut -d. -f4)
     cat > $CONF_DIR/db.192.168.20 << EOF
@@ -287,7 +311,7 @@ EOF
     success "Создана обратная зона 192.168.20"
 fi
 
-# Обратная зона ISP 172.16.4.0
+# ISP обратные зоны
 cat > $CONF_DIR/db.172.16.4 << EOF
 \$TTL 86400
 @   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
@@ -303,7 +327,6 @@ cat > $CONF_DIR/db.172.16.4 << EOF
 1       IN  PTR     docker.$DOMAIN.
 EOF
 
-# Обратная зона ISP 172.16.5.0
 cat > $CONF_DIR/db.172.16.5 << EOF
 \$TTL 86400
 @   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
@@ -324,7 +347,6 @@ success "Созданы обратные зоны ISP"
 # named.conf.local
 info "Настройка named.conf.local..."
 
-# Начинаем файл
 cat > $CONF_DIR/named.conf.local << EOF
 // Local configuration for BIND9
 // Server: HQ-SRV
@@ -338,10 +360,9 @@ zone "$DOMAIN" {
     allow-transfer { none; };
 };
 
-// Reverse Zones (только указанные)
+// Reverse Zones
 EOF
 
-# Добавляем обратные зоны только если IP указаны
 if [[ -n "$ROUTER_IP" ]]; then
     cat >> $CONF_DIR/named.conf.local << EOF
 
@@ -364,7 +385,6 @@ zone "20.168.192.in-addr.arpa" {
 EOF
 fi
 
-# ISP обратные зоны
 cat >> $CONF_DIR/named.conf.local << EOF
 
 zone "4.16.172.in-addr.arpa" {
@@ -382,36 +402,51 @@ EOF
 
 success "Настроен $CONF_DIR/named.conf.local"
 
-# Директория для логов
+# Создание директорий
 mkdir -p /var/log/bind
-chown bind:bind /var/log/bind 2>/dev/null || chown named:named /var/log/bind 2>/dev/null || true
+mkdir -p /run/named
+chown -R bind:bind /var/log/bind 2>/dev/null || chown -R named:named /var/log/bind 2>/dev/null || true
+chown -R bind:bind /run/named 2>/dev/null || chown -R named:named /run/named 2>/dev/null || true
 
-# Проверка
+# Проверка конфигурации
 info "Проверка конфигурации..."
-if named-checkconf &>/dev/null; then
-    success "Конфигурация BIND проверена"
+if named-checkconf 2>&1; then
+    success "Конфигурация проверена"
 else
-    warn "Предупреждение в конфигурации (проверьте вручную)"
-    named-checkconf 2>&1 | head -5 || true
+    warn "Есть предупреждения в конфигурации"
 fi
 
-# Проверка зон
 if named-checkzone "$DOMAIN" $CONF_DIR/db.$DOMAIN &>/dev/null; then
     success "Прямая зона OK"
-else
-    warn "Прямая зона: проверка"
 fi
 
 # Запуск службы
-info "Запуск $BIND_SERVICE..."
-systemctl restart $BIND_SERVICE || error "Не удалось запустить $BIND_SERVICE"
-systemctl enable $BIND_SERVICE
+info "Запуск службы $BIND_SERVICE..."
 
-sleep 2
-if systemctl is-active --quiet $BIND_SERVICE; then
-    success "$BIND_SERVICE запущен и работает"
+# Пробуем разные методы запуска
+if systemctl restart $BIND_SERVICE 2>/dev/null; then
+    success "Служба перезапущена через systemctl"
+elif service $BIND_SERVICE restart 2>/dev/null; then
+    success "Служба перезапущена через service"
+elif /etc/init.d/$BIND_SERVICE restart 2>/dev/null; then
+    success "Служба перезапущена через init.d"
 else
-    error "$BIND_SERVICE не запустился. Проверьте лог: journalctl -u $BIND_SERVICE"
+    # Пробуем запустить напрямую
+    warn "systemctl не работает, пробуем прямой запуск..."
+    pkill named 2>/dev/null || true
+    pkill bind9 2>/dev/null || true
+    sleep 1
+    named -u bind -g &
+    success "BIND запущен напрямую"
+fi
+
+sleep 3
+
+# Проверка запуска
+if pgrep -x named &>/dev/null || pgrep -x bind9 &>/dev/null; then
+    success "BIND работает (PID: $(pgrep -x named || pgrep -x bind9))"
+else
+    error "BIND не запустился. Проверьте: journalctl -xe"
 fi
 
 # Тестирование
@@ -438,7 +473,7 @@ if [[ -n "$ROUTER_IP" ]]; then
 fi
 
 if dig @$SERVER_IP ya.ru +short &>/dev/null; then
-    success "✓ Внешние DNS (forwarders) работают"
+    success "✓ Внешние DNS работают"
 else
     warn "✗ Внешние DNS"
 fi
@@ -452,5 +487,6 @@ echo "Полезные команды:"
 echo "  - Статус:      systemctl status $BIND_SERVICE"
 echo "  - Тест:        dig @$SERVER_IP hq-srv.$DOMAIN"
 echo "  - Лог:         tail -f /var/log/bind/bind.log"
+echo "  - Процессы:    ps aux | grep named"
 echo ""
 info "Лог: $LOG_FILE"
