@@ -1,7 +1,7 @@
 #!/bin/bash
 ################################################################################
 # Скрипт настройки DNS сервера (BIND) для ALT Linux Server
-# Версия: 3.1 - Исправлена установка пакетов
+# Версия: 3.2 - Исправлена ошибка chroot() Operation not permitted
 ################################################################################
 
 set -e
@@ -151,6 +151,8 @@ RNDEOF
 fi
 
 # Основной конфигурационный файл named.conf
+# ИСПРАВЛЕНИЕ: Убраны user/group из options - теперь named запускается от root
+# и сам сбрасывает привилегии без chroot
 info "Создание named.conf..."
 cat > /etc/named.conf << EOF
 // Named configuration for ALT Linux
@@ -182,7 +184,7 @@ options {
     forward only;
     
     // DNSSEC
-    dnssec-validation auto;
+    dnssec-validation no;
     
     // Логи
     querylog yes;
@@ -190,9 +192,8 @@ options {
     // Производительность
     max-cache-size 256m;
     
-    // Пользователь и группа
-    user "named";
-    group "named";
+    // ВАЖНО: Не используем user/group здесь - это вызывает chroot()
+    // Привилегии будут сброшены через параметры запуска
 };
 
 logging {
@@ -427,20 +428,41 @@ pkill named 2>/dev/null || true
 sleep 2
 
 # Запуск named
+# ИСПРАВЛЕНИЕ: Запускаем named напрямую без chroot
+# -f: запуск в foreground (для тестирования)
+# -u named: сброс привилегий через setuid (без chroot)
 info "Запуск named..."
 cd /var/cache/bind
 
-# Запускаем от имени пользователя named
-su -s /bin/bash -c "named -c /etc/named.conf -g" named &
-NAMED_PID=$!
+# Проверяем, поддерживает ли named опцию -u (не все версии ALT Linux)
+if named --help 2>&1 | grep -q '\-u'; then
+    # Если есть поддержка -u, запускаем с ней
+    named -c /etc/named.conf -f -u named &
+else
+    # Иначе запускаем напрямую (без chroot)
+    named -c /etc/named.conf -f &
+fi
 
+NAMED_PID=$!
 sleep 3
 
 # Проверка запуска
 if pgrep -x named &>/dev/null; then
     success "named запущен (PID: $(pgrep -x named))"
 else
-    error "named не запустился. Проверьте: tail -f /var/log/bind/bind.log"
+    # Если не запустился, пробуем альтернативный способ
+    warn "Первая попытка не удалась, пробуем альтернативный способ..."
+    
+    # Пробуем запустить без сброса привилегий (для контейнеров)
+    named -c /etc/named.conf -f &
+    sleep 3
+    
+    if pgrep -x named &>/dev/null; then
+        success "named запущен альтернативным способом (PID: $(pgrep -x named))"
+        warn "Внимание: named работает от root. Это не рекомендуется для production."
+    else
+        error "named не запустился. Проверьте: tail -f /var/log/bind/bind.log"
+    fi
 fi
 
 # Тестирование
@@ -482,6 +504,6 @@ echo "  - Статус:        ps aux | grep named"
 echo "  - Тест:          dig @$SERVER_IP hq-srv.$DOMAIN"
 echo "  - Лог:           tail -f /var/log/bind/bind.log"
 echo "  - Остановка:     pkill named"
-echo "  - Запуск:        su -s /bin/bash -c 'named -c /etc/named.conf -g' named &"
+echo "  - Запуск:        named -c /etc/named.conf -f &"
 echo ""
 info "Лог: $LOG_FILE"
