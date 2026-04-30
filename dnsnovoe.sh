@@ -1,7 +1,3 @@
---- dns_setup_interactive.sh (原始)
-
-
-+++ dns_setup_interactive.sh (修改后)
 #!/bin/bash
 ################################################################################
 # Скрипт настройки DNS сервера (BIND) для ALT Linux Server
