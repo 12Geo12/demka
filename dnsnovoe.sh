@@ -1,7 +1,7 @@
 #!/bin/bash
 ################################################################################
 # Скрипт настройки DNS сервера (BIND) для ALT Linux Server
-# Версия: 3.2 - Исправлена ошибка chroot() Operation not permitted
+# Версия: 3.4 - Исправлено: создание директорий и прав доступа
 ################################################################################
 
 set -e
@@ -80,120 +80,91 @@ fi
 
 # Установка BIND для ALT Linux
 info "Обновление списков пакетов..."
-apt-get update || error "Не удалось обновить списки пакетов"
+apt-get update || warn "Не удалось обновить списки пакетов"
 
 info "Установка BIND (ALT Linux)..."
-# Пробуем установить основные пакеты BIND
-if ! apt-get install -y bind bind-utils; then
-    # Если не получилось, пробуем только bind
-    apt-get install -y bind || error "Не удалось установить BIND"
-fi
+apt-get install -y bind bind-utils 2>/dev/null || apt-get install -y bind || warn "Возможны проблемы с установкой"
 
-# Проверяем наличие утилит
+# Проверяем наличие named
 if ! command -v named &>/dev/null; then
     error "named не найден. BIND не установлен корректно."
 fi
 
-if ! command -v dig &>/dev/null; then
-    warn "dig не найден. Установите bind-utils отдельно."
-fi
-
 success "BIND установлен"
 
-# Проверка/создание пользователя named
-info "Проверка пользователя named..."
-if ! id named &>/dev/null; then
-    warn "Пользователь named не найден, создаем..."
-    useradd -r -s /sbin/nologin -d /etc/named named 2>/dev/null || \
-    adduser -D -S -H -s /sbin/nologin named 2>/dev/null || \
-    error "Не удалось создать пользователя named"
-    success "Пользователь named создан"
-else
-    success "Пользователь named существует"
-fi
+# ============================================================================
+# КРИТИЧНО: Создание всех директорий с правильными правами
+# ============================================================================
+info "Создание директорий с правильными правами..."
 
-# Проверка/создание группы named
-if ! getent group named &>/dev/null; then
-    groupadd named 2>/dev/null || true
-fi
-
-# Создание директорий
-info "Создание директорий..."
+# Основные директории BIND
 mkdir -p /etc/bind
 mkdir -p /var/cache/bind
 mkdir -p /var/log/bind
 mkdir -p /var/run/named
-mkdir -p /etc/named
 
-# Установка прав
-chown -R named:named /var/cache/bind 2>/dev/null || true
-chown -R named:named /var/log/bind 2>/dev/null || true
-chown -R named:named /var/run/named 2>/dev/null || true
-chown -R named:named /etc/bind 2>/dev/null || true
+# Устанавливаем владельца root (так как named запускается от root)
+chown -R root:root /etc/bind
+chown -R root:root /var/cache/bind
+chown -R root:root /var/log/bind
+chown -R root:root /var/run/named
+
+# Устанавливаем права
+chmod 755 /etc/bind
+chmod 755 /var/cache/bind
+chmod 755 /var/log/bind
+chmod 755 /var/run/named
+
+# Проверяем что директории доступны
+info "Проверка директорий..."
+if [[ ! -d /var/cache/bind ]]; then
+    error "Не удалось создать /var/cache/bind"
+fi
+if [[ ! -w /var/cache/bind ]]; then
+    error "/var/cache/bind недоступен для записи"
+fi
+success "Директории созданы и доступны"
 
 # Резервное копирование
 info "Создание резервных копий..."
-[[ -f /etc/named.conf ]] && cp /etc/named.conf /etc/named.conf.bak
-[[ -f /etc/bind/named.conf ]] && cp /etc/bind/named.conf /etc/bind/named.conf.bak
+[[ -f /etc/named.conf ]] && cp /etc/named.conf /etc/named.conf.bak.$(date +%s)
+[[ -f /etc/bind/named.conf ]] && cp /etc/bind/named.conf /etc/bind/named.conf.bak.$(date +%s)
 
 # Создание rndc.key
 info "Создание rndc.key..."
-if [[ ! -f /etc/bind/rndc.key ]]; then
-    cat > /etc/bind/rndc.key << 'RNDEOF'
+cat > /etc/bind/rndc.key << 'RNDEOF'
 key "rndc-key" {
     algorithm hmac-sha256;
     secret "placeholder-key";
 };
 RNDEOF
-    chmod 640 /etc/bind/rndc.key
-    chown named:named /etc/bind/rndc.key 2>/dev/null || true
-    success "rndc.key создан"
-fi
+chmod 644 /etc/bind/rndc.key
 
 # Основной конфигурационный файл named.conf
-# ИСПРАВЛЕНИЕ: Убраны user/group из options - теперь named запускается от root
-# и сам сбрасывает привилегии без chroot
 info "Создание named.conf..."
 cat > /etc/named.conf << EOF
 // Named configuration for ALT Linux
 // Generated: $(date)
 
-include "/etc/bind/rndc.key";
-
 options {
     directory "/var/cache/bind";
     pid-file "/var/run/named/named.pid";
     
-    // Прослушиваемые интерфейсы
     listen-on port 53 { 127.0.0.1; $SERVER_IP; };
     listen-on-v6 port 53 { none; };
     
-    // Разрешенные для запросов
     allow-query { any; };
     
-    // Рекурсия
     recursion yes;
     allow-recursion { any; };
     
-    // DNS Forwarders
     forwarders {
         $FORWARDER1;
         $FORWARDER2;
     };
-    
     forward only;
     
-    // DNSSEC
     dnssec-validation no;
-    
-    // Логи
-    querylog yes;
-    
-    // Производительность
-    max-cache-size 256m;
-    
-    // ВАЖНО: Не используем user/group здесь - это вызывает chroot()
-    // Привилегии будут сброшены через параметры запуска
 };
 
 logging {
@@ -207,7 +178,6 @@ logging {
     category default { default_log; };
 };
 
-// Включаем локальные настройки
 include "/etc/bind/named.conf.local";
 EOF
 
@@ -219,54 +189,45 @@ info "Создание прямой зоны..."
 cat > /etc/bind/db.$DOMAIN << EOF
 \$TTL 86400
 @   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
-        $(date +%Y%m%d)01  ; Serial
-        3600               ; Refresh
-        1800               ; Retry
-        604800             ; Expire
-        86400              ; Minimum TTL
+        $(date +%Y%m%d)01
+        3600
+        1800
+        604800
+        86400
 )
 
-; Name Servers
 @       IN  NS      hq-srv.$DOMAIN.
 
-; A Records
 EOF
 
 if [[ -n "$ROUTER_IP" ]]; then
     echo "hq-rtr      IN  A       $ROUTER_IP" >> /etc/bind/db.$DOMAIN
-    success "Добавлена запись: hq-rtr → $ROUTER_IP"
 fi
 
 echo "hq-srv      IN  A       $SERVER_IP" >> /etc/bind/db.$DOMAIN
 
 if [[ -n "$CLI_IP" ]]; then
     echo "hq-cli      IN  A       $CLI_IP" >> /etc/bind/db.$DOMAIN
-    success "Добавлена запись: hq-cli → $CLI_IP"
 fi
 
 if [[ -n "$BR_RTR_IP" ]]; then
     echo "br-rtr      IN  A       $BR_RTR_IP" >> /etc/bind/db.$DOMAIN
-    success "Добавлена запись: br-rtr → $BR_RTR_IP"
 fi
 
 if [[ -n "$BR_SRV_IP" ]]; then
     echo "br-srv      IN  A       $BR_SRV_IP" >> /etc/bind/db.$DOMAIN
-    success "Добавлена запись: br-srv → $BR_SRV_IP"
 fi
 
 cat >> /etc/bind/db.$DOMAIN << EOF
 
-; ISP Interfaces
 docker      IN  A       172.16.4.1
 web         IN  A       172.16.5.1
 
-; CNAME Records
 moodle      IN  CNAME   hq-rtr.$DOMAIN.
 wiki        IN  CNAME   hq-rtr.$DOMAIN.
 ftp         IN  CNAME   hq-srv.$DOMAIN.
 mail        IN  CNAME   hq-srv.$DOMAIN.
 
-; MX Record
 @           IN  MX  10  hq-srv.$DOMAIN.
 EOF
 
@@ -351,17 +312,11 @@ success "Созданы обратные зоны ISP"
 info "Настройка named.conf.local..."
 
 cat > /etc/bind/named.conf.local << EOF
-// Local configuration for BIND
-// Server: HQ-SRV
-
-// Forward Zone
 zone "$DOMAIN" {
     type master;
     file "/etc/bind/db.$DOMAIN";
     allow-transfer { none; };
 };
-
-// Reverse Zones
 EOF
 
 if [[ -n "$ROUTER_IP" ]]; then
@@ -403,12 +358,10 @@ EOF
 
 success "Настроен /etc/bind/named.conf.local"
 
-# Создание симлинка для совместимости
-ln -sf /etc/named.conf /etc/bind/named.conf 2>/dev/null || true
-
-# Установка прав
-chown -R named:named /etc/bind 2>/dev/null || true
-chown named:named /etc/named.conf 2>/dev/null || true
+# Финальная установка прав
+chmod -R 755 /etc/bind
+chmod 644 /etc/named.conf
+chmod 644 /etc/bind/db.* 2>/dev/null || true
 
 # Проверка конфигурации
 info "Проверка конфигурации..."
@@ -418,7 +371,7 @@ else
     warn "Есть предупреждения в конфигурации"
 fi
 
-if named-checkzone "$DOMAIN" /etc/bind/db.$DOMAIN &>/dev/null; then
+if named-checkzone "$DOMAIN" /etc/bind/db.$DOMAIN 2>&1; then
     success "Прямая зона OK"
 fi
 
@@ -427,41 +380,36 @@ info "Остановка старых процессов named..."
 pkill named 2>/dev/null || true
 sleep 2
 
-# Запуск named
-# ИСПРАВЛЕНИЕ: Запускаем named напрямую без chroot
-# -f: запуск в foreground (для тестирования)
-# -u named: сброс привилегий через setuid (без chroot)
+# ============================================================================
+# Запуск named с правильной рабочей директорией
+# ============================================================================
 info "Запуск named..."
+
+# Переходим в рабочую директорию BIND ПЕРЕД запуском
 cd /var/cache/bind
 
-# Проверяем, поддерживает ли named опцию -u (не все версии ALT Linux)
-if named --help 2>&1 | grep -q '\-u'; then
-    # Если есть поддержка -u, запускаем с ней
-    named -c /etc/named.conf -f -u named &
-else
-    # Иначе запускаем напрямую (без chroot)
-    named -c /etc/named.conf -f &
-fi
+# Создаём пустой лог-файл заранее
+touch /var/log/bind/bind.log
+chmod 644 /var/log/bind/bind.log
 
+# Запуск named (от root, без chroot)
+named -c /etc/named.conf &
 NAMED_PID=$!
+
 sleep 3
 
 # Проверка запуска
 if pgrep -x named &>/dev/null; then
     success "named запущен (PID: $(pgrep -x named))"
 else
-    # Если не запустился, пробуем альтернативный способ
-    warn "Первая попытка не удалась, пробуем альтернативный способ..."
-    
-    # Пробуем запустить без сброса привилегий (для контейнеров)
-    named -c /etc/named.conf -f &
+    warn "named не запустился, пробуем отладку..."
+    named -c /etc/named.conf -g 2>&1 &
     sleep 3
     
     if pgrep -x named &>/dev/null; then
-        success "named запущен альтернативным способом (PID: $(pgrep -x named))"
-        warn "Внимание: named работает от root. Это не рекомендуется для production."
+        success "named запущен"
     else
-        error "named не запустился. Проверьте: tail -f /var/log/bind/bind.log"
+        error "named не запустился. Проверьте конфигурацию вручную."
     fi
 fi
 
@@ -496,7 +444,7 @@ fi
 
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}           DNS НАСТРОЕН УСПЕШНО!${NC}"
+echo -e "${GREEN}           DNS НАСТРОЕН!${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
 echo ""
 echo "Полезные команды:"
@@ -504,6 +452,6 @@ echo "  - Статус:        ps aux | grep named"
 echo "  - Тест:          dig @$SERVER_IP hq-srv.$DOMAIN"
 echo "  - Лог:           tail -f /var/log/bind/bind.log"
 echo "  - Остановка:     pkill named"
-echo "  - Запуск:        named -c /etc/named.conf -f &"
+echo "  - Запуск:        cd /var/cache/bind && named -c /etc/named.conf &"
 echo ""
 info "Лог: $LOG_FILE"
