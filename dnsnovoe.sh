@@ -1,7 +1,7 @@
 #!/bin/bash
 ################################################################################
 # Скрипт настройки DNS сервера (BIND) для ALT Linux Server
-# Версия: 3.4 - Исправлено: создание директорий и прав доступа
+# Версия: 4.0 - Используем /var/lib/bind вместо /var/cache/bind
 ################################################################################
 
 set -e
@@ -78,83 +78,67 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     error "Отменено"
 fi
 
-# Установка BIND для ALT Linux
-info "Обновление списков пакетов..."
-apt-get update || warn "Не удалось обновить списки пакетов"
+# Установка BIND
+info "Установка BIND..."
+apt-get update
+apt-get install -y bind bind-utils || apt-get install -y bind
 
-info "Установка BIND (ALT Linux)..."
-apt-get install -y bind bind-utils 2>/dev/null || apt-get install -y bind || warn "Возможны проблемы с установкой"
-
-# Проверяем наличие named
 if ! command -v named &>/dev/null; then
-    error "named не найден. BIND не установлен корректно."
+    error "named не найден"
 fi
-
 success "BIND установлен"
 
 # ============================================================================
-# КРИТИЧНО: Создание всех директорий с правильными правами
+# ВАЖНО: Создаём директории ПЕРЕД конфигурацией
+# Используем /var/lib/bind - стандартный путь для ALT Linux
 # ============================================================================
-info "Создание директорий с правильными правами..."
+info "Создание директорий..."
 
-# Основные директории BIND
+# Создаём все нужные директории
 mkdir -p /etc/bind
-mkdir -p /var/cache/bind
+mkdir -p /var/lib/bind
+mkdir -p /var/lib/bind/zones
 mkdir -p /var/log/bind
 mkdir -p /var/run/named
 
-# Устанавливаем владельца root (так как named запускается от root)
+# Устанавливаем права root (named запускается от root)
 chown -R root:root /etc/bind
-chown -R root:root /var/cache/bind
+chown -R root:root /var/lib/bind
 chown -R root:root /var/log/bind
 chown -R root:root /var/run/named
 
-# Устанавливаем права
 chmod 755 /etc/bind
-chmod 755 /var/cache/bind
+chmod 755 /var/lib/bind
+chmod 755 /var/lib/bind/zones
 chmod 755 /var/log/bind
 chmod 755 /var/run/named
 
 # Проверяем что директории доступны
-info "Проверка директорий..."
-if [[ ! -d /var/cache/bind ]]; then
-    error "Не удалось создать /var/cache/bind"
-fi
-if [[ ! -w /var/cache/bind ]]; then
-    error "/var/cache/bind недоступен для записи"
-fi
-success "Директории созданы и доступны"
+ls -la /var/lib/bind
+touch /var/lib/bind/test_write && rm /var/lib/bind/test_write
+success "Директории созданы"
 
 # Резервное копирование
-info "Создание резервных копий..."
-[[ -f /etc/named.conf ]] && cp /etc/named.conf /etc/named.conf.bak.$(date +%s)
-[[ -f /etc/bind/named.conf ]] && cp /etc/bind/named.conf /etc/bind/named.conf.bak.$(date +%s)
+[[ -f /etc/named.conf ]] && cp /etc/named.conf /etc/named.conf.bak
 
-# Создание rndc.key
-info "Создание rndc.key..."
-cat > /etc/bind/rndc.key << 'RNDEOF'
-key "rndc-key" {
-    algorithm hmac-sha256;
-    secret "placeholder-key";
-};
-RNDEOF
-chmod 644 /etc/bind/rndc.key
-
-# Основной конфигурационный файл named.conf
+# ============================================================================
+# Конфигурация named.conf - используем /var/lib/bind
+# ============================================================================
 info "Создание named.conf..."
+
 cat > /etc/named.conf << EOF
-// Named configuration for ALT Linux
+// BIND Configuration for ALT Linux
 // Generated: $(date)
 
 options {
-    directory "/var/cache/bind";
+    // ИСПОЛЬЗУЕМ /var/lib/bind вместо /var/cache/bind
+    directory "/var/lib/bind";
     pid-file "/var/run/named/named.pid";
     
     listen-on port 53 { 127.0.0.1; $SERVER_IP; };
     listen-on-v6 port 53 { none; };
     
     allow-query { any; };
-    
     recursion yes;
     allow-recursion { any; };
     
@@ -181,12 +165,15 @@ logging {
 include "/etc/bind/named.conf.local";
 EOF
 
-success "Создан /etc/named.conf"
+success "named.conf создан"
+
+# ============================================================================
+# Создание зон
+# ============================================================================
+info "Создание зон..."
 
 # Прямая зона
-info "Создание прямой зоны..."
-
-cat > /etc/bind/db.$DOMAIN << EOF
+cat > /var/lib/bind/zones/db.$DOMAIN << EOF
 \$TTL 86400
 @   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
         $(date +%Y%m%d)01
@@ -200,45 +187,30 @@ cat > /etc/bind/db.$DOMAIN << EOF
 
 EOF
 
-if [[ -n "$ROUTER_IP" ]]; then
-    echo "hq-rtr      IN  A       $ROUTER_IP" >> /etc/bind/db.$DOMAIN
-fi
+[[ -n "$ROUTER_IP" ]] && echo "hq-rtr      IN  A       $ROUTER_IP" >> /var/lib/bind/zones/db.$DOMAIN
+echo "hq-srv      IN  A       $SERVER_IP" >> /var/lib/bind/zones/db.$DOMAIN
+[[ -n "$CLI_IP" ]] && echo "hq-cli      IN  A       $CLI_IP" >> /var/lib/bind/zones/db.$DOMAIN
+[[ -n "$BR_RTR_IP" ]] && echo "br-rtr      IN  A       $BR_RTR_IP" >> /var/lib/bind/zones/db.$DOMAIN
+[[ -n "$BR_SRV_IP" ]] && echo "br-srv      IN  A       $BR_SRV_IP" >> /var/lib/bind/zones/db.$DOMAIN
 
-echo "hq-srv      IN  A       $SERVER_IP" >> /etc/bind/db.$DOMAIN
-
-if [[ -n "$CLI_IP" ]]; then
-    echo "hq-cli      IN  A       $CLI_IP" >> /etc/bind/db.$DOMAIN
-fi
-
-if [[ -n "$BR_RTR_IP" ]]; then
-    echo "br-rtr      IN  A       $BR_RTR_IP" >> /etc/bind/db.$DOMAIN
-fi
-
-if [[ -n "$BR_SRV_IP" ]]; then
-    echo "br-srv      IN  A       $BR_SRV_IP" >> /etc/bind/db.$DOMAIN
-fi
-
-cat >> /etc/bind/db.$DOMAIN << EOF
+cat >> /var/lib/bind/zones/db.$DOMAIN << EOF
 
 docker      IN  A       172.16.4.1
 web         IN  A       172.16.5.1
-
 moodle      IN  CNAME   hq-rtr.$DOMAIN.
 wiki        IN  CNAME   hq-rtr.$DOMAIN.
 ftp         IN  CNAME   hq-srv.$DOMAIN.
 mail        IN  CNAME   hq-srv.$DOMAIN.
-
 @           IN  MX  10  hq-srv.$DOMAIN.
 EOF
 
-success "Создана прямая зона: /etc/bind/db.$DOMAIN"
+chmod 644 /var/lib/bind/zones/db.$DOMAIN
+success "Прямая зона создана"
 
 # Обратные зоны
-info "Создание обратных зон..."
-
 if [[ -n "$ROUTER_IP" ]]; then
-    ROUTER_LAST_OCTET=$(echo $ROUTER_IP | cut -d. -f4)
-    cat > /etc/bind/db.192.168.10 << EOF
+    ROUTER_LAST=$(echo $ROUTER_IP | cut -d. -f4)
+    cat > /var/lib/bind/zones/db.192.168.10 << EOF
 \$TTL 86400
 @   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
         $(date +%Y%m%d)01
@@ -247,18 +219,16 @@ if [[ -n "$ROUTER_IP" ]]; then
         604800
         86400
 )
-
 @       IN  NS      hq-srv.$DOMAIN.
-
-$ROUTER_LAST_OCTET       IN  PTR     hq-rtr.$DOMAIN.
+$ROUTER_LAST       IN  PTR     hq-rtr.$DOMAIN.
 2       IN  PTR     hq-srv.$DOMAIN.
 EOF
-    success "Создана обратная зона 192.168.10"
+    chmod 644 /var/lib/bind/zones/db.192.168.10
 fi
 
 if [[ -n "$CLI_IP" ]]; then
-    CLI_LAST_OCTET=$(echo $CLI_IP | cut -d. -f4)
-    cat > /etc/bind/db.192.168.20 << EOF
+    CLI_LAST=$(echo $CLI_IP | cut -d. -f4)
+    cat > /var/lib/bind/zones/db.192.168.20 << EOF
 \$TTL 86400
 @   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
         $(date +%Y%m%d)01
@@ -267,191 +237,124 @@ if [[ -n "$CLI_IP" ]]; then
         604800
         86400
 )
-
 @       IN  NS      hq-srv.$DOMAIN.
-
-$CLI_LAST_OCTET       IN  PTR     hq-cli.$DOMAIN.
+$CLI_LAST       IN  PTR     hq-cli.$DOMAIN.
 EOF
-    success "Создана обратная зона 192.168.20"
+    chmod 644 /var/lib/bind/zones/db.192.168.20
 fi
 
-# ISP обратные зоны
-cat > /etc/bind/db.172.16.4 << EOF
+# ISP зоны
+cat > /var/lib/bind/zones/db.172.16.4 << EOF
 \$TTL 86400
-@   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
-        $(date +%Y%m%d)01
-        3600
-        1800
-        604800
-        86400
-)
-
+@   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. ($(date +%Y%m%d)01 3600 1800 604800 86400)
 @       IN  NS      hq-srv.$DOMAIN.
-
 1       IN  PTR     docker.$DOMAIN.
 EOF
 
-cat > /etc/bind/db.172.16.5 << EOF
+cat > /var/lib/bind/zones/db.172.16.5 << EOF
 \$TTL 86400
-@   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. (
-        $(date +%Y%m%d)01
-        3600
-        1800
-        604800
-        86400
-)
-
+@   IN  SOA hq-srv.$DOMAIN. admin.$DOMAIN. ($(date +%Y%m%d)01 3600 1800 604800 86400)
 @       IN  NS      hq-srv.$DOMAIN.
-
 1       IN  PTR     web.$DOMAIN.
 EOF
 
-success "Созданы обратные зоны ISP"
+chmod 644 /var/lib/bind/zones/db.*
+success "Зоны созданы"
 
+# ============================================================================
 # named.conf.local
-info "Настройка named.conf.local..."
-
+# ============================================================================
 cat > /etc/bind/named.conf.local << EOF
 zone "$DOMAIN" {
     type master;
-    file "/etc/bind/db.$DOMAIN";
+    file "/var/lib/bind/zones/db.$DOMAIN";
     allow-transfer { none; };
 };
 EOF
 
-if [[ -n "$ROUTER_IP" ]]; then
-    cat >> /etc/bind/named.conf.local << EOF
-
+[[ -n "$ROUTER_IP" ]] && cat >> /etc/bind/named.conf.local << EOF
 zone "10.168.192.in-addr.arpa" {
     type master;
-    file "/etc/bind/db.192.168.10";
+    file "/var/lib/bind/zones/db.192.168.10";
     allow-transfer { none; };
 };
 EOF
-fi
 
-if [[ -n "$CLI_IP" ]]; then
-    cat >> /etc/bind/named.conf.local << EOF
-
+[[ -n "$CLI_IP" ]] && cat >> /etc/bind/named.conf.local << EOF
 zone "20.168.192.in-addr.arpa" {
     type master;
-    file "/etc/bind/db.192.168.20";
+    file "/var/lib/bind/zones/db.192.168.20";
     allow-transfer { none; };
 };
 EOF
-fi
 
 cat >> /etc/bind/named.conf.local << EOF
-
 zone "4.16.172.in-addr.arpa" {
     type master;
-    file "/etc/bind/db.172.16.4";
+    file "/var/lib/bind/zones/db.172.16.4";
     allow-transfer { none; };
 };
-
 zone "5.16.172.in-addr.arpa" {
     type master;
-    file "/etc/bind/db.172.16.5";
+    file "/var/lib/bind/zones/db.172.16.5";
     allow-transfer { none; };
 };
 EOF
 
-success "Настроен /etc/bind/named.conf.local"
+chmod 644 /etc/bind/named.conf.local
+success "named.conf.local создан"
 
-# Финальная установка прав
-chmod -R 755 /etc/bind
-chmod 644 /etc/named.conf
-chmod 644 /etc/bind/db.* 2>/dev/null || true
-
+# ============================================================================
 # Проверка конфигурации
+# ============================================================================
 info "Проверка конфигурации..."
-if named-checkconf 2>&1; then
-    success "Конфигурация проверена"
-else
-    warn "Есть предупреждения в конфигурации"
-fi
+named-checkconf
+named-checkzone "$DOMAIN" /var/lib/bind/zones/db.$DOMAIN
 
-if named-checkzone "$DOMAIN" /etc/bind/db.$DOMAIN 2>&1; then
-    success "Прямая зона OK"
-fi
-
-# Остановка старых процессов
-info "Остановка старых процессов named..."
+# ============================================================================
+# Запуск named
+# ============================================================================
+info "Остановка старых процессов..."
 pkill named 2>/dev/null || true
 sleep 2
 
-# ============================================================================
-# Запуск named с правильной рабочей директорией
-# ============================================================================
 info "Запуск named..."
-
-# Переходим в рабочую директорию BIND ПЕРЕД запуском
-cd /var/cache/bind
-
-# Создаём пустой лог-файл заранее
 touch /var/log/bind/bind.log
 chmod 644 /var/log/bind/bind.log
 
-# Запуск named (от root, без chroot)
-named -c /etc/named.conf &
-NAMED_PID=$!
+# Переходим в рабочую директорию
+cd /var/lib/bind
 
+# Запускаем named
+named -c /etc/named.conf &
 sleep 3
 
-# Проверка запуска
 if pgrep -x named &>/dev/null; then
     success "named запущен (PID: $(pgrep -x named))"
 else
-    warn "named не запустился, пробуем отладку..."
-    named -c /etc/named.conf -g 2>&1 &
-    sleep 3
-    
-    if pgrep -x named &>/dev/null; then
-        success "named запущен"
-    else
-        error "named не запустился. Проверьте конфигурацию вручную."
-    fi
+    error "named не запустился. Выполните: cd /var/lib/bind && named -c /etc/named.conf -g"
 fi
 
+# ============================================================================
 # Тестирование
+# ============================================================================
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
 echo -e "${BLUE}           ТЕСТИРОВАНИЕ DNS${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
 
-sleep 1
-if dig @$SERVER_IP hq-srv.$DOMAIN +short &>/dev/null; then
-    IP=$(dig @$SERVER_IP hq-srv.$DOMAIN +short)
-    success "✓ Прямое разрешение: hq-srv.$DOMAIN → $IP"
-else
-    warn "✗ Прямое разрешение"
-fi
-
-if [[ -n "$ROUTER_IP" ]]; then
-    if dig -x $ROUTER_IP @$SERVER_IP +short &>/dev/null; then
-        PTR=$(dig -x $ROUTER_IP @$SERVER_IP +short)
-        success "✓ Обратное разрешение: $ROUTER_IP → $PTR"
-    else
-        warn "✗ Обратное разрешение"
-    fi
-fi
-
-if dig @$SERVER_IP ya.ru +short &>/dev/null; then
-    success "✓ Внешние DNS работают"
-else
-    warn "✗ Внешние DNS"
-fi
+dig @$SERVER_IP hq-srv.$DOMAIN +short && success "✓ Прямое разрешение работает" || warn "✗ Прямое разрешение"
+[[ -n "$ROUTER_IP" ]] && dig -x $ROUTER_IP @$SERVER_IP +short && success "✓ Обратное разрешение работает"
+dig @$SERVER_IP ya.ru +short && success "✓ Внешние DNS работают" || warn "✗ Внешние DNS"
 
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}           DNS НАСТРОЕН!${NC}"
+echo -e "${GREEN}           DNS НАСТРОЕН УСПЕШНО!${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
 echo ""
-echo "Полезные команды:"
-echo "  - Статус:        ps aux | grep named"
-echo "  - Тест:          dig @$SERVER_IP hq-srv.$DOMAIN"
-echo "  - Лог:           tail -f /var/log/bind/bind.log"
-echo "  - Остановка:     pkill named"
-echo "  - Запуск:        cd /var/cache/bind && named -c /etc/named.conf &"
-echo ""
-info "Лог: $LOG_FILE"
+echo "Команды:"
+echo "  Статус:   ps aux | grep named"
+echo "  Тест:     dig @$SERVER_IP hq-srv.$DOMAIN"
+echo "  Лог:      tail -f /var/log/bind/bind.log"
+echo "  Стоп:     pkill named"
+echo "  Старт:    cd /var/lib/bind && named -c /etc/named.conf &"
