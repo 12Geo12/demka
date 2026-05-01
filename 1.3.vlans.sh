@@ -40,7 +40,6 @@ fi
 calculate_cidr() {
     local hosts=$1
     local bits=0
-    local max_hosts=1
     
     # Защита от некорректных значений
     if [ "$hosts" -lt 1 ]; then
@@ -83,12 +82,10 @@ get_iface_status() {
 # Надёжное получение MAC-адреса
 get_iface_mac() {
     local iface=$1
-    local mac
     
     # Получаем MAC из /sys/class/net
     if [ -f "/sys/class/net/${iface}/address" ]; then
-        mac=$(cat "/sys/class/net/${iface}/address")
-        echo "$mac"
+        cat "/sys/class/net/${iface}/address"
     else
         echo "N/A"
     fi
@@ -97,45 +94,17 @@ get_iface_mac() {
 # Получение IP адреса интерфейса
 get_iface_ip() {
     local iface=$1
-    local ip
     
-    ip=$(ip -4 addr show dev "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
-    echo "$ip"
-}
-
-# Получение списка существующих VLAN на интерфейсе
-get_existing_vlans() {
-    local iface=$1
-    local vlans=""
-    
-    # Ищем в /etc/net/ifaces
-    for dir in "$IFACES_DIR"/${iface}.*; do
-        if [ -d "$dir" ]; then
-            local vlan_name=$(basename "$dir")
-            vlans="$vlans $vlan_name"
-        fi
-    done
-    
-    # Также проверяем через ip link
-    local ip_vlans=$(ip -o link show | grep -E "${iface}\." | awk -F': ' '{print $2}')
-    
-    for v in $ip_vlans; do
-        if [[ ! " $vlans " =~ " $v " ]]; then
-            vlans="$vlans $v"
-        fi
-    done
-    
-    echo "$vlans"
+    ip -4 addr show dev "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1
 }
 
 # Показать существующие VLAN
 show_existing_vlans() {
     local iface=$1
+    local found=0
     
     echo ""
     echo -e "${CYAN}=== Существующие VLAN на интерфейсе $iface ===${NC}"
-    
-    local found=0
     
     # Проверяем /etc/net/ifaces
     for dir in "$IFACES_DIR"/${iface}.*; do
@@ -147,31 +116,33 @@ show_existing_vlans() {
             
             # Статус интерфейса
             local status=$(get_iface_status "$vlan_name")
+            local status_out
             if [ "$status" = "UP" ]; then
-                status="${GREEN}UP${NC}"
+                status_out="${GREEN}UP${NC}"
             else
-                status="${YELLOW}$status${NC}"
+                status_out="${YELLOW}$status${NC}"
             fi
             
             printf "  %-20s VLAN ID: %-5s IP: %-20s Статус: " "$vlan_name" "$vlan_id" "$vlan_ip"
-            echo -e "$status"
+            echo -e "$status_out"
         fi
     done
     
     # Также проверяем активные интерфейсы
-    local active_vlans=$(ip -o link show | grep -E "${iface}\." | awk -F': ' '{print $2}')
+    local active_vlans=$(ip -o link show 2>/dev/null | grep -E "${iface}\." | awk -F': ' '{print $2}')
     for v in $active_vlans; do
         if [ ! -d "$IFACES_DIR/$v" ]; then
             found=1
             local vlan_ip=$(get_iface_ip "$v")
             local status=$(get_iface_status "$v")
+            local status_out
             if [ "$status" = "UP" ]; then
-                status="${GREEN}UP${NC}"
+                status_out="${GREEN}UP${NC}"
             else
-                status="${YELLOW}$status${NC}"
+                status_out="${YELLOW}$status${NC}"
             fi
-            printf "  %-20s %s%-10s%s IP: %-20s Статус: " "$v" "${YELLOW}" "(активен, без конфига)" "${NC}" "$vlan_ip"
-            echo -e "$status"
+            printf "  %-20s %s%-10s%s IP: %-20s Статус: " "$v" "${YELLOW}" "(без конфига)" "${NC}" "$vlan_ip"
+            echo -e "$status_out"
         fi
     done
     
@@ -182,19 +153,19 @@ show_existing_vlans() {
 
 # Создание конфига VLAN
 create_vlan_config() {
-    local vlan_name=$1       # Имя/Описание
-    local vlan_id=$2         # Номер VLAN
-    local iface=$3           # Физический интерфейс
-    local network_octet=$4   # Третий октет
-    local hosts=$5           # Кол-во хостов
-    local base_net=$6        # Базовая сеть (192.168)
+    local vlan_name=$1
+    local vlan_id=$2
+    local iface=$3
+    local network_octet=$4
+    local hosts=$5
+    local base_net=$6
     
     local cidr=$(calculate_cidr "$hosts")
     local vlan_iface_name="${iface}.${vlan_id}"
     local vlan_dir="$IFACES_DIR/${vlan_iface_name}"
     local network_ip="${base_net}.${network_octet}.0"
     
-    # Формируем IP адрес (.1 для шлюза или .2 для хоста)
+    # Формируем IP адрес (.1 для шлюза)
     local ip_address="${base_net}.${network_octet}.1/${cidr}"
     local full_network="${network_ip}/${cidr}"
     
@@ -242,10 +213,12 @@ delete_vlan() {
     echo -e "${GREEN}[OK]${NC} VLAN $vlan_iface удалён"
 }
 
-# ==============================================================================
-# ПОКАЗ ИНТЕРФЕЙСОВ
-# ==============================================================================
+# Получение списка интерфейсов
+get_iface_list() {
+    ls /sys/class/net/ 2>/dev/null | grep -v -E "^(lo|docker|veth|virbr|sit|br-|flannel|cni|tun|tap|bond|gre)"
+}
 
+# Показ интерфейсов
 show_interfaces() {
     echo ""
     echo -e "${CYAN}========================================================${NC}"
@@ -253,16 +226,12 @@ show_interfaces() {
     echo -e "${CYAN}========================================================${NC}"
     echo ""
     
-    # Получаем список интерфейсов
-    local ifaces=$(ls /sys/class/net/ 2>/dev/null | grep -v -E "^(lo|docker|veth|virbr|sit|br-|flannel|cni|tun|tap|bond|gre)")
+    local ifaces=$(get_iface_list)
     
     if [ -z "$ifaces" ]; then
         echo -e "${RED}Ошибка: Не найдено подходящих сетевых интерфейсов.${NC}"
         exit 1
     fi
-    
-    # Подсчитываем количество
-    local iface_count=$(echo "$ifaces" | wc -w)
     
     # Выводим список
     echo "Обнаружены следующие сетевые интерфейсы:"
@@ -296,6 +265,13 @@ show_interfaces() {
     echo ""
 }
 
+# Выбор интерфейса по номеру
+select_interface() {
+    local idx=$1
+    local ifaces=$(get_iface_list)
+    echo "$ifaces" | sed -n "${idx}p"
+}
+
 # ==============================================================================
 # ГЛАВНОЕ МЕНЮ
 # ==============================================================================
@@ -315,23 +291,19 @@ read -p "Ваш выбор [1]: " main_action
 main_action=${main_action:-1}
 
 case "$main_action" in
-    1)
-        # Создание VLAN - продолжаем ниже
-        ;;
     2)
         # Показать VLAN
         show_interfaces
         read -p "Выберите номер интерфейса: " iface_idx
         
-        local ifaces=$(ls /sys/class/net/ 2>/dev/null | grep -v -E "^(lo|docker|veth|virbr|sit|br-|flannel|cni|tun|tap|bond|gre)")
-        local phys_iface=$(echo "$ifaces" | sed -n "${iface_idx}p")
+        PHYS_IFACE=$(select_interface "$iface_idx")
         
-        if [ -z "$phys_iface" ]; then
+        if [ -z "$PHYS_IFACE" ]; then
             echo -e "${RED}Ошибка: Неверный выбор интерфейса${NC}"
             exit 1
         fi
         
-        show_existing_vlans "$phys_iface"
+        show_existing_vlans "$PHYS_IFACE"
         exit 0
         ;;
     3)
@@ -339,17 +311,16 @@ case "$main_action" in
         show_interfaces
         read -p "Выберите номер физического интерфейса: " iface_idx
         
-        local ifaces=$(ls /sys/class/net/ 2>/dev/null | grep -v -E "^(lo|docker|veth|virbr|sit|br-|flannel|cni|tun|tap|bond|gre)")
-        local phys_iface=$(echo "$ifaces" | sed -n "${iface_idx}p")
+        PHYS_IFACE=$(select_interface "$iface_idx")
         
-        if [ -z "$phys_iface" ]; then
+        if [ -z "$PHYS_IFACE" ]; then
             echo -e "${RED}Ошибка: Неверный выбор интерфейса${NC}"
             exit 1
         fi
         
-        show_existing_vlans "$phys_iface"
+        show_existing_vlans "$PHYS_IFACE"
         echo ""
-        read -p "Введите имя VLAN для удаления (например, ${phys_iface}.10): " vlan_to_delete
+        read -p "Введите имя VLAN для удаления (например, ${PHYS_IFACE}.10): " vlan_to_delete
         
         if [ -z "$vlan_to_delete" ]; then
             echo -e "${RED}Ошибка: Не указано имя VLAN${NC}"
@@ -368,9 +339,6 @@ case "$main_action" in
         echo "Выход..."
         exit 0
         ;;
-    *)
-        # По умолчанию - создание VLAN
-        ;;
 esac
 
 # ==============================================================================
@@ -380,18 +348,17 @@ esac
 show_interfaces
 
 # Запрос выбора интерфейса
+IFACE_COUNT=$(get_iface_list | wc -w)
+
 while true; do
     read -p "Введите номер интерфейса для настройки VLAN [1]: " SELECTION
     SELECTION=${SELECTION:-1}
     
-    local ifaces=$(ls /sys/class/net/ 2>/dev/null | grep -v -E "^(lo|docker|veth|virbr|sit|br-|flannel|cni|tun|tap|bond|gre)")
-    local iface_count=$(echo "$ifaces" | wc -w)
-    
-    if [[ "$SELECTION" =~ ^[0-9]+$ ]] && [ "$SELECTION" -ge 1 ] && [ "$SELECTION" -le "$iface_count" ]; then
-        PHYS_IFACE=$(echo "$ifaces" | sed -n "${SELECTION}p")
+    if [[ "$SELECTION" =~ ^[0-9]+$ ]] && [ "$SELECTION" -ge 1 ] && [ "$SELECTION" -le "$IFACE_COUNT" ]; then
+        PHYS_IFACE=$(select_interface "$SELECTION")
         break
     else
-        echo -e "${RED}Ошибка: введите число от 1 до $iface_count${NC}"
+        echo -e "${RED}Ошибка: введите число от 1 до $IFACE_COUNT${NC}"
     fi
 done
 
