@@ -19,9 +19,9 @@ echo -e "${CYAN}========================================${NC}"
 echo ""
 
 # Массивы для интерфейсов
-declare -a INTERFACES
-declare -a IPS
-declare -a STATUSES
+INTERFACES=()
+IPS=()
+STATUSES=()
 
 # Получение интерфейсов (включая VLAN)
 get_interfaces() {
@@ -29,8 +29,11 @@ get_interfaces() {
     echo "------------------------------"
 
     local INDEX=1
-
-    # Получаем все интерфейсы с IPv4 адресами
+    local TMPFILE=$(mktemp)
+    
+    # Сохраняем вывод во временный файл
+    ip -4 -o addr show 2>/dev/null > "$TMPFILE"
+    
     while IFS= read -r line; do
         local iface=$(echo "$line" | awk '{print $2}' | cut -d@ -f1)
         local ip_cidr=$(echo "$line" | awk '{print $4}')
@@ -58,16 +61,17 @@ get_interfaces() {
             # Цвет статуса
             local status_colored
             if [ "$status" = "UP" ]; then
-                status_colored="${GREEN}$status${NC}"
+                status_colored="${GREEN}UP${NC}"
             else
                 status_colored="${YELLOW}$status${NC}"
             fi
             
             printf "%2d) %-15s [%s] (IP: %s)\n" "$INDEX" "$iface" "$status_colored" "$ip"
-            ((INDEX++))
+            INDEX=$((INDEX + 1))
         fi
-    done < <(ip -4 -o addr show 2>/dev/null)
-
+    done < "$TMPFILE"
+    
+    rm -f "$TMPFILE"
     echo ""
 }
 
@@ -90,18 +94,6 @@ select_interface() {
             else
                 echo -e "${RED}Ошибка: введите число от 1 до ${#INTERFACES[@]}${NC}"
             fi
-        elif [[ " ${INTERFACES[*]} " =~ " ${selection} " ]]; then
-            SELECTED_IFACE="$selection"
-            # Находим IP для выбранного интерфейса
-            for i in "${!INTERFACES[@]}"; do
-                if [ "${INTERFACES[$i]}" = "$selection" ]; then
-                    SELECTED_IP="${IPS[$i]}"
-                    break
-                fi
-            done
-            echo -e "${GREEN}Выбран: $SELECTED_IFACE ($SELECTED_IP)${NC}"
-            echo ""
-            return 0
         else
             echo -e "${RED}Ошибка: неверный ввод${NC}"
         fi
@@ -152,11 +144,12 @@ if [ "$IFACE_COUNT" -gt ${#INTERFACES[@]} ]; then
 fi
 
 # Массив для выбранных интерфейсов
-declare -a SELECTED_IFACES
-declare -a SELECTED_IPS
+SELECTED_IFACES=()
+SELECTED_IPS=()
 
 # Выбор интерфейсов
-for ((i=1; i<=IFACE_COUNT; i++)); do
+i=1
+while [ $i -le $IFACE_COUNT ]; do
     select_interface "Выберите интерфейс #$i: "
     
     # Проверка на дубликаты
@@ -170,19 +163,19 @@ for ((i=1; i<=IFACE_COUNT; i++)); do
     
     if [ $already_selected -eq 1 ]; then
         echo -e "${RED}Ошибка: этот интерфейс уже выбран${NC}"
-        ((i--))
         continue
     fi
     
     SELECTED_IFACES+=("$SELECTED_IFACE")
     SELECTED_IPS+=("$SELECTED_IP")
+    i=$((i + 1))
 done
 
 echo -e "${GREEN}Используем:${NC} ${SELECTED_IFACES[*]}"
 echo ""
 
 # Получаем параметры сети для каждого интерфейса
-declare -a NETWORKS
+NETWORKS=()
 
 echo -e "${WHITE}Определение параметров сети...${NC}"
 echo ""
@@ -221,9 +214,9 @@ option domain-name-servers 8.8.8.8, 8.8.4.4;
 EOF
 
 # Добавляем подсети
-for i in "${!SELECTED_IFACES[@]}"; do
-    iface="${SELECTED_IFACES[$i]}"
-    NET_INFO=(${NETWORKS[$i]})
+idx=0
+for iface in "${SELECTED_IFACES[@]}"; do
+    NET_INFO=(${NETWORKS[$idx]})
     
     cat >> /etc/dhcp/dhcpd.conf <<EOF
 
@@ -235,6 +228,7 @@ subnet ${NET_INFO[0]} netmask ${NET_INFO[1]} {
 }
 
 EOF
+    idx=$((idx + 1))
 done
 
 # Интерфейсы DHCP
