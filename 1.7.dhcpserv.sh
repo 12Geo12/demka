@@ -9,9 +9,9 @@ MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
 NC='\033[0m'
 
-echo -e "${CYAN}========================================${NC}"
-echo -e "${WHITE}     Установка DHCP сервера${NC}"
-echo -e "${CYAN}========================================${NC}"
+echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║${NC}         ${WHITE}Настройка DHCP сервера для VLAN${NC}              ${CYAN}║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 
 echo -e "${CYAN}Установка пакетов...${NC}"
 apt-get update -y > /dev/null 2>&1
@@ -19,7 +19,7 @@ apt-get install -y dhcp-server ipcalc > /dev/null 2>&1
 
 echo ""
 echo -e "${CYAN}========================================${NC}"
-echo -e "${WHITE}  Автонастройка DHCP сервера${NC}"
+echo -e "${WHITE}  Выбор VLAN интерфейса для DHCP${NC}"
 echo -e "${CYAN}========================================${NC}"
 echo ""
 
@@ -31,9 +31,9 @@ VLAN_IDS=()
 # Получение интерфейсов (включая VLAN)
 get_interfaces() {
     echo -e "${WHITE}Доступные сетевые интерфейсы:${NC}"
-    echo "--------------------------------------------------"
+    echo "------------------------------------------------------------"
     printf "%-4s %-18s %-10s %-18s %-10s\n" "№" "Интерфейс" "VLAN ID" "IP адрес" "Статус"
-    echo "--------------------------------------------------"
+    echo "------------------------------------------------------------"
     
     local INDEX=1
     local TMPFILE=$(mktemp)
@@ -147,7 +147,7 @@ if [ ${#INTERFACES[@]} -lt 1 ]; then
 fi
 
 # Спрашиваем количество интерфейсов
-echo -e "${WHITE}Сколько интерфейсов (VLAN) настроить для DHCP?${NC}"
+echo -e "${WHITE}Сколько VLAN (интерфейсов) настроить для DHCP?${NC}"
 read -p "Введите число [1]: " IFACE_COUNT
 IFACE_COUNT=${IFACE_COUNT:-1}
 
@@ -158,7 +158,7 @@ if ! [[ "$IFACE_COUNT" =~ ^[0-9]+$ ]] || [ "$IFACE_COUNT" -lt 1 ]; then
 fi
 
 if [ "$IFACE_COUNT" -gt ${#INTERFACES[@]} ]; then
-    echo -e "${RED}Ошибка: нельзя выбрать больше интерфейсов, чем доступно (${#INTERFACES[@]})${NC}"
+    echo -e "${RED}Ошибка: нельзя выбрать больше интерфейсов (${#INTERFACES[@]})${NC}"
     exit 1
 fi
 
@@ -195,6 +195,41 @@ done
 echo -e "${GREEN}Выбранные интерфейсы:${NC} ${SELECTED_IFACES[*]}"
 echo ""
 
+# =====================================================
+# НАСТРОЙКА DNS И СУФФИКСА
+# =====================================================
+
+echo -e "${CYAN}========================================${NC}"
+echo -e "${WHITE}  Настройка DNS параметров${NC}"
+echo -e "${CYAN}========================================${NC}"
+echo ""
+
+# DNS сервер
+echo -e "${WHITE}Укажите IP адрес DNS сервера${NC}"
+echo "(например, HQ-SRV: 192.168.10.2)"
+read -p "DNS сервер [8.8.8.8]: " DNS_SERVER
+DNS_SERVER=${DNS_SERVER:-8.8.8.8}
+
+# Вторичный DNS
+read -p "Вторичный DNS сервер (Enter для пропуска): " DNS_SERVER_2
+
+# DNS суффикс
+echo ""
+echo -e "${WHITE}Укажите DNS суффикс (доменное имя)${NC}"
+echo "(например: au-team.irpo)"
+read -p "DNS суффикс [au-team.irpo]: " DNS_SUFFIX
+DNS_SUFFIX=${DNS_SUFFIX:-au-team.irpo}
+
+echo ""
+echo -e "${GREEN}DNS сервер: $DNS_SERVER${NC}"
+[ -n "$DNS_SERVER_2" ] && echo -e "${GREEN}Вторичный DNS: $DNS_SERVER_2${NC}"
+echo -e "${GREEN}DNS суффикс: $DNS_SUFFIX${NC}"
+echo ""
+
+# =====================================================
+# ПАРАМЕТРЫ СЕТИ
+# =====================================================
+
 # Получаем параметры сети для каждого интерфейса
 NETWORKS=()
 
@@ -214,12 +249,15 @@ done
 
 # Подтверждение
 echo -e "${YELLOW}========================================${NC}"
-echo -e "${YELLOW}  ВАЖНО! Для работы DHCP по VLAN:${NC}"
+echo -e "${YELLOW}  ПРОВЕРЬТЕ НАСТРОЙКИ${NC}"
 echo -e "${YELLOW}========================================${NC}"
 echo ""
-echo "1. Клиенты должны быть в той же VLAN (через коммутатор или VMware)"
-echo "2. В VMware используйте LAN Segments для каждой VLAN"
-echo "3. Или настройте VLAN tagging на клиентах"
+echo -e "${WHITE}VLAN интерфейсы:${NC} ${SELECTED_IFACES[*]}"
+echo -e "${WHITE}DNS сервер:${NC} $DNS_SERVER"
+[ -n "$DNS_SERVER_2" ] && echo -e "${WHITE}Вторичный DNS:${NC} $DNS_SERVER_2"
+echo -e "${WHITE}DNS суффикс:${NC} $DNS_SUFFIX"
+echo ""
+echo -e "${YELLOW}ВАЖНО! Клиенты должны быть подключены к тем же VLAN${NC}"
 echo ""
 read -p "Продолжить настройку? (y/n): " CONFIRM
 if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
@@ -227,7 +265,10 @@ if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
     exit 0
 fi
 
-# Конфиг DHCP
+# =====================================================
+# СОЗДАНИЕ КОНФИГУРАЦИИ DHCP
+# =====================================================
+
 echo ""
 echo -e "${CYAN}Создание /etc/dhcp/dhcpd.conf...${NC}"
 
@@ -241,8 +282,9 @@ default-lease-time 600;
 max-lease-time 7200;
 authoritative;
 
-# DNS серверы
-option domain-name-servers 8.8.8.8, 8.8.4.4;
+# DNS параметры
+option domain-name "$DNS_SUFFIX";
+option domain-name-servers $DNS_SERVER$([ -n "$DNS_SERVER_2" ] && echo ", $DNS_SERVER_2");
 
 EOF
 
@@ -251,6 +293,7 @@ idx=0
 for iface in "${SELECTED_IFACES[@]}"; do
     NET_INFO=(${NETWORKS[$idx]})
     vlan_id="${SELECTED_VLANS[$idx]}"
+    gateway="${NET_INFO[5]}"
     
     # Комментарий с VLAN ID
     if [ "$vlan_id" != "-" ]; then
@@ -260,11 +303,13 @@ for iface in "${SELECTED_IFACES[@]}"; do
     
     cat >> /etc/dhcp/dhcpd.conf <<EOF
 
-# Network for $iface
+# Network for $iface (VLAN $vlan_id)
 subnet ${NET_INFO[0]} netmask ${NET_INFO[1]} {
   range ${NET_INFO[3]} ${NET_INFO[4]};
-  option routers ${NET_INFO[5]};
+  option routers ${gateway};
   option broadcast-address ${NET_INFO[2]};
+  option domain-name "$DNS_SUFFIX";
+  option domain-name-servers $DNS_SERVER$([ -n "$DNS_SERVER_2" ] && echo ", $DNS_SERVER_2");
   default-lease-time 600;
   max-lease-time 7200;
 }
@@ -279,7 +324,7 @@ echo -e "${CYAN}Настройка /etc/sysconfig/dhcpd...${NC}"
 
 cat > /etc/sysconfig/dhcpd <<EOF
 # DHCP Server Arguments
-# Interfaces: $IFACES_STR
+# VLAN Interfaces: $IFACES_STR
 DHCPDARGS="$IFACES_STR"
 EOF
 
@@ -294,6 +339,11 @@ iptables -I INPUT -p udp --dport 67 -j ACCEPT 2>/dev/null
 iptables -I INPUT -p udp --dport 68 -j ACCEPT 2>/dev/null
 iptables -I INPUT -p udp --sport 67 --dport 68 -j ACCEPT 2>/dev/null
 
+# Сохранение правил iptables
+if [ -d /etc/sysconfig ]; then
+    iptables-save > /etc/sysconfig/iptables 2>/dev/null
+fi
+
 # Перезапуск
 echo -e "${CYAN}Перезапуск DHCP...${NC}"
 systemctl enable dhcpd > /dev/null 2>&1
@@ -307,56 +357,81 @@ else
     exit 1
 fi
 
-# Итоговый вывод
+# =====================================================
+# ИТОГОВЫЙ ВЫВОД
+# =====================================================
+
 echo ""
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  НАСТРОЙКА ЗАВЕРШЕНА!${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
-echo -e "${WHITE}Интерфейсы DHCP:${NC}"
-for i in "${!SELECTED_IFACES[@]}"; do
-    iface="${SELECTED_IFACES[$i]}"
-    vlan="${SELECTED_VLANS[$i]}"
-    if [ "$vlan" != "-" ]; then
-        echo "  - $iface (VLAN $vlan)"
-    else
-        echo "  - $iface"
-    fi
-done
+echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║${NC}         ${WHITE}НАСТРОЙКА ЗАВЕРШЕНА!${NC}                        ${GREEN}║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# Показываем конфигурацию
-echo -e "${WHITE}Конфигурация DHCP:${NC}"
+echo -e "${WHITE}Параметры DHCP:${NC}"
 echo "----------------------------------------"
-cat /etc/dhcp/dhcpd.conf | grep -E "^(subnet|range|option routers|option broadcast|# VLAN)"
+echo -e "VLAN интерфейсы: ${CYAN}${SELECTED_IFACES[*]}${NC}"
+echo -e "DNS сервер:      ${CYAN}$DNS_SERVER${NC}"
+[ -n "$DNS_SERVER_2" ] && echo -e "Вторичный DNS:   ${CYAN}$DNS_SERVER_2${NC}"
+echo -e "DNS суффикс:     ${CYAN}$DNS_SUFFIX${NC}"
 echo "----------------------------------------"
 echo ""
+
+# Показываем конфигурацию подсетей
+echo -e "${WHITE}Настроенные подсети:${NC}"
+echo "----------------------------------------"
+idx=0
+for iface in "${SELECTED_IFACES[@]}"; do
+    NET_INFO=(${NETWORKS[$idx]})
+    vlan_id="${SELECTED_VLANS[$idx]}"
+    echo -e "${CYAN}VLAN $vlan_id${NC} ($iface):"
+    echo "  Сеть:      ${NET_INFO[0]}/${NET_INFO[1]}"
+    echo "  Шлюз:      ${NET_INFO[5]}"
+    echo "  Диапазон:  ${NET_INFO[3]} - ${NET_INFO[4]}"
+    echo ""
+    idx=$((idx + 1))
+done
 
 # Статус
 echo -e "${WHITE}Статус службы:${NC}"
 systemctl status dhcpd --no-pager 2>/dev/null | head -10
 
+# =====================================================
+# ИНСТРУКЦИЯ ПО ПОДКЛЮЧЕНИЮ КЛИЕНТОВ
+# =====================================================
+
 echo ""
-echo -e "${CYAN}========================================${NC}"
-echo -e "${CYAN}  КАК ПОДКЛЮЧИТЬ КЛИЕНТОВ${NC}"
-echo -e "${CYAN}========================================${NC}"
+echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║${NC}       ${WHITE}КАК ПОДКЛЮЧИТЬ КЛИЕНТОВ К VLAN${NC}             ${CYAN}║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "${YELLOW}Вариант 1: Через LAN Segment в VMware${NC}"
-echo "  1. Создайте LAN Segment для каждой VLAN"
-echo "  2. Подключите клиентскую ВМ к нужному сегменту"
-echo "  3. На клиенте запустите: dhcpcd"
+
+echo -e "${YELLOW}Вариант 1: VMware LAN Segments (рекомендуется)${NC}"
+echo "  1. VMware -> Edit -> Virtual Network Editor"
+echo "  2. Создайте LAN Segment для каждого VLAN"
+echo "  3. Подключите клиентскую ВМ к нужному сегменту"
+echo "  4. На клиенте: dhcpcd"
 echo ""
-echo -e "${YELLOW}Вариант 2: Через VLAN tagging на клиенте${NC}"
+
+echo -e "${YELLOW}Вариант 2: VLAN tagging на клиенте${NC}"
 echo "  На клиенте выполните:"
-echo "    ip link add link ens33 name ens33.<VLAN_ID> type vlan id <VLAN_ID>"
-echo "    ip link set ens33.<VLAN_ID> up"
-echo "    dhcpcd ens33.<VLAN_ID>"
 echo ""
+for vlan_id in "${SELECTED_VLANS[@]}"; do
+    if [ "$vlan_id" != "-" ]; then
+        echo -e "  ${GREEN}# Для VLAN $vlan_id:${NC}"
+        echo "  ip link add link ens33 name ens33.$vlan_id type vlan id $vlan_id"
+        echo "  ip link set ens33.$vlan_id up"
+        echo "  dhcpcd ens33.$vlan_id"
+        echo ""
+    fi
+done
+
 echo -e "${YELLOW}Вариант 3: Через управляемый коммутатор${NC}"
-echo "  Настройте access port для нужной VLAN"
+echo "  Настройте access port в нужной VLAN"
 echo ""
+
 echo -e "${CYAN}Полезные команды:${NC}"
-echo "  systemctl status dhcpd     - статус службы"
-echo "  journalctl -u dhcpd -f     - логи в реальном времени"
-echo "  dhcp-lease-list            - список выданных адресов"
+echo "  systemctl status dhcpd       - статус службы"
+echo "  journalctl -u dhcpd -f       - логи в реальном времени"
+echo "  dhcp-lease-list              - список выданных адресов"
+echo "  cat /etc/dhcp/dhcpd.conf     - конфигурация"
 echo ""
