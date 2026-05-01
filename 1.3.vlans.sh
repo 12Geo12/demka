@@ -411,10 +411,6 @@ while [ "$i" -le "$VLAN_COUNT" ]; do
     echo ""
     echo -e "${MAGENTA}--- VLAN #$i ---${NC}"
     
-    # Имя/Описание
-    read -p "Название/Описание (например, Office): " V_NAME
-    [ -z "$V_NAME" ] && V_NAME="VLAN_$i"
-    
     # ID VLAN
     while true; do
         read -p "VLAN ID (1-4094): " V_ID
@@ -449,7 +445,8 @@ while [ "$i" -le "$VLAN_COUNT" ]; do
     read -p "Требуемое кол-во хостов [254]: " V_HOSTS
     V_HOSTS=${V_HOSTS:-254}
 
-    # Сохраняем данные
+    # Сохраняем данные (имя автоматически VLAN_N)
+    V_NAME="VLAN_$i"
     echo "${V_NAME}|${V_ID}|${V_OCTET}|${V_HOSTS}" >> "$VLANS_FILE"
     
     i=$((i + 1))
