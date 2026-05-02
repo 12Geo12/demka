@@ -1,10 +1,10 @@
 #!/bin/bash
 #===============================================================================
-# NAT Setup for Demo2026 - Alt Linux
-# На основе: https://github.com/12Geo12/demka/blob/main/1.2.nat.sh
+# DHCP Server - Полная диагностика и исправление
+# Для Demo2026 - Alt Linux
 #===============================================================================
 
-# Цвета
+#--- Цвета --------------------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -13,262 +13,413 @@ CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 NC='\033[0m'
 
-# Вывод
-msg_ok() { echo -e "${GREEN}[✓]${NC} $1"; }
-msg_er() { echo -e "${RED}[✗]${NC} $1"; }
-msg_in() { echo -e "${BLUE}[i]${NC} $1"; }
+#--- Функции ------------------------------------------------------------------
+msg_ok() { echo -e "${GREEN}[OK]${NC} $1"; }
+msg_er() { echo -e "${RED}[ERR]${NC} $1"; }
+msg_in() { echo -e "${BLUE}[INFO]${NC} $1"; }
+msg_wa() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+line() { echo -e "${CYAN}================================================${NC}"; }
+
+#--- Заголовок ----------------------------------------------------------------
+clear
+echo -e "${CYAN}"
+echo "╔══════════════════════════════════════════════════════╗"
+echo "║      DHCP Server - Диагностика и Исправление         ║"
+echo "╚══════════════════════════════════════════════════════╝"
+echo -e "${NC}"
 
 # Проверка root
 if [ "$EUID" -ne 0 ]; then
-    msg_er "Запустите от root (su -)"
+    msg_er "Запустите от root: su -"
     exit 1
 fi
 
-clear
-echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║${NC} ${WHITE}NAT Setup for Demo2026${NC}"
-echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
-
-# Проверка и установка iptables
+#===============================================================================
+# 1. ИНФОРМАЦИЯ О СИСТЕМЕ
+#===============================================================================
+line
+echo -e "${WHITE}1. Системная информация${NC}"
+line
 echo ""
-msg_in "Проверка iptables..."
-if ! command -v iptables >/dev/null 2>&1; then
-    msg_in "Установка iptables..."
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update
-        apt-get install -y iptables
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y iptables
-    fi
-fi
-msg_ok "iptables установлен"
+echo -e "  Хостнейм:     ${YELLOW}$(hostname)${NC}"
+echo -e "  OS:           ${YELLOW}$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'\"' -f2)${NC}"
+echo -e "  Ядро:         ${YELLOW}$(uname -r)${NC}"
 
-# Включение IP forwarding
+#===============================================================================
+# 2. СЕТЕВЫЕ ИНТЕРФЕЙСЫ
+#===============================================================================
 echo ""
-msg_in "Проверка IP forwarding..."
-if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
-    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-fi
-sysctl -w net.ipv4.ip_forward=1 >/dev/null
-msg_ok "IP forwarding включен"
-
-# Вопрос об очистке
-echo ""
-echo -e "${YELLOW}Очистить существующие правила NAT?${NC}"
-echo "  1) Да"
-echo "  2) Нет"
-read -r -p "Выбор [1-2]: " clear_choice
-
-case "$clear_choice" in
-    1)
-        msg_in "Очистка правил..."
-        iptables -t nat -F 2>/dev/null
-        iptables -F FORWARD 2>/dev/null
-        iptables -t mangle -F 2>/dev/null
-        msg_ok "Правила очищены"
-        ;;
-esac
-
-# Получаем список интерфейсов
-echo ""
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-echo -e "${CYAN}Доступные интерфейсы:${NC}"
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+line
+echo -e "${WHITE}2. Сетевые интерфейсы${NC}"
+line
 echo ""
 
-# Создаём временный файл со списком
-TMPFILE="/tmp/nat_ifaces_$$"
-ls /sys/class/net | grep -v lo > "$TMPFILE"
-
-idx=1
-while IFS= read -r iface; do
-    ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
-    status=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo "unknown")
-    
-    # Цвет статуса
-    if [ "$status" = "up" ]; then
-        status_show="${GREEN}UP${NC}"
-    else
-        status_show="${YELLOW}$status${NC}"
-    fi
-    
-    printf "  ${GREEN}[%2d]${NC} %-15s [%b] IP: %s\n" "$idx" "$iface" "$status_show" "$ip_addr"
-    echo "$iface" >> /tmp/nat_iface_list_$$
-    idx=$((idx + 1))
-done < "$TMPFILE"
-
-rm -f "$TMPFILE"
-TOTAL=$((idx - 1))
+echo -e "${CYAN}>>> ip addr show${NC}"
+echo ""
+ip -brief addr show 2>/dev/null || ip addr show
 
 echo ""
-echo -e "${YELLOW}Выберите WAN интерфейс (к ISP/Internet):${NC}"
-read -r -p "Номер [1-$TOTAL]: " wan_num
-
-case "$wan_num" in
-    ''|*[!0-9]*)
-        msg_er "Неверный выбор"
-        rm -f /tmp/nat_iface_list_$$
-        exit 1
-        ;;
-esac
-
-WAN=$(sed -n "${wan_num}p" /tmp/nat_iface_list_$$)
-msg_ok "WAN интерфейс: $WAN"
-
-# Автоматически определяем LAN интерфейсы
+echo -e "${CYAN}>>> VLAN интерфейсы:${NC}"
 echo ""
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-echo -e "${CYAN}LAN интерфейсы (все кроме WAN):${NC}"
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-
-LAN_FILE="/tmp/nat_lan_$$"
-> "$LAN_FILE"
-LAN_NETS_FILE="/tmp/nat_nets_$$"
-> "$LAN_NETS_FILE"
-
-while IFS= read -r iface; do
-    if [ "$iface" != "$WAN" ]; then
-        ip_net=$(ip -o -f inet addr show "$iface" 2>/dev/null | awk '{print $4}')
-        if [ -n "$ip_net" ]; then
-            echo "$iface" >> "$LAN_FILE"
-            echo "$ip_net" >> "$LAN_NETS_FILE"
-            echo -e "  ${GREEN}•${NC} $iface ${YELLOW}→${NC} $ip_net"
-        fi
-    fi
-done < /tmp/nat_iface_list_$$
-
-rm -f /tmp/nat_iface_list_$$
-
-LAN_COUNT=$(wc -l < "$LAN_FILE")
-
-if [ "$LAN_COUNT" -eq 0 ]; then
-    msg_er "LAN интерфейсы не найдены"
-    rm -f "$LAN_FILE" "$LAN_NETS_FILE"
-    exit 1
-fi
-
-msg_ok "Найдено LAN интерфейсов: $LAN_COUNT"
-
-# Подтверждение
-echo ""
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-echo -e "${WHITE}WAN:${NC} $WAN"
-echo -e "${WHITE}LAN:${NC} $(cat "$LAN_FILE" | tr '\n' ' ')"
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+ip -brief addr show type vlan 2>/dev/null || echo "  (нет VLAN интерфейсов)"
 
 echo ""
-read -r -p "Применить NAT? (y/n): " confirm
-case "$confirm" in
-    [Yy]*) ;;
-    *) msg_in "Отменено"; rm -f "$LAN_FILE" "$LAN_NETS_FILE"; exit 0 ;;
-esac
-
-# Настройка NAT
+echo -e "${CYAN}>>> Таблица маршрутизации:${NC}"
 echo ""
-echo -e "${CYAN}Настройка NAT правил...${NC}"
-echo ""
+ip route show
 
-# Читаем LAN интерфейсы и сети
-idx=0
-while IFS= read -r iface && IFS= read -r net <&3; do
-    if [ -n "$net" ]; then
-        echo -e "  ${GREEN}NAT:${NC} $iface ($net) -> $WAN"
-        iptables -t nat -A POSTROUTING -o "$WAN" -s "$net" -j MASQUERADE
-    fi
-    idx=$((idx + 1))
-done < "$LAN_FILE" 3< "$LAN_NETS_FILE"
-
-# Настройка FORWARD
+#===============================================================================
+# 3. ПРОВЕРКА DHCP ПАКЕТА
+#===============================================================================
 echo ""
-echo -e "${CYAN}Настройка FORWARD цепочки...${NC}"
+line
+echo -e "${WHITE}3. Проверка DHCP пакета${NC}"
+line
 echo ""
 
-# 1. Разрешаем установленные соединения
-echo -e "  ${GREEN}Разрешение ESTABLISHED,RELATED...${NC}"
-iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+# Проверяем разные имена пакетов
+PKG_FOUND=""
+PKG_NAME=""
 
-# 2. Разрешаем LAN -> WAN
-idx=0
-while IFS= read -r iface && IFS= read -r net <&3; do
-    if [ -n "$net" ]; then
-        echo -e "  ${GREEN}FORWARD:${NC} $iface -> $WAN"
-        iptables -A FORWARD -i "$iface" -o "$WAN" -s "$net" -j ACCEPT
-    fi
-    idx=$((idx + 1))
-done < "$LAN_FILE" 3< "$LAN_NETS_FILE"
-
-# 3. Разрешаем WAN -> LAN (ответный трафик)
-while IFS= read -r iface; do
-    echo -e "  ${GREEN}FORWARD:${NC} $WAN -> $iface (ответный)"
-    iptables -A FORWARD -i "$WAN" -o "$iface" -j ACCEPT
-done < "$LAN_FILE"
-
-# 4. Разрешаем между LAN (VLAN <-> VLAN)
-if [ "$LAN_COUNT" -gt 1 ]; then
-    echo ""
-    echo -e "${CYAN}Настройка пересылки между LAN...${NC}"
-    
-    while IFS= read -r iface1; do
-        while IFS= read -r iface2; do
-            if [ "$iface1" != "$iface2" ]; then
-                echo -e "  ${GREEN}FORWARD:${NC} $iface1 <-> $iface2"
-                iptables -A FORWARD -i "$iface1" -o "$iface2" -j ACCEPT
-            fi
-        done < "$LAN_FILE"
-    done < "$LAN_FILE"
-fi
-
-rm -f "$LAN_FILE" "$LAN_NETS_FILE"
-
-# Сохранение правил
-echo ""
-msg_in "Сохранение правил..."
-
-if [ -d /etc/sysconfig ]; then
-    iptables-save > /etc/sysconfig/iptables
-    msg_ok "Правила сохранены: /etc/sysconfig/iptables"
-elif [ -d /etc/iptables ]; then
-    iptables-save > /etc/iptables/rules.v4
-    msg_ok "Правила сохранены: /etc/iptables/rules.v4"
+if rpm -q dhcp-server >/dev/null 2>&1; then
+    PKG_FOUND="yes"
+    PKG_NAME="dhcp-server"
+    msg_ok "Пакет установлен: ${YELLOW}dhcp-server${NC}"
+elif rpm -q dhcp >/dev/null 2>&1; then
+    PKG_FOUND="yes"
+    PKG_NAME="dhcp"
+    msg_ok "Пакет установлен: ${YELLOW}dhcp${NC}"
+elif dpkg -l isc-dhcp-server >/dev/null 2>&1; then
+    PKG_FOUND="yes"
+    PKG_NAME="isc-dhcp-server"
+    msg_ok "Пакет установлен: ${YELLOW}isc-dhcp-server${NC}"
 else
-    mkdir -p /etc/sysconfig
-    iptables-save > /etc/sysconfig/iptables
-    msg_ok "Правила сохранены: /etc/sysconfig/iptables"
+    PKG_FOUND="no"
+    msg_wa "Пакет DHCP не установлен!"
 fi
 
-# Включение сервиса iptables
-if command -v systemctl >/dev/null 2>&1; then
-    if systemctl list-unit-files 2>/dev/null | grep -q "^iptables.service"; then
-        systemctl enable iptables --now 2>/dev/null
-        msg_ok "Сервис iptables включен"
+# Проверяем команду dhcpd
+echo ""
+echo -e "${CYAN}>>> which dhcpd${NC}"
+if which dhcpd 2>/dev/null; then
+    msg_ok "Команда dhcpd найдена"
+else
+    msg_wa "Команда dhcpd НЕ найдена в PATH"
+fi
+
+# Прямой поиск
+echo ""
+echo -e "${CYAN}>>> Поиск dhcpd:${NC}"
+find /usr -name "dhcpd" -type f 2>/dev/null | head -5
+
+#===============================================================================
+# 4. УСТАНОВКА DHCP (если нужно)
+#===============================================================================
+if [ "$PKG_FOUND" = "no" ]; then
+    echo ""
+    line
+    echo -e "${WHITE}4. Установка DHCP сервера${NC}"
+    line
+    echo ""
+    
+    msg_in "Определение пакетного менеджера..."
+    
+    if command -v apt-get >/dev/null 2>&1; then
+        msg_in "Установка dhcp-server через apt-get..."
+        apt-get update
+        apt-get install -y dhcp-server
+    elif command -v dnf >/dev/null 2>&1; then
+        msg_in "Установка dhcp-server через dnf..."
+        dnf install -y dhcp-server
+    elif command -v yum >/dev/null 2>&1; then
+        msg_in "Установка dhcp через yum..."
+        yum install -y dhcp
+    fi
+    
+    # Повторная проверка
+    if which dhcpd >/dev/null 2>&1; then
+        msg_ok "DHCP установлен успешно!"
+    else
+        msg_er "Ошибка установки DHCP!"
+        exit 1
     fi
 fi
 
-# Показать результат
+#===============================================================================
+# 5. КОНФИГУРАЦИЯ DHCP
+#===============================================================================
 echo ""
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-echo -e "${WHITE}NAT таблица:${NC}"
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-iptables -t nat -L -n -v --line-numbers 2>/dev/null | head -20
+line
+echo -e "${WHITE}5. Конфигурация DHCP${NC}"
+line
+echo ""
+
+DHCP_CONF="/etc/dhcp/dhcpd.conf"
+
+if [ -f "$DHCP_CONF" ]; then
+    echo -e "${CYAN}>>> cat $DHCP_CONF${NC}"
+    echo ""
+    cat "$DHCP_CONF"
+else
+    msg_wa "Конфиг не существует: $DHCP_CONF"
+fi
+
+#===============================================================================
+# 6. ИНТЕРФЕЙСЫ ДЛЯ DHCP
+#===============================================================================
+echo ""
+line
+echo -e "${WHITE}6. Интерфейсы для DHCP${NC}"
+line
+echo ""
+
+if [ -f /etc/sysconfig/dhcpd ]; then
+    echo -e "${CYAN}>>> cat /etc/sysconfig/dhcpd${NC}"
+    cat /etc/sysconfig/dhcpd
+elif [ -f /etc/default/isc-dhcp-server ]; then
+    echo -e "${CYAN}>>> cat /etc/default/isc-dhcp-server${NC}"
+    cat /etc/default/isc-dhcp-server
+else
+    msg_wa "Файл интерфейсов не найден"
+fi
+
+#===============================================================================
+# 7. ПРОВЕРКА КОНФИГУРАЦИИ
+#===============================================================================
+echo ""
+line
+echo -e "${WHITE}7. Проверка конфигурации${NC}"
+line
+echo ""
+
+echo -e "${CYAN}>>> dhcpd -t -cf $DHCP_CONF${NC}"
+echo ""
+
+if dhcpd -t -cf "$DHCP_CONF" 2>&1; then
+    msg_ok "Конфигурация валидна"
+else
+    msg_er "Ошибка в конфигурации!"
+fi
+
+#===============================================================================
+# 8. СТАТУС СЕРВИСА
+#===============================================================================
+echo ""
+line
+echo -e "${WHITE}8. Статус сервиса${NC}"
+line
+echo ""
+
+# Ищем имя сервиса
+SERVICE_NAME=""
+for svc in dhcpd dhcp-server isc-dhcp-server; do
+    if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+        SERVICE_NAME="$svc"
+        break
+    fi
+done
+
+if [ -n "$SERVICE_NAME" ]; then
+    echo -e "${CYAN}>>> systemctl status $SERVICE_NAME${NC}"
+    echo ""
+    systemctl status "$SERVICE_NAME" --no-pager 2>&1 | head -20
+else
+    msg_wa "Сервис DHCP не найден"
+fi
+
+#===============================================================================
+# 9. ПОРТЫ
+#===============================================================================
+echo ""
+line
+echo -e "${WHITE}9. Проверка портов (UDP 67)${NC}"
+line
+echo ""
+
+echo -e "${CYAN}>>> ss -ulnp | grep 67${NC}"
+ss -ulnp 2>/dev/null | grep 67 || echo "  (порт 67 не слушается)"
+
+#===============================================================================
+# 10. ДЕЙСТВИЕ
+#===============================================================================
+echo ""
+line
+echo -e "${WHITE}10. Что сделать?${NC}"
+line
+echo ""
+echo "  1) Создать новую конфигурацию DHCP (автоопределение)"
+echo "  2) Перезапустить DHCP сервис"
+echo "  3) Показать логи"
+echo "  4) Выход"
+echo ""
+read -r -p "Выбор [1-4]: " action
+
+case "$action" in
+    1)
+        #=======================================================================
+        # СОЗДАНИЕ КОНФИГУРАЦИИ
+        #=======================================================================
+        echo ""
+        line
+        echo -e "${WHITE}Создание конфигурации${NC}"
+        line
+        echo ""
+        
+        # Функция преобразования префикса в маску
+        prefix_to_mask() {
+            case "$1" in
+                24) echo "255.255.255.0" ;;
+                25) echo "255.255.255.128" ;;
+                26) echo "255.255.255.192" ;;
+                27) echo "255.255.255.224" ;;
+                28) echo "255.255.255.240" ;;
+                29) echo "255.255.255.248" ;;
+                30) echo "255.255.255.252" ;;
+                *)  echo "255.255.255.0" ;;
+            esac
+        }
+        
+        # Показываем интерфейсы
+        echo -e "${CYAN}Интерфейсы для DHCP:${NC}"
+        echo ""
+        
+        TMPFILE="/tmp/dhcp_ifaces_$$"
+        > "$TMPFILE"
+        
+        idx=0
+        for iface in $(ip -brief addr show 2>/dev/null | grep -v "^lo" | awk '{print $1}'); do
+            ip_info=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
+            [ -z "$ip_info" ] && continue
+            
+            ip=$(echo "$ip_info" | cut -d'/' -f1)
+            prefix=$(echo "$ip_info" | cut -d'/' -f2)
+            
+            printf "  ${GREEN}[%d]${NC} %-15s %s\n" "$((idx+1))" "$iface" "$ip_info"
+            echo "$iface|$ip|$prefix" >> "$TMPFILE"
+            idx=$((idx + 1))
+        done
+        
+        TOTAL=$idx
+        
+        if [ $TOTAL -eq 0 ]; then
+            msg_er "Нет интерфейсов с IP"
+            rm -f "$TMPFILE"
+            exit 1
+        fi
+        
+        echo ""
+        echo -e "${YELLOW}Выберите интерфейс [1-$TOTAL] или 'all':${NC}"
+        read -r -p "> " sel
+        
+        # Бэкап
+        [ -f "$DHCP_CONF" ] && cp "$DHCP_CONF" "${DHCP_CONF}.bak"
+        
+        # Создаём конфиг
+        cat > "$DHCP_CONF" << 'HEADER'
+# DHCP Configuration - Demo2026
+authoritative;
+default-lease-time 600;
+max-lease-time 7200;
+log-facility local7;
+option domain-name "au-team.irpo";
+
+HEADER
+        
+        SELECTED_IFACES=""
+        
+        generate_subnet() {
+            local data=$1
+            local iface=$(echo "$data" | cut -d'|' -f1)
+            local ip=$(echo "$data" | cut -d'|' -f2)
+            local prefix=$(echo "$data" | cut -d'|' -f3)
+            
+            local mask=$(prefix_to_mask "$prefix")
+            local o1=$(echo "$ip" | cut -d'.' -f1)
+            local o2=$(echo "$ip" | cut -d'.' -f2)
+            local o3=$(echo "$ip" | cut -d'.' -f3)
+            local network="${o1}.${o2}.${o3}.0"
+            local gateway="${o1}.${o2}.${o3}.1"
+            
+            # Диапазон
+            case "$prefix" in
+                26) last=62 ;;
+                27) last=30 ;;
+                28) last=14 ;;
+                29) last=6 ;;
+                *)  last=254 ;;
+            esac
+            local range="${o1}.${o2}.${o3}.2 ${o1}.${o2}.${o3}.${last}"
+            
+            echo "# Interface $iface (/${prefix})"
+            echo "subnet $network netmask $mask {"
+            echo "    range $range;"
+            echo "    option domain-name-servers $gateway;"
+            echo "    option domain-name \"au-team.irpo\";"
+            echo "    option routers $gateway;"
+            echo "}"
+            echo ""
+        }
+        
+        if [ "$sel" = "all" ]; then
+            while IFS= read -r line; do
+                generate_subnet "$line" >> "$DHCP_CONF"
+                iface=$(echo "$line" | cut -d'|' -f1)
+                SELECTED_IFACES="$SELECTED_IFACES $iface"
+            done < "$TMPFILE"
+        else
+            data=$(sed -n "${sel}p" "$TMPFILE")
+            generate_subnet "$data" >> "$DHCP_CONF"
+            SELECTED_IFACES=$(echo "$data" | cut -d'|' -f1)
+        fi
+        
+        rm -f "$TMPFILE"
+        
+        msg_ok "Конфиг создан: $DHCP_CONF"
+        
+        # Интерфейсы
+        if [ -d /etc/sysconfig ]; then
+            echo "DHCPDARGS=\"$SELECTED_IFACES\"" > /etc/sysconfig/dhcpd
+            msg_ok "Интерфейсы: /etc/sysconfig/dhcpd"
+        fi
+        
+        # Показываем
+        echo ""
+        cat "$DHCP_CONF"
+        
+        # Проверка
+        echo ""
+        msg_in "Проверка конфигурации..."
+        dhcpd -t -cf "$DHCP_CONF" 2>&1 && msg_ok "OK" || msg_er "Ошибка!"
+        
+        # Запуск
+        echo ""
+        msg_in "Запуск DHCP..."
+        systemctl stop dhcpd 2>/dev/null
+        systemctl enable --now dhcpd 2>/dev/null || systemctl enable --now dhcp-server 2>/dev/null
+        
+        sleep 2
+        systemctl status dhcpd --no-pager 2>&1 | head -10
+        ;;
+        
+    2)
+        echo ""
+        msg_in "Перезапуск DHCP..."
+        systemctl restart dhcpd 2>/dev/null || systemctl restart dhcp-server 2>/dev/null || systemctl restart isc-dhcp-server 2>/dev/null
+        sleep 2
+        systemctl status dhcpd --no-pager 2>&1 | head -10
+        ;;
+        
+    3)
+        echo ""
+        echo -e "${CYAN}>>> journalctl -u dhcpd -n 30${NC}"
+        journalctl -u dhcpd -n 30 --no-pager 2>/dev/null || journalctl -u dhcp-server -n 30 --no-pager 2>/dev/null
+        ;;
+        
+    4)
+        msg_in "Выход"
+        ;;
+esac
 
 echo ""
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-echo -e "${WHITE}FORWARD цепочка:${NC}"
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-iptables -L FORWARD -n -v --line-numbers 2>/dev/null | head -20
+msg_ok "Готово!"
 
-# Итог
-echo ""
-echo -e "${GREEN}╔══════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║  NAT настроен!                               ║${NC}"
-echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
-echo ""
-echo -e "  ${WHITE}WAN:${NC} $WAN"
-echo ""
-echo -e "${CYAN}Проверка:${NC}"
-echo -e "  ${YELLOW}ping 8.8.8.8${NC}      - проверить связь"
-echo -e "  ${YELLOW}ping google.com${NC}  - проверить DNS"
-echo ""
-echo -e "${YELLOW}На клиенте:${NC}"
-echo -e "  ${WHITE}echo 'nameserver 8.8.8.8' > /etc/resolv.conf${NC}"
-echo -e "  ${WHITE}ping 8.8.8.8${NC}"
