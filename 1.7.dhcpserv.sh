@@ -554,24 +554,23 @@ if [ "$IFACE_COUNT" -gt ${#INTERFACES[@]} ]; then
 fi
 
 # Выбор интерфейсов
-local i
+i=0
 for i in $(seq 1 $IFACE_COUNT); do
     while true; do
         echo -e "${YELLOW}Выберите интерфейс #$i:${NC}"
         read -p "Введите номер: " selection
         
         if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le ${#INTERFACES[@]} ]; then
-            local idx=$((selection - 1))
-            local iface="${INTERFACES[$idx]}"
+            idx=$((selection - 1))
+            iface="${INTERFACES[$idx]}"
             
             # Проверка дубликатов
-            local duplicate=0
-            local j
+            duplicate=0
             for j in "${SELECTED_IFACES[@]}"; do
                 [ "$j" = "$iface" ] && duplicate=1
             done
             
-            if [ $duplicate -eq 0 ]; then
+            if [ "$duplicate" -eq 0 ]; then
                 SELECTED_IFACES+=("$iface")
                 SELECTED_VLANS+=("${VLAN_IDS[$idx]}")
                 SELECTED_IPS+=("${IPS[$idx]}")
