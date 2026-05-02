@@ -2,7 +2,7 @@
 
 # =============================================
 # СКРИПТ НАСТРОЙКИ DHCP СЕРВЕРА ДЛЯ ALT SERVER
-# Версия: 4.1 - Исправлена совместимость
+# Версия: 4.2 - Проверенная и исправленная
 # =============================================
 # 
 # Соответствует требованиям задания Demo2026:
@@ -77,7 +77,7 @@ cleanup_on_error() {
     rm -f "$DHCP_CONF" 2>/dev/null
     rm -f "$DHCP_SYSCONFIG" 2>/dev/null
     
-    # Удаляем правила iptables
+    # Удаляем правила iptables для DHCP
     iptables -D INPUT -p udp --dport 67 -j ACCEPT 2>/dev/null
     iptables -D INPUT -p udp --dport 68 -j ACCEPT 2>/dev/null
     
@@ -104,6 +104,34 @@ check_alt_linux() {
         echo -e "${YELLOW}⚠ Внимание: Система не Alt Linux.${NC}"
         log "WARN: Non-Alt Linux system"
         return 1
+    fi
+}
+
+# Проверка существующей установки DHCP
+check_existing_dhcp() {
+    if systemctl is-active --quiet dhcpd 2>/dev/null || systemctl is-active --quiet isc-dhcp-server 2>/dev/null; then
+        echo -e "${YELLOW}⚠ Обнаружен запущенный DHCP сервер!${NC}"
+        echo ""
+        echo "Остановить и перенастроить?"
+        select STOP_DHCP in "Да" "Нет (выход)";
+        do
+            case $STOP_DHCP in
+                "Да")
+                    echo -e "${YELLOW}Остановка DHCP сервера...${NC}"
+                    systemctl stop dhcpd 2>/dev/null
+                    systemctl stop isc-dhcp-server 2>/dev/null
+                    echo -e "${GREEN}DHCP сервер остановлен${NC}"
+                    break
+                    ;;
+                "Нет (выход)")
+                    echo "Выход..."
+                    exit 0
+                    ;;
+                *)
+                    echo "Выберите 1 или 2"
+                    ;;
+            esac
+        done
     fi
 }
 
@@ -173,6 +201,22 @@ calculate_network_params() {
     CALC_GATEWAY="$gateway_ip"
 }
 
+# Получение статуса интерфейса (как в NAT скрипте)
+get_iface_status() {
+    local iface=$1
+    
+    if [ -f "/sys/class/net/${iface}/operstate" ]; then
+        local state=$(cat "/sys/class/net/${iface}/operstate")
+        case "$state" in
+            up|UP) echo "UP" ;;
+            down|DOWN) echo "DOWN" ;;
+            *) echo "$state" ;;
+        esac
+    else
+        echo "UNKNOWN"
+    fi
+}
+
 # Получение списка интерфейсов (исправлено для совместимости)
 get_interfaces() {
     local INDEX=1
@@ -196,9 +240,8 @@ get_interfaces() {
             vlan_id="${BASH_REMATCH[1]}"
         fi
         
-        # Определяем статус
-        local status=$(ip link show "$iface" 2>/dev/null | grep -o "state [A-Z]*" | awk '{print $2}')
-        [ -z "$status" ] && status="UNKNOWN"
+        # Определяем статус (как в NAT скрипте)
+        local status=$(get_iface_status "$iface")
         
         if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
             INTERFACES+=("$iface")
@@ -206,10 +249,18 @@ get_interfaces() {
             VLAN_IDS+=("$vlan_id")
             STATUSES+=("$status")
             
-            if [ "$vlan_id" != "-" ]; then
-                printf "${MAGENTA}%2d${NC}) %-18s ${CYAN}VID %-5s${NC} %-18s %s\n" "$INDEX" "$iface" "$vlan_id" "$ip" "$status"
+            # Цветной статус
+            local status_out
+            if [ "$status" = "UP" ]; then
+                status_out="${GREEN}UP${NC}"
             else
-                printf "%2d) %-18s %-10s %-18s %s\n" "$INDEX" "$iface" "$vlan_id" "$ip" "$status"
+                status_out="${YELLOW}$status${NC}"
+            fi
+            
+            if [ "$vlan_id" != "-" ]; then
+                printf "${MAGENTA}%2d${NC}) %-18s ${CYAN}VID %-5s${NC} %-18s %b\n" "$INDEX" "$iface" "$vlan_id" "$ip" "$status_out"
+            else
+                printf "%2d) %-18s %-10s %-18s %b\n" "$INDEX" "$iface" "$vlan_id" "$ip" "$status_out"
             fi
             INDEX=$((INDEX + 1))
         fi
@@ -347,10 +398,16 @@ verify_config() {
     fi
 }
 
-# Настройка IP форвардинга
+# Настройка IP форвардинга (как в NAT скрипте)
 enable_ip_forward() {
     echo -e "${CYAN}→ Включение IP форвардинга...${NC}"
     log "INFO: Enabling IP forwarding"
+    
+    # Определяем файл sysctl (как в NAT скрипте)
+    local SYSCTL_FILE="/etc/sysctl.conf"
+    if [ -f /etc/net/sysctl.conf ]; then
+        SYSCTL_FILE="/etc/net/sysctl.conf"
+    fi
     
     # Проверяем текущее состояние
     if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" -eq 1 ]; then
@@ -358,9 +415,11 @@ enable_ip_forward() {
         return 0
     fi
     
-    # Добавляем в sysctl.conf если нет
-    if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
-        echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    # Добавляем или исправляем в sysctl.conf
+    if ! grep -q "net.ipv4.ip_forward" "$SYSCTL_FILE" 2>/dev/null; then
+        echo "net.ipv4.ip_forward = 1" >> "$SYSCTL_FILE"
+    else
+        sed -i 's/net.ipv4.ip_forward.*/net.ipv4.ip_forward = 1/' "$SYSCTL_FILE"
     fi
     
     # Применяем
@@ -370,7 +429,7 @@ enable_ip_forward() {
     log "INFO: IP forwarding enabled"
 }
 
-# Настройка firewall
+# Настройка firewall (улучшено как в NAT скрипте)
 configure_firewall() {
     echo -e "${CYAN}→ Настройка firewall...${NC}"
     log "INFO: Configuring firewall"
@@ -383,21 +442,37 @@ configure_firewall() {
     fi
     
     # Добавляем правила для DHCP (проверяем наличие перед добавлением)
+    echo -e "  ${GREEN}Разрешение DHCP портов (67, 68 UDP)...${NC}"
+    
     if ! iptables -C INPUT -p udp --dport 67 -j ACCEPT 2>/dev/null; then
         iptables -I INPUT -p udp --dport 67 -j ACCEPT
+        echo -e "    ${GREEN}✓ Порт 67 UDP открыт${NC}"
+    else
+        echo -e "    ${YELLOW}Порт 67 UDP уже открыт${NC}"
     fi
     
     if ! iptables -C INPUT -p udp --dport 68 -j ACCEPT 2>/dev/null; then
         iptables -I INPUT -p udp --dport 68 -j ACCEPT
+        echo -e "    ${GREEN}✓ Порт 68 UDP открыт${NC}"
+    else
+        echo -e "    ${YELLOW}Порт 68 UDP уже открыт${NC}"
     fi
     
-    # Сохраняем правила (для Alt Linux)
+    # Сохраняем правила (как в NAT скрипте)
     if [ -d "/etc/sysconfig" ]; then
         iptables-save > /etc/sysconfig/iptables 2>/dev/null
-        systemctl enable iptables 2>/dev/null
+        echo -e "  ${GREEN}✓ Правила сохранены в /etc/sysconfig/iptables${NC}"
+    elif [ -d "/etc/iptables" ]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        echo -e "  ${GREEN}✓ Правила сохранены в /etc/iptables/rules.v4${NC}"
     fi
     
-    echo -e "${GREEN}✓ Firewall настроен (порты 67, 68 UDP открыты)${NC}"
+    # Включаем iptables сервис (как в NAT скрипте)
+    if systemctl list-unit-files 2>/dev/null | grep -q "^iptables.service"; then
+        systemctl enable iptables --now 2>/dev/null
+    fi
+    
+    echo -e "${GREEN}✓ Firewall настроен${NC}"
     log "INFO: Firewall configured"
 }
 
@@ -408,8 +483,8 @@ start_dhcp_server() {
     
     # Определяем имя службы
     local service_name="dhcpd"
-    if ! systemctl list-unit-files | grep -q "^dhcpd.service"; then
-        if systemctl list-unit-files | grep -q "^isc-dhcp-server.service"; then
+    if ! systemctl list-unit-files 2>/dev/null | grep -q "^dhcpd.service"; then
+        if systemctl list-unit-files 2>/dev/null | grep -q "^isc-dhcp-server.service"; then
             service_name="isc-dhcp-server"
         fi
     fi
@@ -473,11 +548,19 @@ print_summary() {
         echo ""
     done
     
-    echo -e "${WHITE}Статус службы:${NC} $(systemctl is-active dhcpd 2>/dev/null || systemctl is-active isc-dhcp-server 2>/dev/null)"
+    local active_service="dhcpd"
+    if systemctl is-active --quiet isc-dhcp-server 2>/dev/null; then
+        active_service="isc-dhcp-server"
+    fi
+    
+    echo -e "${WHITE}Статус службы:${NC} $(systemctl is-active "$active_service" 2>/dev/null)"
     echo -e "${WHITE}Конфигурация:${NC}   $DHCP_CONF"
     echo ""
+    echo -e "${CYAN}===== Текущие правила iptables для DHCP =====${NC}"
+    iptables -L INPUT -n -v --line-numbers 2>/dev/null | grep -E "dpt:67|dpt:68" || echo "Правила не найдены"
+    echo ""
     echo -e "${YELLOW}Проверка работы:${NC}"
-    echo "  journalctl -u dhcpd -f"
+    echo "  journalctl -u $active_service -f"
     echo "  tail -f /var/log/messages | grep dhcp"
     echo ""
 }
@@ -499,12 +582,16 @@ log "INFO: ========== Начало настройки DHCP =========="
 clear
 echo -e "${CYAN}════════════════════════════════════════════════════${NC}"
 echo -e "${WHITE}     НАСТРОЙКА DHCP СЕРВЕРА ДЛЯ ALT SERVER${NC}"
-echo -e "${WHITE}             Версия 4.1 (Demo2026)${NC}"
+echo -e "${WHITE}             Версия 4.2 (Demo2026)${NC}"
 echo -e "${CYAN}════════════════════════════════════════════════════${NC}"
 echo ""
 
 # Проверка ОС
 check_alt_linux
+echo ""
+
+# Проверка существующего DHCP
+check_existing_dhcp
 echo ""
 
 # Установка пакетов
@@ -660,3 +747,4 @@ print_summary
 log "INFO: ========== Настройка DHCP завершена =========="
 
 exit 0
+
