@@ -44,7 +44,6 @@ detect_pkg_manager() {
         SERVICE_NAME="dhcpd"
     else
         msg_er "Пакетный менеджер не найден"
-        msg_in "Попробуйте: apt-get install dhcp-server"
         exit 1
     fi
     msg_ok "Пакетный менеджер: $PKG_MANAGER"
@@ -66,32 +65,13 @@ echo -e "\n${BLUE}Поиск VLAN интерфейсов...${NC}\n"
 TMPFILE="/tmp/dhcp_ifaces_$$"
 
 # Получаем список VLAN интерфейсов
-ip -br addr show type vlan > "$TMPFILE" 2>/dev/null
+ip -br addr show type vlan 2>/dev/null | grep -v "^$" > "$TMPFILE"
+
 if [ ! -s "$TMPFILE" ]; then
-    ip -br addr show | grep -v "^lo" > "$TMPFILE"
+    ip -br addr show 2>/dev/null | grep -v "^lo" > "$TMPFILE"
 fi
 
-# Считаем количество
-TOTAL=0
-
-# Сначала считаем и показываем
-while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    
-    iface=$(echo "$line" | awk '{print $1}')
-    ip_full=$(echo "$line" | awk '{print $3}')
-    [ -z "$ip_full" ] && continue
-    
-    TOTAL=$((TOTAL + 1))
-done < "$TMPFILE"
-
-if [ $TOTAL -eq 0 ]; then
-    msg_er "VLAN интерфейсы не найдены"
-    rm -f "$TMPFILE"
-    exit 1
-fi
-
-# Массивы для хранения (используем файлы)
+# Файлы для данных
 IFACE_FILE="/tmp/dhcp_iface_$$"
 IPS_FILE="/tmp/dhcp_ips_$$"
 MASKS_FILE="/tmp/dhcp_masks_$$"
@@ -114,16 +94,22 @@ idx=0
 while IFS= read -r line; do
     [ -z "$line" ] && continue
     
-    iface=$(echo "$line" | awk '{print $1}')
+    # Получаем имя интерфейса (первое слово)
+    iface_full=$(echo "$line" | awk '{print $1}')
+    
+    # Очищаем имя от @suffix (ens37.100@ens37 -> ens37.100)
+    iface=$(echo "$iface_full" | cut -d'@' -f1)
+    
     ip_full=$(echo "$line" | awk '{print $3}')
     [ -z "$ip_full" ] && continue
     
     ip=$(echo "$ip_full" | cut -d'/' -f1)
     
     # Определяем VLAN ID из имени интерфейса
+    # ens37.100 -> 100, vlan100 -> 100
     case "$iface" in
         *.*)
-            vid=$(echo "$iface" | cut -d'.' -f2 | cut -d'@' -f1)
+            vid=$(echo "$iface" | cut -d'.' -f2)
             ;;
         vlan*)
             vid=$(echo "$iface" | sed 's/vlan//')
@@ -191,6 +177,14 @@ done < "$TMPFILE"
 
 rm -f "$TMPFILE"
 
+TOTAL=$idx
+
+if [ $TOTAL -eq 0 ]; then
+    msg_er "Интерфейсы с IP не найдены"
+    rm -f "$IFACE_FILE" "$IPS_FILE" "$MASKS_FILE" "$GATES_FILE" "$RANGES_FILE" "$DNS_FILE" "$NETS_FILE" "$VIDS_FILE"
+    exit 1
+fi
+
 # Выбор интерфейса
 echo ""
 read -r -p "Выберите интерфейс [1-$TOTAL]: " num
@@ -209,7 +203,7 @@ if [ "$num" -lt 1 ] || [ "$num" -gt "$TOTAL" ]; then
     exit 1
 fi
 
-# Получаем значения по номеру строки
+# Получаем значения
 IFACE=$(sed -n "${num}p" "$IFACE_FILE")
 IP=$(sed -n "${num}p" "$IPS_FILE")
 MASK=$(sed -n "${num}p" "$MASKS_FILE")
@@ -300,7 +294,7 @@ echo ""
 # Настройка интерфейса в sysconfig
 if [ -d /etc/sysconfig ]; then
     echo "DHCPDARGS=\"$IFACE\"" > /etc/sysconfig/dhcpd
-    msg_ok "Интерфейс настроен: $IFACE"
+    msg_ok "Интерфейс в sysconfig: $IFACE"
 fi
 
 # Firewall
@@ -310,11 +304,11 @@ if command -v nft >/dev/null 2>&1; then
     nft add chain inet filter input { type filter hook input priority 0 \; } 2>/dev/null
     nft add rule inet filter input udp dport 67 accept 2>/dev/null
     nft add rule inet filter input udp dport 68 accept 2>/dev/null
-    msg_ok "Firewall настроен (nftables)"
+    msg_ok "Firewall (nftables)"
 elif command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p udp --dport 67 -j ACCEPT 2>/dev/null
     iptables -I INPUT -p udp --dport 68 -j ACCEPT 2>/dev/null
-    msg_ok "Firewall настроен (iptables)"
+    msg_ok "Firewall (iptables)"
 fi
 
 # Проверка конфига
@@ -337,7 +331,10 @@ if systemctl is-active --quiet $SERVICE_NAME; then
     msg_ok "DHCP сервер запущен!"
 else
     msg_er "Ошибка запуска"
+    echo ""
     systemctl status $SERVICE_NAME --no-pager
+    echo ""
+    msg_in "Журнал:"
     journalctl -u $SERVICE_NAME -n 20 --no-pager
     exit 1
 fi
