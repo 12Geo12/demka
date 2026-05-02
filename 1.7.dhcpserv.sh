@@ -39,6 +39,15 @@ declare -a GATES
 declare -a RANGES
 declare -a DNS
 
+# Создаём временный файл для вывода
+TMPFILE="/tmp/dhcp_ifaces_$$"
+
+# Получаем список интерфейсов
+ip -br addr show type vlan > "$TMPFILE" 2>/dev/null
+if [ ! -s "$TMPFILE" ]; then
+    ip -br addr show | grep -v "^lo" > "$TMPFILE"
+fi
+
 idx=0
 while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -50,7 +59,10 @@ while IFS= read -r line; do
     ip=$(echo "$ip_full" | cut -d'/' -f1)
     
     # Определение параметров по IP
-    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    o1=$(echo "$ip" | cut -d'.' -f1)
+    o2=$(echo "$ip" | cut -d'.' -f2)
+    o3=$(echo "$ip" | cut -d'.' -f3)
+    o4=$(echo "$ip" | cut -d'.' -f4)
     
     case "$o3" in
         1)
@@ -88,8 +100,10 @@ while IFS= read -r line; do
     
     echo -e "  ${GREEN}[$((idx+1))]${NC} $iface ${YELLOW}→${NC} $ip ${CYAN}($net)${NC}"
     
-    ((idx++))
-done < <(ip -br addr show type vlan 2>/dev/null || ip -br addr show | grep -v "^lo")
+    idx=$((idx + 1))
+done < "$TMPFILE"
+
+rm -f "$TMPFILE"
 
 TOTAL=$idx
 
@@ -99,7 +113,12 @@ TOTAL=$idx
 echo ""
 read -r -p "Выберите интерфейс [1-$TOTAL]: " num
 
-if ! [[ "$num" =~ ^[0-9]+$ ]] || [ "$num" -lt 1 ] || [ "$num" -gt "$TOTAL" ]; then
+if ! echo "$num" | grep -qE '^[0-9]+$'; then
+    msg_er "Неверный выбор"
+    exit 1
+fi
+
+if [ "$num" -lt 1 ] || [ "$num" -gt "$TOTAL" ]; then
     msg_er "Неверный выбор"
     exit 1
 fi
@@ -113,12 +132,16 @@ RANGE="${RANGES[$SEL]}"
 DNS_IP="${DNS[$SEL]}"
 
 # Получаем сеть
-IFS='.' read -r o1 o2 o3 o4 <<< "$IP"
+o3=$(echo "$IP" | cut -d'.' -f3)
 case "$o3" in
     1) NETWORK="192.168.1.0" ;;
     2) NETWORK="192.168.2.0" ;;
     3) NETWORK="192.168.3.0" ;;
-    *) NETWORK="${o1}.${o2}.${o3}.0" ;;
+    *) 
+        o1=$(echo "$IP" | cut -d'.' -f1)
+        o2=$(echo "$IP" | cut -d'.' -f2)
+        NETWORK="${o1}.${o2}.${o3}.0"
+        ;;
 esac
 
 # Показ параметров
@@ -134,7 +157,10 @@ echo -e "  Суффикс:    ${YELLOW}$DNS_SUFFIX${NC}"
 echo ""
 
 read -r -p "Применить? (y/n): " confirm
-[[ ! "$confirm" =~ ^[Yy]$ ]] && { msg_in "Отменено"; exit 0; }
+case "$confirm" in
+    [Yy]*) ;;
+    *) msg_in "Отменено"; exit 0 ;;
+esac
 
 # Установка пакета
 echo ""
@@ -166,13 +192,13 @@ echo "DHCPDARGS=\"$IFACE\"" > /etc/sysconfig/dhcpd
 msg_ok "Интерфейс настроен: $IFACE"
 
 # Firewall
-if command -v nft &>/dev/null; then
+if command -v nft >/dev/null 2>&1; then
     nft add table inet filter 2>/dev/null
     nft add chain inet filter input { type filter hook input priority 0 \; } 2>/dev/null
     nft add rule inet filter input udp dport 67 accept 2>/dev/null
     nft add rule inet filter input udp dport 68 accept 2>/dev/null
     msg_ok "Firewall настроен (nftables)"
-elif command -v iptables &>/dev/null; then
+elif command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p udp --dport 67 -j ACCEPT 2>/dev/null
     iptables -I INPUT -p udp --dport 68 -j ACCEPT 2>/dev/null
     msg_ok "Firewall настроен (iptables)"
