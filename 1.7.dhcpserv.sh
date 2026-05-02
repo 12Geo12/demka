@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# DHCP Server Setup for Demo2026 - Простая версия
-# Автоматическое определение VLAN по имени интерфейса
+# DHCP Server Setup for Demo2026 - Универсальная версия
+# Автоматическое определение VLAN и пакетного менеджера
 #===============================================================================
 
 # Цвета
@@ -20,7 +20,28 @@ msg_er() { echo -e "${RED}[✗]${NC} $1"; }
 msg_in() { echo -e "${BLUE}[i]${NC} $1"; }
 
 # Проверка root
-[ "$EUID" -ne 0 ] && { msg_er "Запустите от root"; exit 1; }
+if [ "$EUID" -ne 0 ]; then
+    msg_er "Запустите от root (sudo)"
+    exit 1
+fi
+
+# Определение пакетного менеджера
+detect_pkg_manager() {
+    if command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"
+        PKG_NAME="dhcp-server"
+    elif command -v apt >/dev/null 2>&1; then
+        PKG_MANAGER="apt"
+        PKG_NAME="isc-dhcp-server"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"
+        PKG_NAME="dhcp"
+    else
+        msg_er "Пакетный менеджер не найден (dnf/apt/yum)"
+        exit 1
+    fi
+    msg_in "Пакетный менеджер: $PKG_MANAGER"
+}
 
 # Очистка экрана
 clear
@@ -28,23 +49,26 @@ echo -e "${CYAN}╔════════════════════�
 echo -e "${CYAN}║${NC} ${YELLOW}DHCP Server Setup for Demo2026${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 
+# Определяем пакетный менеджер
+detect_pkg_manager
+
 # Автоопределение интерфейсов
-echo -e "\n${BLUE}Поиск интерфейсов...${NC}\n"
+echo -e "\n${BLUE}Поиск VLAN интерфейсов...${NC}\n"
 
 # Массивы для данных
-declare -a IFACES
-declare -a IPS
-declare -a MASKS
-declare -a GATES
-declare -a RANGES
-declare -a DNS
-declare -a NETWORKS
-declare -a VIDS
+IFACES=""
+IPS=""
+MASKS=""
+GATES=""
+RANGES=""
+DNS=""
+NETWORKS=""
+VIDS=""
 
 # Создаём временный файл для вывода
 TMPFILE="/tmp/dhcp_ifaces_$$"
 
-# Получаем список интерфейсов
+# Получаем список VLAN интерфейсов
 ip -br addr show type vlan > "$TMPFILE" 2>/dev/null
 if [ ! -s "$TMPFILE" ]; then
     ip -br addr show | grep -v "^lo" > "$TMPFILE"
@@ -61,14 +85,11 @@ while IFS= read -r line; do
     ip=$(echo "$ip_full" | cut -d'/' -f1)
     
     # Определяем VLAN ID из имени интерфейса
-    # Примеры: vlan100, ens37.100, eth0.100, enp0s8.100
     case "$iface" in
         *.*)
-            # Формат interface.vlan (ens37.100)
             vid=$(echo "$iface" | cut -d'.' -f2 | cut -d'@' -f1)
             ;;
         vlan*)
-            # Формат vlan100
             vid=$(echo "$iface" | sed 's/vlan//')
             ;;
         *)
@@ -88,7 +109,6 @@ while IFS= read -r line; do
             net_name="VLAN100 (SRV-Net)"
             mask="255.255.255.224"
             prefix="27"
-            # Диапазон: от 2 до 30 (исключаем 0, 1=шлюз, 31=broadcast)
             range_start="${o1}.${o2}.${o3}.2"
             range_end="${o1}.${o2}.${o3}.30"
             dns_ip="${o1}.${o2}.${o3}.1"
@@ -97,7 +117,6 @@ while IFS= read -r line; do
             net_name="VLAN200 (CLI-Net)"
             mask="255.255.255.240"
             prefix="28"
-            # Диапазон: от 2 до 14 (исключаем 0, 1=шлюз, 15=broadcast)
             range_start="${o1}.${o2}.${o3}.2"
             range_end="${o1}.${o2}.${o3}.14"
             dns_ip="${o1}.${o2}.${o3}.1"
@@ -106,14 +125,12 @@ while IFS= read -r line; do
             net_name="VLAN999 (Management)"
             mask="255.255.255.248"
             prefix="29"
-            # Диапазон: от 2 до 6 (исключаем 0, 1=шлюз, 7=broadcast)
             range_start="${o1}.${o2}.${o3}.2"
             range_end="${o1}.${o2}.${o3}.6"
             dns_ip="${o1}.${o2}.${o3}.1"
             ;;
         *)
-            # Неизвестный VLAN - автоматический расчёт
-            net_name="VLAN$vid (Unknown)"
+            net_name="VLAN$vid"
             mask="255.255.255.0"
             prefix="24"
             range_start="${o1}.${o2}.${o3}.2"
@@ -122,18 +139,18 @@ while IFS= read -r line; do
             ;;
     esac
     
-    # Сеть
     network="${o1}.${o2}.${o3}.0"
     range="$range_start $range_end"
     
-    IFACES[$idx]="$iface"
-    IPS[$idx]="$ip"
-    MASKS[$idx]="$mask"
-    GATES[$idx]="$ip"
-    RANGES[$idx]="$range"
-    DNS[$idx]="$dns_ip"
-    NETWORKS[$idx]="$network"
-    VIDS[$idx]="$vid"
+    # Добавляем в массивы (используем формат idx:value)
+    IFACES="$IFACES $idx:$iface"
+    IPS="$IPS $idx:$ip"
+    MASKS="$MASKS $idx:$mask"
+    GATES="$GATES $idx:$ip"
+    RANGES="$RANGES $idx:$range"
+    DNS="$DNS $idx:$dns_ip"
+    NETWORKS="$NETWORKS $idx:$network"
+    VIDS="$VIDS $idx:$vid"
     
     echo -e "  ${GREEN}[$((idx+1))]${NC} $iface ${YELLOW}→${NC} $ip ${CYAN}($net_name /$prefix)${NC}"
     
@@ -144,31 +161,42 @@ rm -f "$TMPFILE"
 
 TOTAL=$idx
 
-[ $TOTAL -eq 0 ] && { msg_er "Интерфейсы не найдены"; exit 1; }
+if [ $TOTAL -eq 0 ]; then
+    msg_er "Интерфейсы не найдены"
+    exit 1
+fi
 
 # Выбор интерфейса
 echo ""
 read -r -p "Выберите интерфейс [1-$TOTAL]: " num
 
-if ! echo "$num" | grep -qE '^[0-9]+$'; then
-    msg_er "Неверный выбор"
-    exit 1
-fi
+case "$num" in
+    ''|*[!0-9]*)
+        msg_er "Неверный выбор"
+        exit 1
+        ;;
+esac
 
 if [ "$num" -lt 1 ] || [ "$num" -gt "$TOTAL" ]; then
-    msg_er "Неверный выбор"
+    msg_er "Неверный выбор (введите 1-$TOTAL)"
     exit 1
 fi
 
 SEL=$((num-1))
-IFACE="${IFACES[$SEL]}"
-IP="${IPS[$SEL]}"
-MASK="${MASKS[$SEL]}"
-GATE="${GATES[$SEL]}"
-RANGE="${RANGES[$SEL]}"
-DNS_IP="${DNS[$SEL]}"
-NETWORK="${NETWORKS[$SEL]}"
-VID="${VIDS[$SEL]}"
+
+# Функция получения значения из массива
+get_val() {
+    echo "$1" | grep "^$SEL:" | cut -d: -f2
+}
+
+IFACE=$(get_val "$IFACES")
+IP=$(get_val "$IPS")
+MASK=$(get_val "$MASKS")
+GATE=$(get_val "$GATES")
+RANGE=$(get_val "$RANGES")
+DNS_IP=$(get_val "$DNS")
+NETWORK=$(get_val "$NETWORKS")
+VID=$(get_val "$VIDS")
 
 # Показ параметров
 echo ""
@@ -194,13 +222,26 @@ esac
 
 # Установка пакета
 echo ""
-msg_in "Установка dhcp-server..."
-if dnf install -y dhcp-server; then
-    msg_ok "Пакет установлен"
-else
+msg_in "Установка DHCP сервера..."
+
+case "$PKG_MANAGER" in
+    dnf)
+        dnf install -y $PKG_NAME
+        ;;
+    apt)
+        apt update
+        apt install -y $PKG_NAME
+        ;;
+    yum)
+        yum install -y $PKG_NAME
+        ;;
+esac
+
+if [ $? -ne 0 ]; then
     msg_er "Ошибка установки пакета"
     exit 1
 fi
+msg_ok "Пакет установлен"
 
 # Создание конфига
 msg_in "Создание конфигурации..."
@@ -220,11 +261,27 @@ subnet $NETWORK netmask $MASK {
 }
 EOF
 
-msg_ok "Конфиг создан: /etc/dhcp/dhcpd.conf"
+msg_ok "Конфиг создан"
 
-# Настройка sysconfig
-echo "DHCPDARGS=\"$IFACE\"" > /etc/sysconfig/dhcpd
-msg_ok "Интерфейс настроен: $IFACE"
+# Показываем конфиг
+echo ""
+echo -e "${YELLOW}Содержимое /etc/dhcp/dhcpd.conf:${NC}"
+cat /etc/dhcp/dhcpd.conf
+echo ""
+
+# Настройка sysconfig (только для RedHat-based)
+if [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ]; then
+    echo "DHCPDARGS=\"$IFACE\"" > /etc/sysconfig/dhcpd
+    msg_ok "Интерфейс настроен: $IFACE"
+fi
+
+# Для Debian/Ubuntu настраиваем interfaces
+if [ "$PKG_MANAGER" = "apt" ]; then
+    if [ -f /etc/default/isc-dhcp-server ]; then
+        echo "INTERFACESv4=\"$IFACE\"" > /etc/default/isc-dhcp-server
+        msg_ok "Интерфейс настроен: $IFACE"
+    fi
+fi
 
 # Firewall
 msg_in "Настройка firewall..."
@@ -245,25 +302,33 @@ msg_in "Проверка конфигурации..."
 if dhcpd -t -cf /etc/dhcp/dhcpd.conf 2>&1; then
     msg_ok "Конфигурация валидна"
 else
-    msg_er "Ошибка в конфигурации"
-    cat /etc/dhcp/dhcpd.conf
+    msg_er "Ошибка в конфигурации - проверьте параметры"
     exit 1
 fi
 
 # Запуск
-msg_in "Запуск dhcpd..."
-systemctl stop dhcpd 2>/dev/null
-systemctl enable --now dhcpd
+msg_in "Запуск DHCP сервера..."
+
+# Имя сервиса может отличаться
+if [ "$PKG_MANAGER" = "apt" ]; then
+    SERVICE_NAME="isc-dhcp-server"
+else
+    SERVICE_NAME="dhcpd"
+fi
+
+systemctl stop $SERVICE_NAME 2>/dev/null
+systemctl enable --now $SERVICE_NAME
 
 sleep 2
 
-if systemctl is-active --quiet dhcpd; then
+if systemctl is-active --quiet $SERVICE_NAME; then
     msg_ok "DHCP сервер запущен!"
 else
-    msg_er "Ошибка запуска dhcpd"
+    msg_er "Ошибка запуска $SERVICE_NAME"
     echo ""
-    echo "Журнал:"
-    journalctl -u dhcpd -n 20 --no-pager
+    systemctl status $SERVICE_NAME --no-pager
+    echo ""
+    journalctl -u $SERVICE_NAME -n 20 --no-pager
     exit 1
 fi
 
@@ -273,11 +338,7 @@ echo -e "${GREEN}═════════════════════
 echo -e "${GREEN}  DHCP сервер настроен и запущен!${NC}"
 echo -e "${GREEN}══════════════════════════════════════════════${NC}"
 echo ""
-echo -e "Клиент получит IP из диапазона: ${YELLOW}$RANGE${NC}"
+echo -e "Клиент получит IP: ${YELLOW}$RANGE${NC}"
 echo -e "Шлюз: ${YELLOW}$GATE${NC}"
 echo -e "DNS: ${YELLOW}$DNS_IP${NC}"
 echo -e "Суффикс: ${YELLOW}$DNS_SUFFIX${NC}"
-echo ""
-echo -e "Для проверки на клиенте:"
-echo -e "  ${CYAN}# nmcli con reload${NC}"
-echo -e "  ${CYAN}# nmcli con up <интерфейс>${NC}"
