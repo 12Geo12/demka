@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # DHCP Server Setup for Demo2026 - Простая версия
-# Автоматическое определение интерфейсов, без резервных копий
+# Автоматическое определение VLAN по имени интерфейса
 #===============================================================================
 
 # Цвета
@@ -38,6 +38,8 @@ declare -a MASKS
 declare -a GATES
 declare -a RANGES
 declare -a DNS
+declare -a NETWORKS
+declare -a VIDS
 
 # Создаём временный файл для вывода
 TMPFILE="/tmp/dhcp_ifaces_$$"
@@ -58,38 +60,71 @@ while IFS= read -r line; do
     
     ip=$(echo "$ip_full" | cut -d'/' -f1)
     
-    # Определение параметров по IP
+    # Определяем VLAN ID из имени интерфейса
+    # Примеры: vlan100, ens37.100, eth0.100, enp0s8.100
+    case "$iface" in
+        *.*)
+            # Формат interface.vlan (ens37.100)
+            vid=$(echo "$iface" | cut -d'.' -f2 | cut -d'@' -f1)
+            ;;
+        vlan*)
+            # Формат vlan100
+            vid=$(echo "$iface" | sed 's/vlan//')
+            ;;
+        *)
+            vid="0"
+            ;;
+    esac
+    
+    # Получаем октеты IP
     o1=$(echo "$ip" | cut -d'.' -f1)
     o2=$(echo "$ip" | cut -d'.' -f2)
     o3=$(echo "$ip" | cut -d'.' -f3)
     o4=$(echo "$ip" | cut -d'.' -f4)
     
-    case "$o3" in
-        1)
-            net="VLAN100 (SRV-Net)"
+    # Определяем параметры по VLAN ID
+    case "$vid" in
+        100)
+            net_name="VLAN100 (SRV-Net)"
             mask="255.255.255.224"
-            range="192.168.1.2 192.168.1.30"
-            dns_ip="192.168.1.1"
+            prefix="27"
+            # Диапазон: от 2 до 30 (исключаем 0, 1=шлюз, 31=broadcast)
+            range_start="${o1}.${o2}.${o3}.2"
+            range_end="${o1}.${o2}.${o3}.30"
+            dns_ip="${o1}.${o2}.${o3}.1"
             ;;
-        2)
-            net="VLAN200 (CLI-Net)"
+        200)
+            net_name="VLAN200 (CLI-Net)"
             mask="255.255.255.240"
-            range="192.168.2.2 192.168.2.14"
-            dns_ip="192.168.1.2"
+            prefix="28"
+            # Диапазон: от 2 до 14 (исключаем 0, 1=шлюз, 15=broadcast)
+            range_start="${o1}.${o2}.${o3}.2"
+            range_end="${o1}.${o2}.${o3}.14"
+            dns_ip="${o1}.${o2}.${o3}.1"
             ;;
-        3)
-            net="VLAN999 (Mgmt)"
+        999)
+            net_name="VLAN999 (Management)"
             mask="255.255.255.248"
-            range="192.168.3.2 192.168.3.6"
-            dns_ip="192.168.1.2"
+            prefix="29"
+            # Диапазон: от 2 до 6 (исключаем 0, 1=шлюз, 7=broadcast)
+            range_start="${o1}.${o2}.${o3}.2"
+            range_end="${o1}.${o2}.${o3}.6"
+            dns_ip="${o1}.${o2}.${o3}.1"
             ;;
         *)
-            net="Unknown"
+            # Неизвестный VLAN - автоматический расчёт
+            net_name="VLAN$vid (Unknown)"
             mask="255.255.255.0"
-            range=""
-            dns_ip=""
+            prefix="24"
+            range_start="${o1}.${o2}.${o3}.2"
+            range_end="${o1}.${o2}.${o3}.254"
+            dns_ip="${o1}.${o2}.${o3}.1"
             ;;
     esac
+    
+    # Сеть
+    network="${o1}.${o2}.${o3}.0"
+    range="$range_start $range_end"
     
     IFACES[$idx]="$iface"
     IPS[$idx]="$ip"
@@ -97,8 +132,10 @@ while IFS= read -r line; do
     GATES[$idx]="$ip"
     RANGES[$idx]="$range"
     DNS[$idx]="$dns_ip"
+    NETWORKS[$idx]="$network"
+    VIDS[$idx]="$vid"
     
-    echo -e "  ${GREEN}[$((idx+1))]${NC} $iface ${YELLOW}→${NC} $ip ${CYAN}($net)${NC}"
+    echo -e "  ${GREEN}[$((idx+1))]${NC} $iface ${YELLOW}→${NC} $ip ${CYAN}($net_name /$prefix)${NC}"
     
     idx=$((idx + 1))
 done < "$TMPFILE"
@@ -130,30 +167,23 @@ MASK="${MASKS[$SEL]}"
 GATE="${GATES[$SEL]}"
 RANGE="${RANGES[$SEL]}"
 DNS_IP="${DNS[$SEL]}"
-
-# Получаем сеть
-o3=$(echo "$IP" | cut -d'.' -f3)
-case "$o3" in
-    1) NETWORK="192.168.1.0" ;;
-    2) NETWORK="192.168.2.0" ;;
-    3) NETWORK="192.168.3.0" ;;
-    *) 
-        o1=$(echo "$IP" | cut -d'.' -f1)
-        o2=$(echo "$IP" | cut -d'.' -f2)
-        NETWORK="${o1}.${o2}.${o3}.0"
-        ;;
-esac
+NETWORK="${NETWORKS[$SEL]}"
+VID="${VIDS[$SEL]}"
 
 # Показ параметров
 echo ""
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
 echo -e "${CYAN}Параметры DHCP:${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
 echo -e "  Интерфейс:  ${YELLOW}$IFACE${NC}"
+echo -e "  VLAN ID:    ${YELLOW}$VID${NC}"
 echo -e "  Сеть:       ${YELLOW}$NETWORK${NC}"
 echo -e "  Маска:      ${YELLOW}$MASK${NC}"
 echo -e "  Шлюз:       ${YELLOW}$GATE${NC}"
 echo -e "  Диапазон:   ${YELLOW}$RANGE${NC}"
 echo -e "  DNS:        ${YELLOW}$DNS_IP${NC}"
 echo -e "  Суффикс:    ${YELLOW}$DNS_SUFFIX${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
 echo ""
 
 read -r -p "Применить? (y/n): " confirm
@@ -165,14 +195,19 @@ esac
 # Установка пакета
 echo ""
 msg_in "Установка dhcp-server..."
-dnf install -y dhcp-server >/dev/null 2>&1 || { msg_er "Ошибка установки"; exit 1; }
-msg_ok "Пакет установлен"
+if dnf install -y dhcp-server; then
+    msg_ok "Пакет установлен"
+else
+    msg_er "Ошибка установки пакета"
+    exit 1
+fi
 
 # Создание конфига
 msg_in "Создание конфигурации..."
 
 cat > /etc/dhcp/dhcpd.conf << EOF
 # DHCP for Demo2026
+# VLAN $VID - Interface $IFACE
 authoritative;
 default-lease-time 600;
 max-lease-time 7200;
@@ -185,13 +220,14 @@ subnet $NETWORK netmask $MASK {
 }
 EOF
 
-msg_ok "Конфиг создан"
+msg_ok "Конфиг создан: /etc/dhcp/dhcpd.conf"
 
 # Настройка sysconfig
 echo "DHCPDARGS=\"$IFACE\"" > /etc/sysconfig/dhcpd
 msg_ok "Интерфейс настроен: $IFACE"
 
 # Firewall
+msg_in "Настройка firewall..."
 if command -v nft >/dev/null 2>&1; then
     nft add table inet filter 2>/dev/null
     nft add chain inet filter input { type filter hook input priority 0 \; } 2>/dev/null
@@ -205,8 +241,12 @@ elif command -v iptables >/dev/null 2>&1; then
 fi
 
 # Проверка конфига
-if ! dhcpd -t -cf /etc/dhcp/dhcpd.conf 2>&1; then
+msg_in "Проверка конфигурации..."
+if dhcpd -t -cf /etc/dhcp/dhcpd.conf 2>&1; then
+    msg_ok "Конфигурация валидна"
+else
     msg_er "Ошибка в конфигурации"
+    cat /etc/dhcp/dhcpd.conf
     exit 1
 fi
 
@@ -220,8 +260,10 @@ sleep 2
 if systemctl is-active --quiet dhcpd; then
     msg_ok "DHCP сервер запущен!"
 else
-    msg_er "Ошибка запуска"
-    journalctl -u dhcpd -n 10 --no-pager
+    msg_er "Ошибка запуска dhcpd"
+    echo ""
+    echo "Журнал:"
+    journalctl -u dhcpd -n 20 --no-pager
     exit 1
 fi
 
@@ -235,3 +277,7 @@ echo -e "Клиент получит IP из диапазона: ${YELLOW}$RANGE
 echo -e "Шлюз: ${YELLOW}$GATE${NC}"
 echo -e "DNS: ${YELLOW}$DNS_IP${NC}"
 echo -e "Суффикс: ${YELLOW}$DNS_SUFFIX${NC}"
+echo ""
+echo -e "Для проверки на клиенте:"
+echo -e "  ${CYAN}# nmcli con reload${NC}"
+echo -e "  ${CYAN}# nmcli con up <интерфейс>${NC}"
