@@ -2,16 +2,17 @@
 
 # =============================================
 # СКРИПТ НАСТРОЙКИ DHCP СЕРВЕРА ДЛЯ ALT SERVER
-# Версия: 4.0 - Адаптировано для Demo2026
+# Версия: 4.1 - Исправлена совместимость
 # =============================================
 # 
-# Соответствует требованиям задания:
+# Соответствует требованиям задания Demo2026:
 # - Настройка DHCP на HQ-RTR (сервер)
 # - Исключение адреса маршрутизатора из выдачи
 # - Указание шлюза и DNS
 # - DNS-суффикс au-team.irpo
 #
 # Совместимость: Alt Linux Server / JeOS
+# ВАЖНО: Запускать через bash, не sh!
 # =============================================
 
 # Цвета для вывода
@@ -25,8 +26,31 @@ NC='\033[0m'
 
 # Глобальные переменные
 DHCP_CONF="/etc/dhcp/dhcpd.conf"
-DHCP_SYSconfig="/etc/sysconfig/dhcpd"
+DHCP_SYSCONFIG="/etc/sysconfig/dhcpd"
 LOG_FILE="/var/log/dhcp-setup.log"
+
+# Массивы для хранения данных
+declare -a INTERFACES
+declare -a IPS
+declare -a VLAN_IDS
+declare -a STATUSES
+declare -a SELECTED_IFACES
+declare -a SELECTED_VLANS
+declare -a SELECTED_IPS
+
+# Переменные для вычисления сети
+CALC_NETWORK=""
+CALC_NETMASK=""
+CALC_BROADCAST=""
+CALC_START=""
+CALC_END=""
+CALC_GATEWAY=""
+CALC_PREFIX=""
+
+# DNS параметры
+DNS_SERVER=""
+DNS_SERVER_2=""
+DNS_SUFFIX=""
 
 # =============================================
 # ФУНКЦИИ
@@ -34,26 +58,24 @@ LOG_FILE="/var/log/dhcp-setup.log"
 
 # Логирование
 log() {
-    echo -e "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
 }
 
 # Функция очистки при ошибке
 cleanup_on_error() {
+    echo ""
     echo -e "${RED}╔════════════════════════════════════════════════════╗${NC}"
     echo -e "${RED}║     ОШИБКА! Откат конфигурации DHCP сервера       ║${NC}"
     echo -e "${RED}╚════════════════════════════════════════════════════╝${NC}"
     log "ERROR: Начало отката конфигурации"
     
-    # Определяем имя службы
-    local service_name=$(get_dhcp_service_name)
-    
     # Останавливаем службу
-    systemctl stop "$service_name" 2>/dev/null
-    systemctl disable "$service_name" 2>/dev/null
+    systemctl stop dhcpd 2>/dev/null
+    systemctl stop isc-dhcp-server 2>/dev/null
     
     # Удаляем конфиги
-    rm -f "$DHCP_CONF"
-    rm -f "$DHCP_SYSCONFIG"
+    rm -f "$DHCP_CONF" 2>/dev/null
+    rm -f "$DHCP_SYSCONFIG" 2>/dev/null
     
     # Удаляем правила iptables
     iptables -D INPUT -p udp --dport 67 -j ACCEPT 2>/dev/null
@@ -64,14 +86,11 @@ cleanup_on_error() {
     exit 1
 }
 
-# Определение имени службы DHCP в Alt Linux
-get_dhcp_service_name() {
-    if systemctl list-unit-files | grep -q "^dhcpd.service"; then
-        echo "dhcpd"
-    elif systemctl list-unit-files | grep -q "^isc-dhcp-server.service"; then
-        echo "isc-dhcp-server"
-    else
-        echo "dhcpd"
+# Проверка прав root
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}Ошибка: Запустите скрипт с правами root (sudo)${NC}"
+        exit 1
     fi
 }
 
@@ -82,17 +101,9 @@ check_alt_linux() {
         log "INFO: Alt Linux detected"
         return 0
     else
-        echo -e "${YELLOW}⚠ Внимание: Система не Alt Linux. Совместимость не гарантируется.${NC}"
+        echo -e "${YELLOW}⚠ Внимание: Система не Alt Linux.${NC}"
         log "WARN: Non-Alt Linux system"
         return 1
-    fi
-}
-
-# Проверка прав root
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}Ошибка: Запустите скрипт с правами root (sudo)${NC}"
-        exit 1
     fi
 }
 
@@ -126,53 +137,85 @@ install_packages_alt() {
 
 # Вычисление сетевых параметров
 calculate_network_params() {
-    local cidr=$1
-    local gateway_ip=$2
+    local cidr="$1"
+    local gateway_ip="$2"
     
     # Получаем информацию о сети через ipcalc
-    local network=$(ipcalc "$cidr" 2>/dev/null | grep "^Network:" | awk '{print $2}')
-    local netmask=$(ipcalc "$cidr" 2>/dev/null | grep "^Netmask:" | awk '{print $2}')
-    local broadcast=$(ipcalc "$cidr" 2>/dev/null | grep "^Broadcast:" | awk '{print $2}')
-    local prefix=$(echo "$network" | cut -d/ -f2)
+    CALC_NETWORK=$(ipcalc "$cidr" 2>/dev/null | grep "^Network:" | awk '{print $2}')
+    CALC_NETMASK=$(ipcalc "$cidr" 2>/dev/null | grep "^Netmask:" | awk '{print $2}')
+    CALC_BROADCAST=$(ipcalc "$cidr" 2>/dev/null | grep "^Broadcast:" | awk '{print $2}')
+    CALC_PREFIX=$(echo "$CALC_NETWORK" | cut -d/ -f2)
     
     # Разбираем адреса на октеты
-    IFS='.' read -r n1 n2 n3 n4 <<< "$(echo "$network" | cut -d/ -f1)"
-    IFS='.' read -r b1 b2 b3 b4 <<< "$broadcast"
+    local network_ip=$(echo "$CALC_NETWORK" | cut -d/ -f1)
+    
+    IFS='.' read -r n1 n2 n3 n4 <<< "$network_ip"
+    IFS='.' read -r b1 b2 b3 b4 <<< "$CALC_BROADCAST"
     IFS='.' read -r g1 g2 g3 g4 <<< "$gateway_ip"
     
-    # Вычисляем диапазон DHCP с исключением шлюза
-    local gateway_last_octet=$g4
-    local network_last_octet=$n4
-    local broadcast_last_octet=$b4
-    
-    # Начало диапазона - первый адрес после сетевого адреса
-    local start_last=$((network_last_octet + 1))
-    
+    # Начало диапазона - пропускаем сетевой адрес
+    local start_last=$((n4 + 1))
     # Конец диапазона - предпоследний адрес (последний - broadcast)
-    local end_last=$((broadcast_last_octet - 1))
+    local end_last=$((b4 - 1))
     
     # Если шлюз в начале диапазона, начинаем после него
-    if [ "$gateway_last_octet" -ge "$start_last" ] && [ "$gateway_last_octet" -le "$end_last" ]; then
-        if [ "$gateway_last_octet" -eq "$start_last" ]; then
-            start_last=$((gateway_last_octet + 1))
-        elif [ "$gateway_last_octet" -eq "$end_last" ]; then
-            end_last=$((gateway_last_octet - 1))
+    if [ "$g4" -ge "$start_last" ] && [ "$g4" -le "$end_last" ]; then
+        if [ "$g4" -eq "$start_last" ]; then
+            start_last=$((g4 + 1))
+        elif [ "$g4" -eq "$end_last" ]; then
+            end_last=$((g4 - 1))
         fi
-        # Если шлюз внутри диапазона - корректируем
     fi
     
     # Формируем адреса
-    local start_ip="$n1.$n2.$n3.$start_last"
-    local end_ip="$n1.$n2.$n3.$end_last"
-    
-    # Возвращаем значения через глобальные переменные
-    CALC_NETWORK="$network"
-    CALC_NETMASK="$netmask"
-    CALC_BROADCAST="$broadcast"
-    CALC_START="$start_ip"
-    CALC_END="$end_ip"
+    CALC_START="$n1.$n2.$n3.$start_last"
+    CALC_END="$n1.$n2.$n3.$end_last"
     CALC_GATEWAY="$gateway_ip"
-    CALC_PREFIX="$prefix"
+}
+
+# Получение списка интерфейсов (исправлено для совместимости)
+get_interfaces() {
+    local INDEX=1
+    
+    # Используем временный файл вместо процессной подстановки
+    local tmp_file="/tmp/interfaces_$$.txt"
+    
+    ip -4 -o addr show > "$tmp_file" 2>/dev/null
+    
+    while IFS= read -r line; do
+        local iface=$(echo "$line" | awk '{print $2}' | cut -d@ -f1)
+        local ip_cidr=$(echo "$line" | awk '{print $4}')
+        local ip=$(echo "$ip_cidr" | cut -d/ -f1)
+        
+        # Пропускаем loopback
+        [ "$iface" = "lo" ] && continue
+        
+        # Определяем VLAN
+        local vlan_id="-"
+        if [[ "$iface" =~ \.([0-9]+)$ ]]; then
+            vlan_id="${BASH_REMATCH[1]}"
+        fi
+        
+        # Определяем статус
+        local status=$(ip link show "$iface" 2>/dev/null | grep -o "state [A-Z]*" | awk '{print $2}')
+        [ -z "$status" ] && status="UNKNOWN"
+        
+        if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
+            INTERFACES+=("$iface")
+            IPS+=("$ip")
+            VLAN_IDS+=("$vlan_id")
+            STATUSES+=("$status")
+            
+            if [ "$vlan_id" != "-" ]; then
+                printf "${MAGENTA}%2d${NC}) %-18s ${CYAN}VID %-5s${NC} %-18s %s\n" "$INDEX" "$iface" "$vlan_id" "$ip" "$status"
+            else
+                printf "%2d) %-18s %-10s %-18s %s\n" "$INDEX" "$iface" "$vlan_id" "$ip" "$status"
+            fi
+            INDEX=$((INDEX + 1))
+        fi
+    done < "$tmp_file"
+    
+    rm -f "$tmp_file"
 }
 
 # Создание конфигурации DHCP
@@ -182,12 +225,12 @@ create_dhcp_config() {
     
     # Резервное копирование существующего конфига
     if [ -f "$DHCP_CONF" ]; then
-        cp "$DHCP_CONF" "${DHCP_CONF}.backup.$(date +%Y%m%d%H%M%S)"
+        cp "$DHCP_CONF" "${DHCP_CONF}.backup.$(date +%Y%m%d%H%M%S)" 2>/dev/null
         log "INFO: Backup created"
     fi
     
     # Создаём базовую конфигурацию
-    cat > "$DHCP_CONF" <<EOF
+    cat > "$DHCP_CONF" << EOFMAIN
 # =============================================
 # Конфигурация DHCP сервера
 # Создано скриптом dhcp-setup-alt.sh
@@ -207,9 +250,10 @@ option domain-name-servers $DNS_SERVER${DNS_SERVER_2:+, $DNS_SERVER_2};
 # Логирование
 log-facility local7;
 
-EOF
+EOFMAIN
 
     # Добавляем подсети
+    local idx
     for idx in "${!SELECTED_IFACES[@]}"; do
         local iface="${SELECTED_IFACES[$idx]}"
         local vlan="${SELECTED_VLANS[$idx]}"
@@ -219,6 +263,9 @@ EOF
         # Вычисляем параметры сети
         calculate_network_params "$cidr" "$gateway"
         
+        # Извлекаем адрес сети без префикса
+        local network_addr=$(echo "$CALC_NETWORK" | cut -d/ -f1)
+        
         # Добавляем комментарий о VLAN если есть
         if [ "$vlan" != "-" ]; then
             echo "# VLAN $vlan - интерфейс $iface" >> "$DHCP_CONF"
@@ -226,10 +273,10 @@ EOF
             echo "# Интерфейс $iface" >> "$DHCP_CONF"
         fi
         
-        # Добавляем конфигурацию подсети с исключением шлюза
-        cat >> "$DHCP_CONF" <<EOF
+        # Добавляем конфигурацию подсети
+        cat >> "$DHCP_CONF" << EOFSUBNET
 
-subnet ${CALC_NETWORK%/*} netmask $CALC_NETMASK {
+subnet $network_addr netmask $CALC_NETMASK {
     # Диапазон выдачи адресов (шлюз $CALC_GATEWAY исключён)
     range $CALC_START $CALC_END;
     
@@ -245,18 +292,12 @@ subnet ${CALC_NETWORK%/*} netmask $CALC_NETMASK {
     # Время аренды
     default-lease-time 600;
     max-lease-time 7200;
-    
-    # Исключение адреса шлюза из пула
-    host gateway-${iface} {
-        hardware ethernet 00:00:00:00:00:00;
-        fixed-address $CALC_GATEWAY;
-    }
 }
 
-EOF
+EOFSUBNET
         
-        echo -e "${GREEN}✓ Подсеть ${CALC_NETWORK%/*} настроена (шлюз: $CALC_GATEWAY)${NC}"
-        log "INFO: Subnet ${CALC_NETWORK%/*} configured with gateway $CALC_GATEWAY"
+        echo -e "${GREEN}✓ Подсеть $network_addr/$CALC_PREFIX настроена (шлюз: $CALC_GATEWAY)${NC}"
+        log "INFO: Subnet $network_addr configured with gateway $CALC_GATEWAY"
     done
     
     echo -e "${GREEN}✓ Конфигурация создана: $DHCP_CONF${NC}"
@@ -267,15 +308,26 @@ configure_dhcp_interfaces() {
     echo -e "${CYAN}→ Настройка интерфейсов DHCP...${NC}"
     log "INFO: Configuring DHCP interfaces"
     
+    # Формируем список интерфейсов
+    local iface_list=""
+    local i
+    for i in "${SELECTED_IFACES[@]}"; do
+        iface_list="$iface_list $i"
+    done
+    iface_list=$(echo "$iface_list" | xargs)  # Удаляем лишние пробелы
+    
+    # Создаём директорию если нет
+    mkdir -p /etc/sysconfig 2>/dev/null
+    
     # Создаём файл с указанием интерфейсов
-    cat > "$DHCP_SYSCONFIG" <<EOF
+    cat > "$DHCP_SYSCONFIG" << EOFSYSCONFIG
 # Интерфейсы для DHCP сервера
 # Создано скриптом dhcp-setup-alt.sh
-DHCPDARGS="${SELECTED_IFACES[*]}"
-EOF
+DHCPDARGS="$iface_list"
+EOFSYSCONFIG
     
-    echo -e "${GREEN}✓ Интерфейсы настроены: ${SELECTED_IFACES[*]}${NC}"
-    log "INFO: Interfaces configured: ${SELECTED_IFACES[*]}"
+    echo -e "${GREEN}✓ Интерфейсы настроены: $iface_list${NC}"
+    log "INFO: Interfaces configured: $iface_list"
 }
 
 # Проверка конфигурации
@@ -301,7 +353,7 @@ enable_ip_forward() {
     log "INFO: Enabling IP forwarding"
     
     # Проверяем текущее состояние
-    if [ "$(sysctl -n net.ipv4.ip_forward)" -eq 1 ]; then
+    if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" -eq 1 ]; then
         echo -e "${GREEN}✓ IP форвардинг уже включён${NC}"
         return 0
     fi
@@ -330,12 +382,14 @@ configure_firewall() {
         return 0
     fi
     
-    # Добавляем правила для DHCP
-    iptables -C INPUT -p udp --dport 67 -j ACCEPT 2>/dev/null || \
+    # Добавляем правила для DHCP (проверяем наличие перед добавлением)
+    if ! iptables -C INPUT -p udp --dport 67 -j ACCEPT 2>/dev/null; then
         iptables -I INPUT -p udp --dport 67 -j ACCEPT
+    fi
     
-    iptables -C INPUT -p udp --dport 68 -j ACCEPT 2>/dev/null || \
+    if ! iptables -C INPUT -p udp --dport 68 -j ACCEPT 2>/dev/null; then
         iptables -I INPUT -p udp --dport 68 -j ACCEPT
+    fi
     
     # Сохраняем правила (для Alt Linux)
     if [ -d "/etc/sysconfig" ]; then
@@ -349,17 +403,23 @@ configure_firewall() {
 
 # Запуск DHCP сервера
 start_dhcp_server() {
-    local service_name=$(get_dhcp_service_name)
+    echo -e "${CYAN}→ Запуск DHCP сервера...${NC}"
+    log "INFO: Starting DHCP server"
     
-    echo -e "${CYAN}→ Запуск DHCP сервера ($service_name)...${NC}"
-    log "INFO: Starting DHCP server: $service_name"
+    # Определяем имя службы
+    local service_name="dhcpd"
+    if ! systemctl list-unit-files | grep -q "^dhcpd.service"; then
+        if systemctl list-unit-files | grep -q "^isc-dhcp-server.service"; then
+            service_name="isc-dhcp-server"
+        fi
+    fi
     
     # Включаем автозапуск
     systemctl enable "$service_name" > /dev/null 2>&1
     
     # Перезапускаем службу
     if systemctl restart "$service_name" 2>/dev/null; then
-        echo -e "${GREEN}✓ DHCP сервер запущен${NC}"
+        echo -e "${GREEN}✓ DHCP сервер запущен ($service_name)${NC}"
         log "INFO: DHCP server started successfully"
         return 0
     else
@@ -374,8 +434,6 @@ start_dhcp_server() {
 
 # Вывод итоговой информации
 print_summary() {
-    local service_name=$(get_dhcp_service_name)
-    
     echo ""
     echo -e "${GREEN}╔════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║         НАСТРОЙКА DHCP ЗАВЕРШЕНА УСПЕШНО          ║${NC}"
@@ -391,6 +449,7 @@ print_summary() {
     echo -e "${WHITE}Настроенные подсети:${NC}"
     echo "────────────────────────────────────────────────────────"
     
+    local idx
     for idx in "${!SELECTED_IFACES[@]}"; do
         local iface="${SELECTED_IFACES[$idx]}"
         local vlan="${SELECTED_VLANS[$idx]}"
@@ -399,25 +458,26 @@ print_summary() {
         
         calculate_network_params "$cidr" "$gateway"
         
+        local network_addr=$(echo "$CALC_NETWORK" | cut -d/ -f1)
+        
         if [ "$vlan" != "-" ]; then
             echo -e "${MAGENTA}VLAN $vlan${NC} (${CYAN}$iface${NC})"
         else
             echo -e "${CYAN}$iface${NC}"
         fi
         
-        echo -e "  Сеть:           ${CALC_NETWORK%/*}/$CALC_PREFIX"
+        echo -e "  Сеть:           $network_addr/$CALC_PREFIX"
         echo -e "  Шлюз:           $CALC_GATEWAY ${GREEN}(исключён из пула)${NC}"
         echo -e "  Диапазон DHCP:  $CALC_START - $CALC_END"
         echo -e "  Broadcast:      $CALC_BROADCAST"
         echo ""
     done
     
-    echo -e "${WHITE}Статус службы:${NC} $(systemctl is-active "$service_name")"
+    echo -e "${WHITE}Статус службы:${NC} $(systemctl is-active dhcpd 2>/dev/null || systemctl is-active isc-dhcp-server 2>/dev/null)"
     echo -e "${WHITE}Конфигурация:${NC}   $DHCP_CONF"
-    echo -e "${WHITE}Лог установки:${NC}  $LOG_FILE"
     echo ""
     echo -e "${YELLOW}Проверка работы:${NC}"
-    echo "  journalctl -u $service_name -f"
+    echo "  journalctl -u dhcpd -f"
     echo "  tail -f /var/log/messages | grep dhcp"
     echo ""
 }
@@ -430,7 +490,7 @@ print_summary() {
 check_root
 
 # Создаём лог-файл
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+mkdir -p /var/log 2>/dev/null
 touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/dhcp-setup.log"
 
 log "INFO: ========== Начало настройки DHCP =========="
@@ -439,7 +499,7 @@ log "INFO: ========== Начало настройки DHCP =========="
 clear
 echo -e "${CYAN}════════════════════════════════════════════════════${NC}"
 echo -e "${WHITE}     НАСТРОЙКА DHCP СЕРВЕРА ДЛЯ ALT SERVER${NC}"
-echo -e "${WHITE}             Версия 4.0 (Demo2026)${NC}"
+echo -e "${WHITE}             Версия 4.1 (Demo2026)${NC}"
 echo -e "${CYAN}════════════════════════════════════════════════════${NC}"
 echo ""
 
@@ -466,42 +526,8 @@ echo "────────────────────────�
 printf "%-3s %-18s %-10s %-18s %-10s\n" "№" "Интерфейс" "VLAN ID" "IP адрес" "Статус"
 echo "────────────────────────────────────────────────────────"
 
-INTERFACES=()
-IPS=()
-VLAN_IDS=()
-STATUSES=()
-INDEX=1
-
-while IFS= read -r line; do
-    iface=$(echo "$line" | awk '{print $2}' | cut -d@ -f1)
-    ip_cidr=$(echo "$line" | awk '{print $4}')
-    ip=$(echo "$ip_cidr" | cut -d/ -f1)
-    
-    [ "$iface" = "lo" ] && continue
-    
-    # Определяем VLAN
-    vlan_id="-"
-    if [[ "$iface" =~ \.([0-9]+)$ ]]; then
-        vlan_id="${BASH_REMATCH[1]}"
-    fi
-    
-    # Определяем статус
-    status=$(ip link show "$iface" 2>/dev/null | grep -o "state [A-Z]*" | awk '{print $2}')
-    
-    if [ -n "$ip" ] && [ "$ip" != "127.0.0.1" ]; then
-        INTERFACES+=("$iface")
-        IPS+=("$ip")
-        VLAN_IDS+=("$vlan_id")
-        STATUSES+=("$status")
-        
-        if [ "$vlan_id" != "-" ]; then
-            printf "${MAGENTA}%2d${NC}) %-18s ${CYAN}VID %-5s${NC} %-18s %s\n" "$INDEX" "$iface" "$vlan_id" "$ip" "$status"
-        else
-            printf "%2d) %-18s %-10s %-18s %s\n" "$INDEX" "$iface" "$vlan_id" "$ip" "$status"
-        fi
-        INDEX=$((INDEX + 1))
-    fi
-done < <(ip -4 -o addr show 2>/dev/null)
+# Получаем список интерфейсов (исправленная функция)
+get_interfaces
 
 echo "────────────────────────────────────────────────────────"
 echo ""
@@ -528,23 +554,21 @@ if [ "$IFACE_COUNT" -gt ${#INTERFACES[@]} ]; then
 fi
 
 # Выбор интерфейсов
-SELECTED_IFACES=()
-SELECTED_VLANS=()
-SELECTED_IPS=()
-
+local i
 for i in $(seq 1 $IFACE_COUNT); do
     while true; do
         echo -e "${YELLOW}Выберите интерфейс #$i:${NC}"
         read -p "Введите номер: " selection
         
         if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le ${#INTERFACES[@]} ]; then
-            idx=$((selection - 1))
-            iface="${INTERFACES[$idx]}"
+            local idx=$((selection - 1))
+            local iface="${INTERFACES[$idx]}"
             
             # Проверка дубликатов
-            duplicate=0
-            for selected in "${SELECTED_IFACES[@]}"; do
-                [ "$selected" = "$iface" ] && duplicate=1
+            local duplicate=0
+            local j
+            for j in "${SELECTED_IFACES[@]}"; do
+                [ "$j" = "$iface" ] && duplicate=1
             done
             
             if [ $duplicate -eq 0 ]; then
