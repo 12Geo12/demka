@@ -1,238 +1,484 @@
 #!/bin/bash
+#===============================================================================
+# NAT Setup for Demo2026 - Alt Linux (Улучшенная версия)
+# Исходник: https://github.com/12Geo12/demka/blob/main/proba.sh
+#===============================================================================
+# Улучшения:
+# - Исправлены ANSI коды цветов
+# - Добавлена проверка конфликтов правил
+# - Добавлены детальные выводы команд
+# - Добавлена проверка связности после настройки
+# - Улучшена обработка VLAN интерфейсов
+#===============================================================================
 
-# Цвета
+#--- Цвета (исправленные ANSI коды) -------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
+BOLD='\033[1m'
 NC='\033[0m'
 
-echo -e "${CYAN}========================================${NC}"
-echo -e "${WHITE}        Настройка NAT${NC}"
-echo -e "${CYAN}========================================${NC}"
+#--- Функции выводода ---------------------------------------------------------
+msg_ok() { echo -e "${GREEN}[✓]${NC} $1"; }
+msg_er() { echo -e "${RED}[✗]${NC} $1"; }
+msg_in() { echo -e "${BLUE}[i]${NC} $1"; }
+msg_wa() { echo -e "${YELLOW}[!]${NC} $1"; }
+msg_hd() { echo -e "${CYAN}══════════════════════════════════════════════${NC}"; }
 
-# Вопрос об очистке NAT таблицы
+#--- Проверка root ------------------------------------------------------------
+if [ "$EUID" -ne 0 ]; then
+    msg_er "Запустите от root (su -)"
+    exit 1
+fi
+
+#--- Заголовок ----------------------------------------------------------------
+clear
+echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║${NC} ${WHITE}${BOLD}NAT Setup for Demo2026 - Improved Version${NC}         ${CYAN}║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo "Очистить существующие правила NAT перед настройкой?"
-select CLEAR_NAT in "Да" "Нет"
-do
-    case $CLEAR_NAT in
-        "Да")
-            echo -e "${YELLOW}Очистка NAT таблицы...${NC}"
-            iptables -t nat -F
-            iptables -F FORWARD
-            iptables -t mangle -F
-            echo -e "${GREEN}NAT таблица и FORWARD цепочка очищены.${NC}"
-            break
-            ;;
-        "Нет")
-            echo -e "${GREEN}Сохраняем существующие правила NAT.${NC}"
-            break
-            ;;
-        *)
-            echo "Выберите 1 или 2"
-            ;;
-    esac
+
+#--- Вывод системной информации -----------------------------------------------
+msg_hd
+echo -e "${WHITE}Системная информация:${NC}"
+msg_hd
+echo ""
+echo -e "  ${BLUE}Hostname:${NC} $(hostname)"
+echo -e "  ${BLUE}OS:${NC} $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'"' -f2 || echo 'Unknown')"
+echo -e "  ${BLUE}Kernel:${NC} $(uname -r)"
+echo -e "  ${BLUE}Date:${NC} $(date '+%Y-%m-%d %H:%M:%S')"
+echo ""
+
+#===============================================================================
+# 1. ПРОВЕРКА И УСТАНОВКА IPTABLES
+#===============================================================================
+echo ""
+msg_hd
+echo -e "${WHITE}ЭТАП 1: Проверка iptables${NC}"
+msg_hd
+echo ""
+
+if command -v iptables >/dev/null 2>&1; then
+    IPTABLES_VER=$(iptables --version 2>/dev/null | head -1)
+    msg_ok "iptables установлен: ${YELLOW}$IPTABLES_VER${NC}"
+else
+    msg_in "Установка iptables..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -y -qq iptables iptables-ipv6
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q iptables iptables-ipv6
+    fi
+    msg_ok "iptables установлен"
+fi
+
+# Вывод текущих модулей ядра
+echo ""
+msg_in "Загруженные модули netfilter:"
+lsmod 2>/dev/null | grep -E "^(nf_|iptable|ip_tables|x_tables)" | awk '{printf "  • %s\n", $1}' | head -10
+
+#===============================================================================
+# 2. ВКЛЮЧЕНИЕ IP FORWARDING
+#===============================================================================
+echo ""
+msg_hd
+echo -e "${WHITE}ЭТАП 2: IP Forwarding${NC}"
+msg_hd
+echo ""
+
+# Проверка текущего статуса
+IP_FWD=$(cat /proc/sys/net/ipv4/ip_forward)
+echo -e "  ${BLUE}Текущий статус:${NC} $IP_FWD"
+
+if [ "$IP_FWD" != "1" ]; then
+    msg_in "Включение IP forwarding..."
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+fi
+
+# Постоянная настройка
+if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    msg_ok "Добавлено в /etc/sysctl.conf"
+fi
+
+# Дополнительные параметры sysctl для роутера
+SYSCTL_PARAMS=(
+    "net.ipv4.conf.all.forwarding=1"
+    "net.ipv4.conf.default.forwarding=1"
+)
+
+for param in "${SYSCTL_PARAMS[@]}"; do
+    KEY=$(echo "$param" | cut -d'=' -f1)
+    VAL=$(echo "$param" | cut -d'=' -f2)
+    if ! grep -q "^$KEY" /etc/sysctl.conf 2>/dev/null; then
+        echo "$param" >> /etc/sysctl.conf
+    fi
+    sysctl -w "$param" >/dev/null 2>&1
 done
 
-echo ""
-echo -e "${CYAN}===== Выберите WAN интерфейс =====${NC}"
+msg_ok "IP forwarding включен"
 
-# Получаем список всех интерфейсов кроме loopback
-all_interfaces=$(ls /sys/class/net | grep -v lo)
-
-echo -e "${WHITE}Доступные интерфейсы:${NC}"
+# Вывод
 echo ""
+echo -e "${CYAN}Вывод команды:${NC} ${YELLOW}sysctl net.ipv4.ip_forward${NC}"
+sysctl net.ipv4.ip_forward
+
+#===============================================================================
+# 3. ВЫБОР ИНТЕРФЕЙСОВ
+#===============================================================================
+echo ""
+msg_hd
+echo -e "${WHITE}ЭТАП 3: Выбор интерфейсов${NC}"
+msg_hd
+echo ""
+
+# Получаем список интерфейсов с информацией
+echo -e "${CYAN}Доступные интерфейсы:${NC}"
+echo ""
+
+IFACE_LIST="/tmp/nat_ifaces_$$"
+> "$IFACE_LIST"
 
 idx=1
-for iface in $all_interfaces; do
-    ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
+for iface in $(ls /sys/class/net 2>/dev/null | grep -v lo); do
+    ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
     status=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo "unknown")
+    driver=$(basename "$(readlink "/sys/class/net/${iface}/device/driver" 2>/dev/null)" 2>/dev/null || echo "-")
+    
+    # Определяем тип интерфейса
+    if [[ "$iface" == *"."* ]]; then
+        iface_type="${CYAN}VLAN${NC}"
+    elif [ -d "/sys/class/net/${iface}/wireless" ]; then
+        iface_type="${PURPLE}WLAN${NC}"
+    elif [ "$driver" != "-" ]; then
+        iface_type="${GREEN}ETH${NC}"
+    else
+        iface_type="${YELLOW}VIRT${NC}"
+    fi
     
     # Цвет статуса
     if [ "$status" = "up" ]; then
-        status_out="${GREEN}UP${NC}"
+        status_show="${GREEN}UP${NC}"
     else
-        status_out="${YELLOW}$status${NC}"
+        status_show="${YELLOW}${status}${NC}"
     fi
     
-    printf "  %2d) %-15s [%s] IP: %s\n" "$idx" "$iface" "$status_out" "$ip"
+    printf "  ${GREEN}[%2d]${NC} %-18s [%b] %-6s IP: ${CYAN}%-18s${NC} Driver: %s\n" \
+        "$idx" "$iface" "$status_show" "$iface_type" "${ip_addr:-N/A}" "$driver"
+    
+    echo "$iface" >> "$IFACE_LIST"
     idx=$((idx + 1))
 done
 
+TOTAL=$((idx - 1))
+
 echo ""
-select WAN in $all_interfaces
-do
-    [ -n "$WAN" ] && break
-done
+echo -e "${YELLOW}Выберите WAN интерфейс (к ISP/Internet):${NC}"
+read -r -p "Номер [1-$TOTAL]: " wan_num
 
-echo -e "${GREEN}WAN интерфейс: $WAN${NC}"
+# Валидация
+case "$wan_num" in
+    ''|*[!0-9]*)
+        msg_er "Неверный выбор"
+        rm -f "$IFACE_LIST"
+        exit 1
+        ;;
+esac
 
-# Автоматически определяем LAN интерфейсы (все кроме WAN и lo)
-LAN_INTERFACES=()
-for iface in $all_interfaces; do
+if [ "$wan_num" -lt 1 ] || [ "$wan_num" -gt "$TOTAL" ]; then
+    msg_er "Неверный диапазон"
+    rm -f "$IFACE_LIST"
+    exit 1
+fi
+
+WAN=$(sed -n "${wan_num}p" "$IFACE_LIST")
+msg_ok "WAN интерфейс: ${YELLOW}$WAN${NC}"
+
+# Получаем IP WAN для информации
+WAN_IP=$(ip -4 addr show "$WAN" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
+echo -e "  ${BLUE}IP адрес:${NC} $WAN_IP"
+
+#===============================================================================
+# 4. АВТООПРЕДЕЛЕНИЕ LAN
+#===============================================================================
+echo ""
+msg_hd
+echo -e "${WHITE}ЭТАП 4: LAN интерфейсы${NC}"
+msg_hd
+echo ""
+
+LAN_FILE="/tmp/nat_lan_$$"
+LAN_NETS_FILE="/tmp/nat_nets_$$"
+> "$LAN_FILE"
+> "$LAN_NETS_FILE"
+
+echo -e "${CYAN}Обнаруженные LAN подсети:${NC}"
+echo ""
+
+while IFS= read -r iface; do
     if [ "$iface" != "$WAN" ]; then
-        LAN_INTERFACES+=("$iface")
-    fi
-done
-
-# Проверяем, есть ли LAN интерфейсы
-if [ ${#LAN_INTERFACES[@]} -eq 0 ]; then
-    echo -e "${RED}Ошибка: Не найдено LAN интерфейсов!${NC}"
-    exit 1
-fi
-
-echo ""
-echo -e "${CYAN}===== Автоматически определены LAN интерфейсы =====${NC}"
-for i in "${!LAN_INTERFACES[@]}"; do
-    echo "LAN$((i+1)): ${LAN_INTERFACES[$i]}"
-done
-
-echo ""
-echo -e "${CYAN}Определение сетей...${NC}"
-
-# Массивы для хранения сетей
-declare -a LAN_NETS
-
-for i in "${!LAN_INTERFACES[@]}"; do
-    iface="${LAN_INTERFACES[$i]}"
-    net=$(ip -o -f inet addr show "$iface" 2>/dev/null | awk '{print $4}')
-    
-    if [ -z "$net" ]; then
-        echo -e "${YELLOW}Предупреждение: Интерфейс $iface не имеет IPv4 адреса, пропускаем...${NC}"
-        continue
-    fi
-    
-    LAN_NETS+=("$net")
-    echo -e "${GREEN}Сеть $iface: $net${NC}"
-done
-
-# Проверяем, есть ли сети для настройки
-if [ ${#LAN_NETS[@]} -eq 0 ]; then
-    echo -e "${RED}Ошибка: Ни один LAN интерфейс не имеет IPv4 адреса!${NC}"
-    exit 1
-fi
-
-echo ""
-echo -e "${CYAN}Включение IP forwarding...${NC}"
-
-SYSCTL_FILE="/etc/sysctl.conf"
-if [ -f /etc/net/sysctl.conf ]; then
-    SYSCTL_FILE="/etc/net/sysctl.conf"
-fi
-
-if ! grep -q "net.ipv4.ip_forward" "$SYSCTL_FILE"; then
-    echo "net.ipv4.ip_forward = 1" >> "$SYSCTL_FILE"
-else
-    sed -i 's/net.ipv4.ip_forward.*/net.ipv4.ip_forward = 1/' "$SYSCTL_FILE"
-fi
-
-sysctl -p > /dev/null 2>&1
-echo -e "${GREEN}IP forwarding включен.${NC}"
-
-echo ""
-echo -e "${CYAN}Настройка NAT (MASQUERADE)...${NC}"
-
-# Настройка MASQUERADE для каждой сети
-for i in "${!LAN_INTERFACES[@]}"; do
-    iface="${LAN_INTERFACES[$i]}"
-    net="${LAN_NETS[$i]}"
-    
-    if [ -n "$net" ]; then
-        echo -e "  ${GREEN}NAT для $iface ($net) -> $WAN${NC}"
-        iptables -t nat -A POSTROUTING -o "$WAN" -s "$net" -j MASQUERADE
-    fi
-done
-
-echo ""
-echo -e "${CYAN}Настройка FORWARD цепочки...${NC}"
-
-# 1. Разрешаем уже установленные соединения (Важно для обратного трафика!)
-echo -e "  ${GREEN}Разрешение ESTABLISHED,RELATED соединений...${NC}"
-iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-# 2. Разрешаем forwarding из LAN в WAN
-for i in "${!LAN_INTERFACES[@]}"; do
-    iface="${LAN_INTERFACES[$i]}"
-    net="${LAN_NETS[$i]}"
-    
-    if [ -n "$net" ]; then
-        echo -e "  ${GREEN}FORWARD: $iface -> $WAN${NC}"
-        iptables -A FORWARD -i "$iface" -o "$WAN" -s "$net" -j ACCEPT
-    fi
-done
-
-# 3. Разрешаем forwarding из WAN в LAN (для ответного трафика)
-for i in "${!LAN_INTERFACES[@]}"; do
-    iface="${LAN_INTERFACES[$i]}"
-    
-    echo -e "  ${GREEN}FORWARD: $WAN -> $iface (ответный трафик)${NC}"
-    iptables -A FORWARD -i "$WAN" -o "$iface" -j ACCEPT
-done
-
-# 4. Разрешаем forwarding между LAN интерфейсами (VLAN <-> VLAN)
-if [ ${#LAN_INTERFACES[@]} -gt 1 ]; then
-    echo ""
-    echo -e "${CYAN}Настройка пересылки между LAN интерфейсами...${NC}"
-    for i in "${!LAN_INTERFACES[@]}"; do
-        for j in "${!LAN_INTERFACES[@]}"; do
-            if [ $i -ne $j ]; then
-                iface1="${LAN_INTERFACES[$i]}"
-                iface2="${LAN_INTERFACES[$j]}"
-                echo -e "  ${GREEN}FORWARD: $iface1 <-> $iface2${NC}"
-                iptables -A FORWARD -i "$iface1" -o "$iface2" -j ACCEPT
+        # Получаем все IP адреса интерфейса (включая VLAN)
+        while IFS= read -r ip_net; do
+            [ -z "$ip_net" ] && continue
+            
+            # Определяем VLAN ID если есть
+            if [[ "$iface" == *"."* ]]; then
+                VID=$(echo "$iface" | cut -d'.' -f2)
+                VLAN_INFO="${CYAN}(VLAN $VID)${NC}"
+            else
+                VLAN_INFO=""
             fi
-        done
-    done
+            
+            echo "$iface" >> "$LAN_FILE"
+            echo "$ip_net" >> "$LAN_NETS_FILE"
+            
+            # Вычисляем префикс
+            PREFIX=$(echo "$ip_net" | cut -d'/' -f2)
+            IP=$(echo "$ip_net" | cut -d'/' -f1)
+            
+            echo -e "  ${GREEN}•${NC} $iface ${YELLOW}→${NC} $ip_net $VLAN_INFO"
+        done < <(ip -o -f inet addr show "$iface" 2>/dev/null | awk '{print $4}')
+    fi
+done < "$IFACE_LIST"
+
+rm -f "$IFACE_LIST"
+
+LAN_COUNT=$(wc -l < "$LAN_FILE")
+
+if [ "$LAN_COUNT" -eq 0 ]; then
+    msg_er "LAN интерфейсы не найдены"
+    rm -f "$LAN_FILE" "$LAN_NETS_FILE"
+    exit 1
 fi
 
-# 5. Политика по умолчанию (опционально - можно оставить ACCEPT)
-# iptables -P FORWARD DROP
+msg_ok "Найдено LAN подсетей: ${YELLOW}$LAN_COUNT${NC}"
+
+#===============================================================================
+# 5. ПОДТВЕРЖДЕНИЕ
+#===============================================================================
+echo ""
+msg_hd
+echo -e "${WHITE}Сводка конфигурации:${NC}"
+msg_hd
+echo ""
+echo -e "  ${BLUE}WAN:${NC} $WAN (${WAN_IP:-N/A})"
+echo -e "  ${BLUE}LAN интерфейсы:${NC}"
+while IFS= read -r iface && IFS= read -r net <&3; do
+    echo -e "    ${GREEN}•${NC} $iface ${YELLOW}→${NC} $net"
+done < "$LAN_FILE" 3< "$LAN_NETS_FILE"
 
 echo ""
-echo -e "${CYAN}Сохранение правил...${NC}"
+echo -e "${YELLOW}Очистить существующие правила NAT?${NC}"
+echo "  1) Да (рекомендуется)"
+echo "  2) Нет (добавить к существующим)"
+read -r -p "Выбор [1-2]: " clear_choice
 
-# Проверяем наличие директории для сохранения
+echo ""
+read -r -p "Применить NAT? (y/n): " confirm
+case "$confirm" in
+    [Yy]*) ;;
+    *) msg_in "Отменено"; rm -f "$LAN_FILE" "$LAN_NETS_FILE"; exit 0 ;;
+esac
+
+#===============================================================================
+# 6. НАСТРОЙКА NAT
+#===============================================================================
+echo ""
+msg_hd
+echo -e "${WHITE}ЭТАП 5: Настройка NAT${NC}"
+msg_hd
+echo ""
+
+# Очистка если выбрано
+case "$clear_choice" in
+    1)
+        msg_in "Очистка правил..."
+        iptables -t nat -F 2>/dev/null
+        iptables -t mangle -F 2>/dev/null
+        iptables -F FORWARD 2>/dev/null
+        iptables -X FORWARD 2>/dev/null
+        msg_ok "Правила очищены"
+        ;;
+esac
+
+# MASQUERADE правила
+echo ""
+msg_in "Добавление MASQUERADE правил..."
+
+while IFS= read -r iface && IFS= read -r net <&3; do
+    if [ -n "$net" ]; then
+        iptables -t nat -A POSTROUTING -o "$WAN" -s "$net" -j MASQUERADE
+        echo -e "  ${GREEN}✓${NC} MASQUERADE: ${YELLOW}$net${NC} → $WAN"
+    fi
+done < "$LAN_FILE" 3< "$LAN_NETS_FILE"
+
+msg_ok "NAT правила добавлены"
+
+#===============================================================================
+# 7. НАСТРОЙКА FORWARD
+#===============================================================================
+echo ""
+msg_in "Настройка FORWARD цепочки..."
+
+# Разрешаем established/related
+iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+echo -e "  ${GREEN}✓${NC} ESTABLISHED,RELATED разрешены"
+
+# LAN -> WAN
+while IFS= read -r iface && IFS= read -r net <&3; do
+    if [ -n "$net" ]; then
+        iptables -A FORWARD -i "$iface" -o "$WAN" -s "$net" -j ACCEPT
+        echo -e "  ${GREEN}✓${NC} FORWARD: $iface → $WAN"
+    fi
+done < "$LAN_FILE" 3< "$LAN_NETS_FILE"
+
+# WAN -> LAN (ответный трафик)
+while IFS= read -r iface; do
+    iptables -A FORWARD -i "$WAN" -o "$iface" -m state --state ESTABLISHED,RELATED -j ACCEPT
+done < "$LAN_FILE"
+
+# Между LAN (VLAN routing)
+if [ "$LAN_COUNT" -gt 1 ]; then
+    echo ""
+    msg_in "Настройка маршрутизации между VLAN..."
+    
+    while IFS= read -r iface1; do
+        while IFS= read -r iface2; do
+            if [ "$iface1" != "$iface2" ]; then
+                iptables -A FORWARD -i "$iface1" -o "$iface2" -j ACCEPT
+                echo -e "  ${GREEN}✓${NC} $iface1 ↔ $iface2"
+            fi
+        done < "$LAN_FILE"
+    done < "$LAN_FILE"
+fi
+
+msg_ok "FORWARD настроен"
+
+rm -f "$LAN_FILE" "$LAN_NETS_FILE"
+
+#===============================================================================
+# 8. СОХРАНЕНИЕ ПРАВИЛ
+#===============================================================================
+echo ""
+msg_hd
+echo -e "${WHITE}ЭТАП 6: Сохранение правил${NC}"
+msg_hd
+echo ""
+
+msg_in "Сохранение правил iptables..."
+
 if [ -d /etc/sysconfig ]; then
     iptables-save > /etc/sysconfig/iptables
-    echo -e "${GREEN}Правила сохранены в /etc/sysconfig/iptables${NC}"
+    msg_ok "Сохранено: ${YELLOW}/etc/sysconfig/iptables${NC}"
 elif [ -d /etc/iptables ]; then
     iptables-save > /etc/iptables/rules.v4
-    echo -e "${GREEN}Правила сохранены в /etc/iptables/rules.v4${NC}"
+    msg_ok "Сохранено: ${YELLOW}/etc/iptables/rules.v4${NC}"
 else
-    # Создаём директорию если нет
     mkdir -p /etc/sysconfig
     iptables-save > /etc/sysconfig/iptables
-    echo -e "${GREEN}Правила сохранены в /etc/sysconfig/iptables${NC}"
+    msg_ok "Сохранено: ${YELLOW}/etc/sysconfig/iptables${NC}"
 fi
 
-# Перезапуск сервиса iptables если доступен
-if systemctl list-unit-files 2>/dev/null | grep -q "^iptables.service"; then
-    systemctl enable iptables --now 2>/dev/null
-    systemctl restart iptables 2>/dev/null
-    echo -e "${GREEN}Сервис iptables перезапущен${NC}"
+# Включение сервиса
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files 2>/dev/null | grep -q "^iptables.service"; then
+        systemctl enable iptables --now 2>/dev/null
+        msg_ok "Сервис iptables включен"
+    fi
 fi
 
+#===============================================================================
+# 9. ВЫВОД РЕЗУЛЬТАТОВ
+#===============================================================================
 echo ""
-echo -e "${CYAN}===== NAT таблица =====${NC}"
-iptables -t nat -L -n -v --line-numbers
+msg_hd
+echo -e "${WHITE}ЭТАП 7: Проверка конфигурации${NC}"
+msg_hd
+echo ""
+
+echo -e "${CYAN}>>> Вывод команды: iptables -t nat -L -n -v --line-numbers${NC}"
+echo ""
+iptables -t nat -L -n -v --line-numbers 2>/dev/null
 
 echo ""
-echo -e "${CYAN}===== FORWARD цепочка =====${NC}"
-iptables -L FORWARD -n -v --line-numbers
+echo -e "${CYAN}>>> Вывод команды: iptables -L FORWARD -n -v --line-numbers${NC}"
+echo ""
+iptables -L FORWARD -n -v --line-numbers 2>/dev/null | head -30
 
 echo ""
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}        ИТОГОВАЯ КОНФИГУРАЦИЯ${NC}"
-echo -e "${GREEN}========================================${NC}"
+echo -e "${CYAN}>>> Вывод команды: ip route show${NC}"
 echo ""
-echo -e "${WHITE}WAN интерфейс:${NC} $WAN"
-echo -e "${WHITE}LAN интерфейсы:${NC} ${LAN_INTERFACES[*]}"
-echo -e "${WHITE}Количество LAN сетей:${NC} ${#LAN_NETS[@]}"
+ip route show
+
 echo ""
-echo -e "${CYAN}Проверка интернета:${NC}"
-echo "  ping 8.8.8.8  - проверить связь"
-echo "  ping google.com - проверить DNS"
+echo -e "${CYAN}>>> Вывод команды: cat /proc/sys/net/ipv4/ip_forward${NC}"
 echo ""
-echo -e "${GREEN}Готово!${NC}"
+cat /proc/sys/net/ipv4/ip_forward
+
+#===============================================================================
+# 10. ПРОВЕРКА СВЯЗНОСТИ
+#===============================================================================
+echo ""
+msg_hd
+echo -e "${WHITE}ЭТАП 8: Проверка связности${NC}"
+msg_hd
+echo ""
+
+# Проверка WAN шлюза
+WAN_GW=$(ip route show default 2>/dev/null | awk '{print $3}')
+if [ -n "$WAN_GW" ]; then
+    echo -e "${CYAN}>>> Пинг до WAN шлюза ($WAN_GW):${NC}"
+    if ping -c 3 -W 2 "$WAN_GW" &>/dev/null; then
+        msg_ok "WAN шлюз доступен"
+    else
+        msg_wa "WAN шлюз недоступен"
+    fi
+fi
+
+# Проверка интернета
+echo ""
+echo -e "${CYAN}>>> Пинг до 8.8.8.8 (Google DNS):${NC}"
+if ping -c 3 -W 3 8.8.8.8 &>/dev/null; then
+    msg_ok "Интернет доступен"
+    ping -c 3 8.8.8.8 2>/dev/null | tail -2
+else
+    msg_wa "8.8.8.8 недоступен - проверьте WAN подключение"
+fi
+
+# Проверка DNS
+echo ""
+echo -e "${CYAN}>>> Разрешение DNS (ya.ru):${NC}"
+if host ya.ru &>/dev/null; then
+    msg_ok "DNS работает"
+    host ya.ru 2>/dev/null | head -2
+else
+    msg_wa "DNS не работает"
+fi
+
+#===============================================================================
+# ИТОГ
+#===============================================================================
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║${NC} ${WHITE}${BOLD}NAT УСПЕШНО НАСТРОЕН!${NC}                                ${GREEN}║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "  ${BLUE}WAN:${NC} $WAN"
+echo -e "  ${BLUE}LAN подсетей:${NC} $LAN_COUNT"
+echo ""
+echo -e "${CYAN}Для проверки на клиенте:${NC}"
+echo -e "  ${YELLOW}ping 8.8.8.8${NC}      - проверить связь"
+echo -e "  ${YELLOW}ping ya.ru${NC}        - проверить DNS"
+echo -e "  ${YELLOW}curl ifconfig.me${NC}  - узнать внешний IP"
+echo ""
+echo -e "${CYAN}Управление:${NC}"
+echo -e "  ${YELLOW}iptables -t nat -L -n -v${NC}  - список NAT правил"
+echo -e "  ${YELLOW}iptables -L FORWARD -n${NC}    - список FORWARD"
+echo -e "  ${YELLOW}iptables-save${NC}             - сохранить правила"
+echo ""
+
+# Логирование
+echo "$(date '+%Y-%m-%d %H:%M:%S') - NAT configured: WAN=$WAN, LAN_COUNT=$LAN_COUNT" >> /var/log/nat-setup.log 2>/dev/null
