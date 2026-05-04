@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# DNS Server Setup - FINAL FIX
-# Исправление прав и запуск DNS
+# DNS Server Setup - AUTO DETECT IP
+# Автоматическое определение IP адресов из текущего сервера
 #===============================================================================
 
 RED='\033[0;31m'
@@ -9,122 +9,265 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 msg_ok() { printf "${GREEN}[✓]${NC} %s\n" "$1"; }
 msg_er() { printf "${RED}[✗]${NC} %s\n" "$1"; }
 msg_in() { printf "${BLUE}[i]${NC} %s\n" "$1"; }
+msg_wrn() { printf "${YELLOW}[!]${NC} %s\n" "$1"; }
+msg_auto() { printf "${MAGENTA}[⚡]${NC} %s\n" "$1"; }
+
+die() { msg_er "$1"; exit 1; }
+
+# Проверка root
+[ "$(id -u)" -ne 0 ] && die "Запустите от root (su -)"
 
 clear
 echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║${NC} ${YELLOW}DNS Server Setup - FINAL FIX${NC}"
+echo -e "${CYAN}║${NC} ${YELLOW}DNS Server Setup - AUTO DETECT${NC}"
 echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+
+# Параметры по умолчанию
+DOMAIN="au-team.irpo"
+FORWARDER="77.88.8.8"
+
+#===========================================
+# АВТООПРЕДЕЛЕНИЕ IP АДРЕСОВ
+#===========================================
+echo ""
+msg_in "Автоопределение IP адресов сервера..."
 echo ""
 
-# Проверка root
-[ "$(id -u)" -ne 0 ] && { msg_er "Запустите от root"; exit 1; }
+# Получаем все IP адреса сервера
+declare -a ALL_IPS
+declare -a ALL_IFACES
 
-# Параметры
-echo -e "${CYAN}Введите IP адрес DNS сервера (этот сервер):${NC}"
-read -r -p "IP [192.168.5.2]: " DNS_IP
-[ -z "$DNS_IP" ] && DNS_IP="192.168.5.2"
+idx=0
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    
+    iface=$(echo "$line" | awk '{print $1}')
+    ip_full=$(echo "$line" | awk '{print $3}')
+    [ -z "$ip_full" ] && continue
+    
+    ip=$(echo "$ip_full" | cut -d'/' -f1)
+    iface_clean=$(echo "$iface" | cut -d'@' -f1)
+    
+    ALL_IPS+=("$ip")
+    ALL_IFACES+=("$iface_clean")
+    
+    echo -e "  ${GREEN}[$((idx+1))]${NC} $iface_clean: ${YELLOW}$ip${NC}"
+    
+    idx=$((idx + 1))
+done < <(ip -br addr show 2>/dev/null | grep -v "^lo")
 
-echo ""
-echo -e "${CYAN}Введите IP адреса устройств:${NC}"
+TOTAL_IPS=$idx
 
-read -r -p "HQ-RTR [192.168.5.1]: " HQ_RTR
-[ -z "$HQ_RTR" ] && HQ_RTR="192.168.5.1"
-
-read -r -p "BR-RTR [192.168.6.1]: " BR_RTR
-[ -z "$BR_RTR" ] && BR_RTR="192.168.6.1"
-
-read -r -p "HQ-SRV [192.168.5.2]: " HQ_SRV
-[ -z "$HQ_SRV" ] && HQ_SRV="192.168.5.2"
-
-read -r -p "BR-SRV [192.168.6.2]: " BR_SRV
-[ -z "$BR_SRV" ] && BR_SRV="192.168.6.2"
-
-read -r -p "Docker (ISP-HQ) [172.16.5.1]: " DOCKER
-[ -z "$DOCKER" ] && DOCKER="172.16.5.1"
-
-read -r -p "Web (ISP-BR) [172.16.6.1]: " WEB
-[ -z "$WEB" ] && WEB="172.16.6.1"
-
-read -r -p "Домен [au-team.irpo]: " DOMAIN
-[ -z "$DOMAIN" ] && DOMAIN="au-team.irpo"
-
-read -r -p "Forwarder [77.88.8.8]: " FORWARDER
-[ -z "$FORWARDER" ] && FORWARDER="77.88.8.8"
+if [ $TOTAL_IPS -eq 0 ]; then
+    die "IP адреса не найдены"
+fi
 
 echo ""
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-echo -e "  DNS IP:    $DNS_IP"
-echo -e "  Домен:     $DOMAIN"
-echo -e "  Forwarder: $FORWARDER"
-echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+
+# Определяем DNS сервер IP
+# HQ-SRV обычно имеет IP из внутренней сети офиса
+DNS_SERVER_IP=""
+
+# Автовыбор: берём первый IP из приватной сети
+for ip in "${ALL_IPS[@]}"; do
+    case "$ip" in
+        192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)
+            DNS_SERVER_IP="$ip"
+            break
+            ;;
+    esac
+done
+
+# Если не нашли приватный, берём первый
+if [ -z "$DNS_SERVER_IP" ] && [ $TOTAL_IPS -gt 0 ]; then
+    DNS_SERVER_IP="${ALL_IPS[0]}"
+fi
+
+msg_auto "Определён IP этого сервера: ${YELLOW}$DNS_SERVER_IP${NC}"
+
+#===========================================
+# ОПРЕДЕЛЕНИЕ СЕТИ И ДРУГИХ УСТРОЙСТВ
+#===========================================
 echo ""
-read -r -p "Продолжить? (y): " confirm
+msg_in "Определение параметров сети..."
+
+# Определяем сеть сервера
+SERVER_NET=$(echo "$DNS_SERVER_IP" | awk -F. '{print $1"."$2"."$3}')
+SERVER_NET_FULL=$(echo "$DNS_SERVER_IP" | awk -F. '{print $1"."$2}')
+
+# Автоматически определяем вероятные IP других устройств на основе сети
+# Считаем что маршрутизатор - .1 в той же сети
+HQ_RTR_IP="${SERVER_NET}.1"
+
+# Определяем имя сервера по IP
+case "$DNS_SERVER_IP" in
+    *.6.2|*.6.*)
+        SERVER_NAME="hq-srv"
+        # HQ сеть = .6.x
+        HQ_NET_PREFIX=$(echo "$DNS_SERVER_IP" | awk -F. '{print $1"."$2}')
+        HQ_RTR_IP="${HQ_NET_PREFIX}.5.1"
+        BR_RTR_IP="${HQ_NET_PREFIX}.5.2"
+        HQ_SRV_IP="$DNS_SERVER_IP"
+        BR_SRV_IP="${HQ_NET_PREFIX}.6.2"
+        ;;
+    *.5.*|*.4.*)
+        SERVER_NAME="hq-rtr или br-rtr"
+        HQ_RTR_IP="${SERVER_NET}.1"
+        ;;
+    *)
+        SERVER_NAME="hq-srv"
+        HQ_RTR_IP="${SERVER_NET}.1"
+        HQ_SRV_IP="$DNS_SERVER_IP"
+        ;;
+esac
+
+msg_auto "Этот сервер определён как: ${YELLOW}$SERVER_NAME${NC}"
+
+#===========================================
+# ВВОСД ДАННЫХ ДРУГИХ УСТРОЙСТВ
+#===========================================
+echo ""
+echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}Введите IP адреса других устройств:${NC}"
+echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+echo ""
+
+read -r -p "HQ-RTR IP [$HQ_RTR_IP]: " input
+[ -n "$input" ] && HQ_RTR_IP="$input"
+
+read -r -p "BR-RTR IP [192.168.5.2]: " input
+[ -n "$input" ] && BR_RTR_IP="$input"
+[ -z "${BR_RTR_IP}" ] && BR_RTR_IP="192.168.5.2"
+
+read -r -p "HQ-SRV IP [$DNS_SERVER_IP]: " input
+[ -n "$input" ] && HQ_SRV_IP="$input"
+[ -z "${HQ_SRV_IP}" ] && HQ_SRV_IP="$DNS_SERVER_IP"
+
+read -r -p "BR-SRV IP [192.168.6.2]: " input
+[ -n "$input" ] && BR_SRV_IP="$input"
+[ -z "${BR_SRV_IP}" ] && BR_SRV_IP="192.168.6.2"
+
+read -r -p "Docker/ISP-HQ IP [172.16.4.1]: " input
+[ -n "$input" ] && DOCKER_IP="$input"
+[ -z "${DOCKER_IP}" ] && DOCKER_IP="172.16.4.1"
+
+read -r -p "Web/ISP-BR IP [172.16.5.1]: " input
+[ -n "$input" ] && WEB_IP="$input"
+[ -z "${WEB_IP}" ] && WEB_IP="172.16.5.1"
+
+echo ""
+read -r -p "Домен [$DOMAIN]: " input
+[ -n "$input" ] && DOMAIN="$input"
+
+read -r -p "Forwarder [$FORWARDER]: " input
+[ -n "$input" ] && FORWARDER="$input"
+
+# DNS сервер IP
+DNS_SERVER_IP="$HQ_SRV_IP"
+
+#===========================================
+# ИТОГОВАЯ ТАБЛИЦА
+#===========================================
+echo ""
+echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}Параметры DNS сервера:${NC}"
+echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+echo ""
+echo -e "  IP DNS сервера:  ${YELLOW}$DNS_SERVER_IP${NC}"
+echo -e "  Домен:           ${YELLOW}$DOMAIN${NC}"
+echo -e "  Forwarder:       ${YELLOW}$FORWARDER${NC}"
+echo ""
+echo -e "${YELLOW}DNS записи:${NC}"
+printf "  %-18s → %-15s %s\n" "hq-rtr.$DOMAIN" "$HQ_RTR_IP" "(A,PTR)"
+printf "  %-18s → %-15s %s\n" "br-rtr.$DOMAIN" "$BR_RTR_IP" "(A)"
+printf "  %-18s → %-15s %s\n" "hq-srv.$DOMAIN" "$HQ_SRV_IP" "(A,PTR)"
+printf "  %-18s → %-15s %s\n" "br-srv.$DOMAIN" "$BR_SRV_IP" "(A)"
+printf "  %-18s → %-15s %s\n" "docker.$DOMAIN" "$DOCKER_IP" "(A)"
+printf "  %-18s → %-15s %s\n" "web.$DOMAIN" "$WEB_IP" "(A)"
+echo ""
+echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+
+echo ""
+read -r -p "Применить? (y): " confirm
 [[ ! "$confirm" =~ ^[Yy]?$ ]] && { msg_in "Отменено"; exit 0; }
 
 #===========================================
-# 1. УСТАНОВКА ПАКЕТА
+# 1. УСТАНОВКА BIND
 #===========================================
 echo ""
 msg_in "Установка bind..."
-apt-get update -qq 2>/dev/null
-apt-get install -y bind bind-utils 2>/dev/null || apt-get install -y bind 2>/dev/null
+
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq 2>/dev/null
+    apt-get install -y bind bind-utils 2>/dev/null || apt-get install -y bind 2>/dev/null
+fi
+
 msg_ok "Bind установлен"
 
 #===========================================
-# 2. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ (если нужно)
+# 2. ПОЛЬЗОВАТЕЛЬ NAMED
 #===========================================
 if ! id named >/dev/null 2>&1; then
-    msg_in "Создание пользователя named..."
     useradd -r -s /sbin/nologin named 2>/dev/null
 fi
-msg_ok "Пользователь named существует"
+
+# Проверяем группу
+if ! getent group named >/dev/null 2>&1; then
+    groupadd -r named 2>/dev/null
+fi
+
+msg_ok "Пользователь named готов"
 
 #===========================================
-# 3. СОЗДАНИЕ ДИРЕКТОРИЙ И ПРАВ (КРИТИЧНО!)
+# 3. ДИРЕКТОРИИ И ПРАВА (КРИТИЧНО!)
 #===========================================
 echo ""
-msg_in "Исправление прав на /var/named..."
+msg_in "Создание директорий и установка прав..."
 
-# Создаём директории
 mkdir -p /var/named/data
 mkdir -p /var/named/slaves 2>/dev/null
-mkdir -p /var/named/dynamic 2>/dev/null
 
-# Устанавливаем правильные права
+# КРИТИЧНО: правильные права!
 chown -R named:named /var/named
 chmod 770 /var/named
 chmod 770 /var/named/data
 chmod 770 /var/named/slaves 2>/dev/null
-chmod 770 /var/named/dynamic 2>/dev/null
 
-msg_ok "Права установлены"
-
-# Проверка
-echo ""
-msg_in "Проверка прав:"
-ls -la /var/ | grep named
+# Дополнительные проверки
+if [ -d /var/named ]; then
+    msg_ok "Права на /var/named установлены"
+    ls -ld /var/named
+else
+    die "Не удалось создать /var/named"
+fi
 
 #===========================================
-# 4. КОНФИГУРАЦИЯ
+# 4. ОБРАТНАЯ ЗОНА
 #===========================================
-echo ""
-msg_in "Создание named.conf..."
-
-# Обратная зона для сети HQ
-REV_NET=$(echo "$DNS_IP" | awk -F. '{print $3"."$2"."$1}')
+# Определяем сеть для обратной зоны по IP DNS сервера
+REV_NET=$(echo "$DNS_SERVER_IP" | awk -F. '{print $3"."$2"."$1}')
 REV_ZONE="${REV_NET}.in-addr.arpa"
+
+msg_in "Обратная зона: $REV_ZONE"
+
+#===========================================
+# 5. NAMED.CONF
+#===========================================
+msg_in "Создание named.conf..."
 
 cat > /etc/named.conf << EOF
 options {
-    listen-on port 53 { 127.0.0.1; $DNS_IP; };
+    listen-on port 53 { 127.0.0.1; $DNS_SERVER_IP; };
     directory       "/var/named";
     dump-file       "/var/named/data/cache_dump.db";
     statistics-file "/var/named/data/named_stats.txt";
+    memstatistics-file "/var/named/data/named_mem_stats.txt";
     
     allow-query     { any; };
     recursion yes;
@@ -153,7 +296,7 @@ chmod 640 /etc/named.conf
 msg_ok "named.conf создан"
 
 #===========================================
-# 5. ЗОНА ПРЯМОГО ПРОСМОТРА
+# 6. ЗОНА ПРЯМОГО ПРОСМОТРА
 #===========================================
 msg_in "Создание зоны $DOMAIN..."
 
@@ -170,14 +313,14 @@ cat > /var/named/$DOMAIN.zone << EOF
 )
 
 @       IN  NS      ns1.$DOMAIN.
-ns1     IN  A       $DNS_IP
+ns1     IN  A       $DNS_SERVER_IP
 
-hq-rtr  IN  A       $HQ_RTR
-br-rtr  IN  A       $BR_RTR
-hq-srv  IN  A       $HQ_SRV
-br-srv  IN  A       $BR_SRV
-docker  IN  A       $DOCKER
-web     IN  A       $WEB
+hq-rtr  IN  A       $HQ_RTR_IP
+br-rtr  IN  A       $BR_RTR_IP
+hq-srv  IN  A       $HQ_SRV_IP
+br-srv  IN  A       $BR_SRV_IP
+docker  IN  A       $DOCKER_IP
+web     IN  A       $WEB_IP
 EOF
 
 chown named:named /var/named/$DOMAIN.zone
@@ -186,12 +329,12 @@ chmod 660 /var/named/$DOMAIN.zone
 msg_ok "Зона создана"
 
 #===========================================
-# 6. ЗОНА ОБРАТНОГО ПРОСМОТРА
+# 7. ЗОНА ОБРАТНОГО ПРОСМОТРА
 #===========================================
 msg_in "Создание обратной зоны..."
 
-HQ_RTR_LAST=$(echo "$HQ_RTR" | cut -d'.' -f4)
-HQ_SRV_LAST=$(echo "$HQ_SRV" | cut -d'.' -f4)
+HQ_RTR_LAST=$(echo "$HQ_RTR_IP" | cut -d'.' -f4)
+HQ_SRV_LAST=$(echo "$HQ_SRV_IP" | cut -d'.' -f4)
 
 cat > /var/named/$DOMAIN.rev << EOF
 \$TTL 86400
@@ -215,27 +358,29 @@ chmod 660 /var/named/$DOMAIN.rev
 msg_ok "Обратная зона создана"
 
 #===========================================
-# 7. ПРОВЕРКА КОНФИГУРАЦИИ
+# 8. ПРОВЕРКА
 #===========================================
 echo ""
 msg_in "Проверка конфигурации..."
 
-if named-checkconf; then
+if named-checkconf 2>&1; then
     msg_ok "named.conf OK"
 else
-    msg_er "Ошибка в named.conf"
-    exit 1
+    msg_er "Ошибка в named.conf!"
+    named-checkconf
+    die "Исправьте ошибки"
 fi
 
-if named-checkzone "$DOMAIN" /var/named/$DOMAIN.zone; then
+if named-checkzone "$DOMAIN" /var/named/$DOMAIN.zone 2>&1; then
     msg_ok "Зона $DOMAIN OK"
 else
-    msg_er "Ошибка в зоне"
-    exit 1
+    die "Ошибка в зоне"
 fi
 
+named-checkzone "$REV_ZONE" /var/named/$DOMAIN.rev 2>&1 && msg_ok "Обратная зона OK"
+
 #===========================================
-# 8. FIREWALL
+# 9. FIREWALL
 #===========================================
 echo ""
 msg_in "Настройка firewall..."
@@ -246,53 +391,74 @@ iptables -I INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null
 msg_ok "Firewall настроен"
 
 #===========================================
-# 9. ЗАПУСК
+# 10. ЗАПУСК
 #===========================================
 echo ""
-msg_in "Запуск DNS..."
+msg_in "Запуск DNS сервера..."
 
+# Останавливаем
 systemctl stop bind 2>/dev/null
+systemctl stop named 2>/dev/null
+
+# Перечитываем
 systemctl daemon-reload
 
-# Пробуем запустить
-if systemctl start bind 2>&1; then
-    sleep 2
-    if systemctl is-active --quiet bind; then
-        msg_ok "DNS сервер запущен!"
-        systemctl enable bind 2>/dev/null
-    else
-        msg_er "bind не запустился, пробуем named..."
-        systemctl start named 2>/dev/null
+# Определяем имя сервиса
+SERVICE_NAME=""
+for svc in bind named; do
+    if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+        SERVICE_NAME="$svc"
+        break
+    fi
+done
+
+[ -z "$SERVICE_NAME" ] && SERVICE_NAME="bind"
+
+msg_in "Сервис: $SERVICE_NAME"
+
+# Запускаем
+systemctl start "$SERVICE_NAME" 2>&1
+sleep 2
+
+# Проверяем
+if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    msg_ok "DNS сервер запущен!"
+    systemctl enable "$SERVICE_NAME" 2>/dev/null
+else
+    msg_wrn "systemctl не сработал, пробуем напрямую..."
+    
+    # Находим бинарник
+    if [ -x /usr/sbin/named ]; then
+        /usr/sbin/named -u named &
+        sleep 2
+        
+        if pgrep -x named >/dev/null; then
+            msg_ok "named запущен напрямую!"
+        else
+            msg_er "named не запустился"
+            echo ""
+            msg_in "Запустите вручную для диагностики:"
+            echo "  /usr/sbin/named -u named -g"
+            exit 1
+        fi
     fi
 fi
 
-# Проверка
-echo ""
-if systemctl is-active --quiet bind || systemctl is-active --quiet named; then
-    msg_ok "DNS СЕРВЕР РАБОТАЕТ!"
-else
-    msg_er "Сервис не запущен. Попробуйте вручную:"
-    echo "  systemctl start bind"
-    echo "  named -u named -g  (для отладки)"
-fi
-
 #===========================================
-# 10. RESOLV.CONF
+# 11. RESOLV.CONF
 #===========================================
 echo ""
 msg_in "Настройка resolv.conf..."
 
-cp /etc/resolv.conf /etc/resolv.conf.bak.$$ 2>/dev/null
+[ -f /etc/resolv.conf ] && cp /etc/resolv.conf /etc/resolv.conf.bak.$$ 2>/dev/null
 
-# Удаляем старые записи nameserver (опционально)
-# sed -i '/nameserver/d' /etc/resolv.conf
-
-# Добавляем в начало
-if ! grep -q "nameserver $DNS_IP" /etc/resolv.conf; then
-    sed -i "1i\nameserver $DNS_IP" /etc/resolv.conf
+if ! grep -q "nameserver $DNS_SERVER_IP" /etc/resolv.conf 2>/dev/null; then
+    sed -i "1i\nameserver $DNS_SERVER_IP" /etc/resolv.conf 2>/dev/null || {
+        echo "nameserver $DNS_SERVER_IP" > /etc/resolv.conf
+    }
 fi
 
-if ! grep -q "search $DOMAIN" /etc/resolv.conf; then
+if ! grep -q "search.*$DOMAIN" /etc/resolv.conf 2>/dev/null; then
     echo "search $DOMAIN" >> /etc/resolv.conf
 fi
 
@@ -303,14 +469,14 @@ msg_ok "resolv.conf настроен"
 #===========================================
 echo ""
 echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║        DNS СЕРВЕР НАСТРОЕН!                                 ║${NC}"
+echo -e "${GREEN}║        DNS СЕРВЕР УСПЕШНО НАСТРОЕН!                         ║${NC}"
 echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "${CYAN}IP DNS сервера:${NC} $DNS_IP"
+echo -e "${CYAN}IP DNS:${NC} $DNS_SERVER_IP"
 echo -e "${CYAN}Домен:${NC} $DOMAIN"
 echo ""
 echo -e "${CYAN}Проверка:${NC}"
-echo -e "  ${YELLOW}nslookup hq-rtr $DNS_IP${NC}"
-echo -e "  ${YELLOW}nslookup $HQ_RTR $DNS_IP${NC}"
-echo -e "  ${YELLOW}systemctl status bind${NC}"
+echo -e "  ${YELLOW}nslookup hq-rtr $DNS_SERVER_IP${NC}"
+echo -e "  ${YELLOW}nslookup $HQ_RTR_IP $DNS_SERVER_IP${NC}"
+echo -e "  ${YELLOW}dig @$DNS_SERVER_IP hq-srv.$DOMAIN${NC}"
 echo ""
