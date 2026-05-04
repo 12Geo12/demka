@@ -1,17 +1,15 @@
 #!/bin/bash
 #===============================================================================
-# DNS Server Setup for Demo2026 - Alt Linux (AUTO VERSION)
+# DNS Server Setup for Demo2026 - Alt Linux (POSIX COMPATIBLE)
 # Настройка DNS сервера на HQ-SRV с автоматическим определением IP
+#
+# ВНИМАНИЕ: Запускать через bash, не через sh!
+#   bash ./1.8.dns-fixed.sh
 #
 # Задание 10:
 # - Основной DNS-сервер на HQ-SRV
-# - Разрешение имён в адреса и обратно
+# - Разрешение имён в адреса и обратно (A + PTR)
 # - DNS сервер пересылки: 77.88.8.8
-#
-# АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ:
-# - IP адреса устройств из схемы сети
-# - Определение текущего сервера по IP
-# - Автоматическая настройка всех записей
 #===============================================================================
 
 # Цвета
@@ -23,90 +21,77 @@ CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-# Параметры по умолчанию
+# Параметры
 DOMAIN="au-team.irpo"
 FORWARDER="77.88.8.8"
+DNS_SERVER_IP=""
+DETECTED_SERVER=""
 
-#===============================================================================
-# БАЗА ДАННЫХ IP АДРЕСОВ ИЗ СХЕМЫ СЕТИ
-#===============================================================================
-# Формат: "имя IP_адрес PTR_флаг маска описание"
-# PTR_флаг: yes/no - создавать ли PTR запись
+# DNS записи из таблицы 3 (без hq-cli)
+# Формат: "имя:IP:PTR_флаг"
+DNS_RECORDS="
+hq-rtr:192.168.10.1:yes
+br-rtr:192.168.20.1:no
+hq-srv:192.168.10.2:yes
+br-srv:192.168.20.2:no
+docker:172.16.10.1:no
+web:172.16.20.1:no
+"
 
-declare -A NETWORK_DEVICES=(
-    # Маршрутизаторы
-    ["hq-rtr"]="192.168.10.1 yes 24 HQ-RTR маршрутизатор HQ"
-    ["br-rtr"]="192.168.20.1 no 24 BR-RTR маршрутизатор BR"
-    
-    # Серверы
-    ["hq-srv"]="192.168.10.2 yes 24 HQ-SRV сервер HQ (DNS)"
-    ["br-srv"]="192.168.20.2 no 24 BR-SRV сервер BR"
-    
-    # ISP интерфейсы
-    ["docker"]="172.16.10.1 no 24 ISP интерфейс к HQ-RTR"
-    ["web"]="172.16.20.1 no 24 ISP интерфейс к BR-RTR"
-    
-    # Nameserver (добавляется автоматически)
-    ["ns1"]="auto yes 24 DNS сервер"
-)
+# Сообщения
+msg_ok() { printf "${GREEN}[✓]${NC} %s\n" "$1"; }
+msg_er() { printf "${RED}[✗]${NC} %s\n" "$1"; }
+msg_in() { printf "${BLUE}[i]${NC} %s\n" "$1"; }
+msg_wrn() { printf "${YELLOW}[!]${NC} %s\n" "$1"; }
+msg_auto() { printf "${MAGENTA}[⚡]${NC} %s\n" "$1"; }
 
-# Подсети для обратных зон
-declare -A REVERSE_ZONES=(
-    ["192.168.10"]="hq-network"
-    ["192.168.20"]="br-network"
-    ["172.16.10"]="isp-hq"
-    ["172.16.20"]="isp-br"
-)
-
-# Вывод сообщений
-msg_ok() { echo -e "${GREEN}[✓]${NC} $1"; }
-msg_er() { echo -e "${RED}[✗]${NC} $1"; }
-msg_in() { echo -e "${BLUE}[i]${NC} $1"; }
-msg_wrn() { echo -e "${YELLOW}[!]${NC} $1"; }
-msg_auto() { echo -e "${MAGENTA}[⚡]${NC} $1"; }
-
-# Обработка ошибок с выходом
 die() {
     msg_er "$1"
     exit 1
 }
 
 # Проверка root
-if [ "$EUID" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ]; then
     die "Запустите от root (su -)"
+fi
+
+# Проверка bash
+if [ -z "$BASH_VERSION" ]; then
+    die "Запустите через bash: bash $0"
 fi
 
 # Определение пакетного менеджера
 detect_pkg_manager() {
     if command -v apt-get >/dev/null 2>&1; then
         PKG_MANAGER="apt-get"
-        PKG_NAME="bind"
-        SERVICE_NAME="named"
-        NAMED_USER="named"
     elif command -v dnf >/dev/null 2>&1; then
         PKG_MANAGER="dnf"
-        PKG_NAME="bind"
-        SERVICE_NAME="named"
-        NAMED_USER="named"
     elif command -v yum >/dev/null 2>&1; then
         PKG_MANAGER="yum"
-        PKG_NAME="bind"
-        SERVICE_NAME="named"
-        NAMED_USER="named"
     else
         die "Пакетный менеджер не найден"
     fi
+    PKG_NAME="bind"
+    SERVICE_NAME="named"
+    NAMED_USER="named"
 }
 
-# Автоматическое определение IP адресов на сервере
+# Автоматическое определение IP адресов
 auto_detect_ips() {
     msg_in "Автоматическое определение IP адресов..."
     echo ""
     
-    declare -a FOUND_IPS
-    declare -a FOUND_IFACES
+    TMPFILE="/tmp/dns_ips_$$"
+    ip -br addr show 2>/dev/null | grep -v "^lo" > "$TMPFILE"
     
-    # Получаем все IP адреса кроме loopback
+    if [ ! -s "$TMPFILE" ]; then
+        rm -f "$TMPFILE"
+        die "IP адреса не найдены"
+    fi
+    
+    echo -e "${CYAN}Обнаруженные IP адреса:${NC}"
+    
+    idx=0
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         
@@ -117,227 +102,127 @@ auto_detect_ips() {
         ip=$(echo "$ip_full" | cut -d'/' -f1)
         iface_clean=$(echo "$iface" | cut -d'@' -f1)
         
-        FOUND_IPS+=("$ip")
-        FOUND_IFACES+=("$iface_clean")
-        
-    done < <(ip -br addr show | grep -v "^lo")
-    
-    if [ ${#FOUND_IPS[@]} -eq 0 ]; then
-        die "IP адреса не найдены"
-    fi
-    
-    # Определяем тип сервера по IP
-    DETECTED_SERVER=""
-    DETECTED_SERVER_IP=""
-    
-    for i in "${!FOUND_IPS[@]}"; do
-        ip="${FOUND_IPS[$i]}"
-        
-        # Проверяем совпадение с известными устройствами
-        for device in "${!NETWORK_DEVICES[@]}"; do
-            device_ip=$(echo "${NETWORK_DEVICES[$device]}" | awk '{print $1}')
-            if [ "$ip" = "$device_ip" ]; then
-                DETECTED_SERVER="$device"
-                DETECTED_SERVER_IP="$ip"
-                break 2
-            fi
-        done
-    done
-    
-    # Показываем найденные IP
-    echo -e "${CYAN}Обнаруженные IP адреса:${NC}"
-    for i in "${!FOUND_IPS[@]}"; do
-        ip="${FOUND_IPS[$i]}"
-        iface="${FOUND_IFACES[$i]}"
-        
-        # Проверяем, является ли этот IP известным устройством
+        # Проверяем, является ли IP известным устройством
         device_name=""
-        for dev in "${!NETWORK_DEVICES[@]}"; do
-            dev_ip=$(echo "${NETWORK_DEVICES[$dev]}" | awk '{print $1}')
-            if [ "$ip" = "$dev_ip" ]; then
-                device_name="$dev"
-                break
-            fi
-        done
+        case "$ip" in
+            192.168.10.1) device_name="hq-rtr" ;;
+            192.168.20.1) device_name="br-rtr" ;;
+            192.168.10.2) device_name="hq-srv" ;;
+            192.168.20.2) device_name="br-srv" ;;
+            172.16.10.1) device_name="docker" ;;
+            172.16.20.1) device_name="web" ;;
+        esac
         
         if [ -n "$device_name" ]; then
-            echo -e "  ${GREEN}✓${NC} $iface: ${YELLOW}$ip${NC} ${MAGENTA}[$device_name]${NC}"
+            echo -e "  ${GREEN}✓${NC} $iface_clean: ${YELLOW}$ip${NC} ${MAGENTA}[$device_name]${NC}"
+            DETECTED_SERVER="$device_name"
         else
-            echo -e "  ${GREEN}✓${NC} $iface: ${YELLOW}$ip${NC}"
+            echo -e "  ${GREEN}✓${NC} $iface_clean: ${YELLOW}$ip${NC}"
         fi
-    done
+        
+        idx=$((idx + 1))
+    done < "$TMPFILE"
+    
+    rm -f "$TMPFILE"
     echo ""
     
-    # Если сервер определён
     if [ -n "$DETECTED_SERVER" ]; then
-        msg_auto "Определён сервер: ${YELLOW}${DETECTED_SERVER}${NC} (${DETECTED_SERVER_IP})"
-        return 0
-    else
-        msg_wrn "Сервер не определён автоматически"
-        return 1
+        msg_auto "Определён сервер: ${YELLOW}${DETECTED_SERVER}${NC}"
     fi
 }
 
-# Автоматический выбор DNS сервера
+# Выбор DNS сервера
 select_dns_server() {
-    # Если это HQ-SRV - он будет DNS сервером
-    if [ "$DETECTED_SERVER" = "hq-srv" ]; then
-        DNS_SERVER_IP="$DETECTED_SERVER_IP"
-        DNS_SERVER_IFACE=""
-        
-        # Находим интерфейс
-        for i in "${!FOUND_IPS[@]}"; do
-            if [ "${FOUND_IPS[$i]}" = "$DNS_SERVER_IP" ]; then
-                DNS_SERVER_IFACE="${FOUND_IFACES[$i]}"
-                break
+    # Получаем IP текущего сервера
+    case "$DETECTED_SERVER" in
+        hq-srv)
+            DNS_SERVER_IP="192.168.10.2"
+            msg_auto "DNS сервер будет настроен на этом устройстве: ${YELLOW}$DNS_SERVER_IP${NC}"
+            ;;
+        hq-rtr)
+            DNS_SERVER_IP="192.168.10.1"
+            msg_wrn "Скрипт запущен на HQ-RTR, но DNS должен быть на HQ-SRV!"
+            msg_in "Настраиваем DNS на HQ-RTR (IP: $DNS_SERVER_IP)"
+            ;;
+        br-rtr)
+            DNS_SERVER_IP="192.168.20.1"
+            msg_wrn "Скрипт запущен на BR-RTR, но DNS должен быть на HQ-SRV!"
+            ;;
+        br-srv)
+            DNS_SERVER_IP="192.168.20.2"
+            msg_wrn "Скрипт запущен на BR-SRV, но DNS должен быть на HQ-SRV!"
+            ;;
+        *)
+            # Пытаемся найти подходящий IP
+            FOUND_IP=$(ip -br addr show 2>/dev/null | grep -v "^lo" | head -1 | awk '{print $3}' | cut -d'/' -f1)
+            if [ -n "$FOUND_IP" ]; then
+                DNS_SERVER_IP="$FOUND_IP"
+                msg_in "Используем первый найденный IP: ${YELLOW}$DNS_SERVER_IP${NC}"
+            else
+                die "Не удалось определить IP адрес"
             fi
-        done
-        
-        msg_auto "DNS сервер будет настроен на этом устройстве: ${YELLOW}$DNS_SERVER_IP${NC}"
-        return 0
-    else
-        # Скрипт запущен не на HQ-SRV
-        msg_wrn "Этот скрипт должен запускаться на HQ-SRV!"
-        msg_wrn "Определён сервер: $DETECTED_SERVER"
-        msg_wrn "DNS сервер должен быть на hq-srv (192.168.10.2)"
-        
-        # Предлагаем выбрать IP вручную
-        echo ""
-        msg_in "Доступные IP для выбора:"
-        for i in "${!FOUND_IPS[@]}"; do
-            echo -e "  ${GREEN}[$((i+1))]${NC} ${FOUND_IFACES[$i]}: ${YELLOW}${FOUND_IPS[$i]}${NC}"
-        done
-        
-        read -r -p "Выберите IP для DNS сервера [1-${#FOUND_IPS[@]}]: " num
-        
-        if [[ "$num" =~ ^[0-9]+$ ]] && [ "$num" -ge 1 ] && [ "$num" -le ${#FOUND_IPS[@]} ]; then
-            DNS_SERVER_IP="${FOUND_IPS[$((num-1))]}"
-            DNS_SERVER_IFACE="${FOUND_IFACES[$((num-1))]}"
-        else
-            die "Неверный выбор"
-        fi
-    fi
-}
-
-# Генерация DNS записей
-generate_dns_entries() {
-    msg_in "Генерация DNS записей из базы данных..."
-    echo ""
-    
-    DNS_ENTRIES=()
-    PTR_ENTRIES_HQ=()
-    PTR_ENTRIES_BR=()
-    
-    for device in "${!NETWORK_DEVICES[@]}"; do
-        data="${NETWORK_DEVICES[$device]}"
-        ip=$(echo "$data" | awk '{print $1}')
-        has_ptr=$(echo "$data" | awk '{print $2}')
-        desc=$(echo "$data" | cut -d' ' -f4-)
-        
-        # Пропускаем ns1 - он добавится с IP сервера
-        if [ "$device" = "ns1" ]; then
-            continue
-        fi
-        
-        DNS_ENTRIES+=("$device $ip")
-        
-        if [ "$has_ptr" = "yes" ]; then
-            # Определяем к какой сети принадлежит для обратной зоны
-            net=$(echo "$ip" | cut -d'.' -f1-3)
-            if [ "$net" = "192.168.10" ]; then
-                PTR_ENTRIES_HQ+=("$device $ip")
-            elif [ "$net" = "192.168.20" ]; then
-                PTR_ENTRIES_BR+=("$device $ip")
-            fi
-        fi
-        
-        echo -e "  ${GREEN}✓${NC} $device.$DOMAIN ${YELLOW}→${NC} $ip ${CYAN}$desc${NC}"
-    done
-    
-    # Добавляем ns1 с IP DNS сервера
-    DNS_ENTRIES+=("ns1 $DNS_SERVER_IP")
-    echo -e "  ${GREEN}✓${NC} ns1.$DOMAIN ${YELLOW}→${NC} $DNS_SERVER_IP ${CYAN}DNS сервер${NC}"
-    
-    echo ""
-    msg_ok "Всего A-записей: ${#DNS_ENTRIES[@]}"
-    msg_ok "PTR записей HQ сети: ${#PTR_ENTRIES_HQ[@]}"
-    msg_ok "PTR записей BR сети: ${#PTR_ENTRIES_BR[@]}"
+            ;;
+    esac
 }
 
 # Парсинг аргументов
 AUTO_MODE=true
-MANUAL_CONFIRM=false
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -m|--manual)
-            AUTO_MODE=false
-            shift
-            ;;
-        -c|--confirm)
-            MANUAL_CONFIRM=true
-            shift
-            ;;
+for arg in "$@"; do
+    case "$arg" in
+        -m|--manual) AUTO_MODE=false ;;
         -h|--help)
-            echo "Использование: $0 [OPTIONS]"
+            echo "Использование: bash $0 [OPTIONS]"
             echo ""
             echo "Опции:"
-            echo "  -m, --manual    Ручной режим (выбор IP вручную)"
-            echo "  -c, --confirm   Требовать подтверждение перед выполнением"
-            echo "  -h, --help      Показать справку"
-            echo ""
-            echo "По умолчанию скрипт работает автоматически:"
-            echo "  - Определяет IP адреса из схемы сети"
-            echo "  - Находит HQ-SRV и настраивает DNS на нём"
-            echo "  - Создаёт все записи автоматически"
+            echo "  -m, --manual    Ручной режим"
+            echo "  -h, --help      Справка"
             exit 0
-            ;;
-        *)
-            shift
             ;;
     esac
 done
 
-# Начало работы
+# Начало
 clear
 echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║${NC} ${YELLOW}DNS Server Setup for Demo2026 - AUTO MODE${NC}"
+echo -e "${CYAN}║${NC} ${YELLOW}DNS Server Setup for Demo2026${NC}"
 echo -e "${CYAN}║${NC} ${GREEN}Автоматическое определение IP адресов${NC}"
 echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════╝${NC}"
 
 detect_pkg_manager
 msg_ok "Пакетный менеджер: $PKG_MANAGER"
 
-# Автоопределение
 auto_detect_ips
 select_dns_server
 
-# Генерация записей
-generate_dns_entries
-
-# Параметры
+# Показ параметров
 echo ""
-echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
-echo -e "${CYAN}Параметры DNS сервера:${NC}"
-echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+echo -e "${CYAN}Параметры DNS:${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
 echo -e "  IP сервера:     ${YELLOW}$DNS_SERVER_IP${NC}"
 echo -e "  Домен:          ${YELLOW}$DOMAIN${NC}"
 echo -e "  DNS пересылки:  ${YELLOW}$FORWARDER${NC}"
-echo -e "  Обратная зона:  ${YELLOW}192.168.10.in-addr.arpa${NC}"
-echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+echo ""
+echo -e "${YELLOW}DNS записи (Таблица 3):${NC}"
+echo -e "  hq-rtr.$DOMAIN  → 192.168.10.1  (PTR)"
+echo -e "  br-rtr.$DOMAIN  → 192.168.20.1"
+echo -e "  hq-srv.$DOMAIN  → 192.168.10.2  (PTR)"
+echo -e "  br-srv.$DOMAIN  → 192.168.20.2"
+echo -e "  docker.$DOMAIN  → 172.16.10.1"
+echo -e "  web.$DOMAIN     → 172.16.20.1"
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
 
-if [ "$MANUAL_CONFIRM" = true ] || [ "$AUTO_MODE" = false ]; then
+if [ "$AUTO_MODE" = false ]; then
     echo ""
-    read -r -p "Применить настройки? (y/n): " confirm
+    read -r -p "Применить? (y/n): " confirm
     case "$confirm" in
         [Yy]*) ;;
         *) msg_in "Отменено"; exit 0 ;;
     esac
 fi
 
-#===========================================
-# УСТАНОВКА И НАСТРОЙКА
-#===========================================
+# Установка
 echo ""
 msg_in "Установка DNS сервера..."
 
@@ -356,7 +241,7 @@ esac
 
 msg_ok "Пакет установлен: $PKG_NAME"
 
-# Создание директорий
+# Создание директорий (КРИТИЧЕСКИ ВАЖНО!)
 echo ""
 msg_in "Создание директорий..."
 
@@ -367,55 +252,39 @@ chmod 775 /var/named /var/named/data
 msg_ok "Директории созданы"
 
 # Создание named.conf
-msg_in "Создание конфигурации..."
+msg_in "Создание named.conf..."
 
-cat > /etc/named.conf << EOF
-// DNS Server for Demo2026 - Auto-generated
-// Server: $DETECTED_SERVER
+cat > /etc/named.conf << NAMED_CONF
+// DNS Server for Demo2026
 // Generated: $(date)
 
 options {
     listen-on port 53 { 127.0.0.1; $DNS_SERVER_IP; };
-    listen-on-v6 port 53 { ::1; };
     directory       "/var/named";
     dump-file       "/var/named/data/cache_dump.db";
     statistics-file "/var/named/data/named_stats.txt";
     memstatistics-file "/var/named/data/named_mem_stats.txt";
-    recursing-file  "/var/named/data/named.recursing";
-    secroots-file   "/var/named/data/named.secroots";
     
     allow-query     { any; };
-    allow-recursion { any; };
-    
     recursion yes;
     dnssec-enable no;
     dnssec-validation no;
     
     forwarders { $FORWARDER; };
-    forward only;
 };
 
-logging {
-    channel default_debug {
-        file "data/named.run";
-        severity dynamic;
-    };
-};
-
-// Зона прямого просмотра
 zone "$DOMAIN" IN {
     type master;
     file "$DOMAIN.zone";
     allow-update { none; };
 };
 
-// Зона обратного просмотра HQ сети
 zone "10.168.192.in-addr.arpa" IN {
     type master;
     file "$DOMAIN.rev";
     allow-update { none; };
 };
-EOF
+NAMED_CONF
 
 msg_ok "named.conf создан"
 
@@ -425,7 +294,7 @@ msg_in "Создание зоны прямого просмотра..."
 SERIAL=$(date +%Y%m%d01)
 ZONE_FILE="/var/named/$DOMAIN.zone"
 
-cat > "$ZONE_FILE" << EOF
+cat > "$ZONE_FILE" << ZONE_EOF
 \$TTL 86400
 @   IN  SOA ns1.$DOMAIN. root.$DOMAIN. (
         $SERIAL      ; Serial
@@ -438,14 +307,13 @@ cat > "$ZONE_FILE" << EOF
 @       IN  NS      ns1.$DOMAIN.
 ns1     IN  A       $DNS_SERVER_IP
 
-EOF
-
-# Добавляем все A-записи
-for entry in "${DNS_ENTRIES[@]}"; do
-    name=$(echo "$entry" | awk '{print $1}')
-    ip=$(echo "$entry" | awk '{print $2}')
-    echo "$name    IN  A       $ip" >> "$ZONE_FILE"
-done
+hq-rtr  IN  A       192.168.10.1
+br-rtr  IN  A       192.168.20.1
+hq-srv  IN  A       192.168.10.2
+br-srv  IN  A       192.168.20.2
+docker  IN  A       172.16.10.1
+web     IN  A       172.16.20.1
+ZONE_EOF
 
 msg_ok "Зона создана: $ZONE_FILE"
 
@@ -454,7 +322,7 @@ msg_in "Создание зоны обратного просмотра..."
 
 REV_FILE="/var/named/$DOMAIN.rev"
 
-cat > "$REV_FILE" << EOF
+cat > "$REV_FILE" << REV_EOF
 \$TTL 86400
 @   IN  SOA ns1.$DOMAIN. root.$DOMAIN. (
         $SERIAL      ; Serial
@@ -466,15 +334,9 @@ cat > "$REV_FILE" << EOF
 
 @       IN  NS      ns1.$DOMAIN.
 
-EOF
-
-# PTR записи для HQ сети
-for entry in "${PTR_ENTRIES_HQ[@]}"; do
-    name=$(echo "$entry" | awk '{print $1}')
-    ip=$(echo "$entry" | awk '{print $2}')
-    last_octet=$(echo "$ip" | cut -d'.' -f4)
-    echo "$last_octet     IN  PTR     $name.$DOMAIN." >> "$REV_FILE"
-done
+1       IN  PTR     hq-rtr.$DOMAIN.
+2       IN  PTR     hq-srv.$DOMAIN.
+REV_EOF
 
 msg_ok "Зона обратного просмотра создана: $REV_FILE"
 
@@ -482,6 +344,8 @@ msg_ok "Зона обратного просмотра создана: $REV_FILE
 chown $NAMED_USER:$NAMED_USER "$ZONE_FILE" "$REV_FILE" 2>/dev/null || chown root:$NAMED_USER "$ZONE_FILE" "$REV_FILE"
 chown root:$NAMED_USER /etc/named.conf 2>/dev/null
 chmod 640 "$ZONE_FILE" "$REV_FILE" /etc/named.conf
+
+msg_ok "Права установлены"
 
 # Проверка конфигурации
 echo ""
@@ -493,7 +357,7 @@ fi
 msg_ok "named.conf валиден"
 
 if ! named-checkzone "$DOMAIN" "$ZONE_FILE" 2>&1; then
-    die "Ошибки в зоне $DOMAIN"
+    die "Ошибки в зоне"
 fi
 msg_ok "Зона $DOMAIN валидна"
 
@@ -503,16 +367,16 @@ named-checkzone "10.168.192.in-addr.arpa" "$REV_FILE" 2>&1 && msg_ok "Зона �
 echo ""
 msg_in "Настройка firewall..."
 
-if command -v nft >/dev/null 2>&1; then
+if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 53 -j ACCEPT
+    iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 53 -j ACCEPT
+    msg_ok "Firewall (iptables)"
+elif command -v nft >/dev/null 2>&1; then
     nft add table inet filter 2>/dev/null
     nft 'add chain inet filter input { type filter hook input priority 0 ; }' 2>/dev/null
     nft add rule inet filter input tcp dport 53 accept 2>/dev/null
     nft add rule inet filter input udp dport 53 accept 2>/dev/null
     msg_ok "Firewall (nftables)"
-elif command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 53 -j ACCEPT
-    iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 53 -j ACCEPT
-    msg_ok "Firewall (iptables)"
 elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-service=dns 2>/dev/null
     firewall-cmd --reload 2>/dev/null
@@ -541,10 +405,15 @@ msg_ok "DNS сервер запущен!"
 # resolv.conf
 msg_in "Настройка resolv.conf..."
 
-[ -f /etc/resolv.conf ] && cp /etc/resolv.conf /etc/resolv.conf.bak.$(date +%s)
+if [ -f /etc/resolv.conf ]; then
+    cp /etc/resolv.conf /etc/resolv.conf.bak.$$ 2>/dev/null
+fi
 
+# Добавляем локальный DNS в начало
 if ! grep -q "nameserver $DNS_SERVER_IP" /etc/resolv.conf 2>/dev/null; then
-    sed -i "1i\nameserver $DNS_SERVER_IP" /etc/resolv.conf 2>/dev/null || echo "nameserver $DNS_SERVER_IP" > /etc/resolv.conf
+    sed -i "1i\nameserver $DNS_SERVER_IP" /etc/resolv.conf 2>/dev/null || {
+        echo "nameserver $DNS_SERVER_IP" > /etc/resolv.conf
+    }
 fi
 
 if ! grep -q "search.*$DOMAIN" /etc/resolv.conf 2>/dev/null; then
@@ -559,24 +428,21 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║        DNS СЕРВЕР УСПЕШНО НАСТРОЕН!                         ║${NC}"
 echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "${CYAN}Параметры:${NC}"
-echo -e "  IP сервера:     ${YELLOW}$DNS_SERVER_IP${NC}"
-echo -e "  Домен:          ${YELLOW}$DOMAIN${NC}"
-echo -e "  Пересылка:      ${YELLOW}$FORWARDER${NC}"
+echo -e "${CYAN}IP сервера:${NC}     ${YELLOW}$DNS_SERVER_IP${NC}"
+echo -e "${CYAN}Домен:${NC}          ${YELLOW}$DOMAIN${NC}"
+echo -e "${CYAN}Пересылка:${NC}      ${YELLOW}$FORWARDER${NC}"
 echo ""
 echo -e "${CYAN}A-записи:${NC}"
-for entry in "${DNS_ENTRIES[@]}"; do
-    name=$(echo "$entry" | awk '{print $1}')
-    ip=$(echo "$entry" | awk '{print $2}')
-    printf "  %-12s → %s\n" "$name.$DOMAIN" "$ip"
-done
+echo -e "  hq-rtr.$DOMAIN  → 192.168.10.1"
+echo -e "  br-rtr.$DOMAIN  → 192.168.20.1"
+echo -e "  hq-srv.$DOMAIN  → 192.168.10.2"
+echo -e "  br-srv.$DOMAIN  → 192.168.20.2"
+echo -e "  docker.$DOMAIN  → 172.16.10.1"
+echo -e "  web.$DOMAIN     → 172.16.20.1"
 echo ""
-echo -e "${CYAN}PTR-записи (HQ сеть):${NC}"
-for entry in "${PTR_ENTRIES_HQ[@]}"; do
-    name=$(echo "$entry" | awk '{print $1}')
-    ip=$(echo "$entry" | awk '{print $2}')
-    printf "  %-15s → %s.$DOMAIN\n" "$ip" "$name"
-done
+echo -e "${CYAN}PTR-записи:${NC}"
+echo -e "  192.168.10.1 → hq-rtr.$DOMAIN"
+echo -e "  192.168.10.2 → hq-srv.$DOMAIN"
 echo ""
 echo -e "${CYAN}Проверка:${NC}"
 echo -e "  ${YELLOW}nslookup hq-rtr $DNS_SERVER_IP${NC}"
