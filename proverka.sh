@@ -1,498 +1,398 @@
 #!/bin/bash
-# ==============================================================================
-# DHCP SETUP - ПРЯМОЕ СОЕДИНЕНИЕ HQ-RTR ↔ HQ-SRV (БЕЗ КОММУТАТОРА)
-# ==============================================================================
-# Топология: HQ-RTR (ens37) ──── LAN Segment ──── HQ-SRV (ens33)
-# Автоматическое определение интерфейсов
-# ==============================================================================
+#===============================================================================
+# DNS Server Setup for Demo2026 - Alt Linux (DEBUG VERSION)
+# С диагностикой ошибок и автоматическим исправлением
+#===============================================================================
 
 # Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-# Проверка прав root
-if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}Ошибка: Запустите от имени root${NC}"
-    exit 1
-fi
+msg_ok() { printf "${GREEN}[✓]${NC} %s\n" "$1"; }
+msg_er() { printf "${RED}[✗]${NC} %s\n" "$1"; }
+msg_in() { printf "${BLUE}[i]${NC} %s\n" "$1"; }
+msg_wrn() { printf "${YELLOW}[!]${NC} %s\n" "$1"; }
+
+die() { msg_er "$1"; exit 1; }
+
+# Проверка root
+[ "$(id -u)" -ne 0 ] && die "Запустите от root (su -)"
 
 clear
-echo -e "${CYAN}"
-echo "========================================================================"
-echo "       DHCP SETUP - Автоматическая настройка (без коммутатора)"
-echo "========================================================================"
-echo -e "${NC}"
-
-# ============================================================
-# АВТООПРЕДЕЛЕНИЕ ИНТЕРФЕЙСОВ
-# ============================================================
-echo -e "${WHITE}[AUTO] Определение интерфейсов...${NC}"
-echo "------------------------------------------------------------------------"
-
-# Получаем все интерфейсы
-ALL_IFACES=$(ls /sys/class/net/ | grep -v lo)
-
-# Массивы для классификации
-declare -a WAN_IFACES
-declare -a LAN_IFACES
-declare -a VLAN_IFACES
-declare -a GRE_IFACES
-
-# Классификация интерфейсов
-for iface in $ALL_IFACES; do
-    # Пропускаем loopback
-    [ "$iface" = "lo" ] && continue
-    
-    # GRE туннели
-    if [[ "$iface" == gre* ]] || [[ "$iface" == tun* ]]; then
-        GRE_IFACES+=("$iface")
-        continue
-    fi
-    
-    # VLAN интерфейсы
-    if [[ "$iface" == *.* ]]; then
-        VLAN_IFACES+=("$iface")
-        continue
-    fi
-    
-    # Проверяем есть ли IP
-    IP=$(ip -4 -o addr show "$iface" 2>/dev/null | awk '{print $4}')
-    STATUS=$(cat /sys/class/net/"$iface"/operstate 2>/dev/null)
-    
-    # Определяем тип по имени и наличию IP
-    if [[ "$iface" == ens33 ]] || [[ "$iface" == eth0 ]]; then
-        # ens33 или eth0 - обычно WAN (интернет)
-        if [ -n "$IP" ]; then
-            WAN_IFACES+=("$iface ($IP)")
-        else
-            WAN_IFACES+=("$iface (no IP)")
-        fi
-    elif [[ "$iface" == ens37 ]] || [[ "$iface" == eth1 ]] || [[ "$iface" == ens38 ]]; then
-        # ens37, eth1, ens38 - обычно LAN
-        if [ -n "$IP" ]; then
-            LAN_IFACES+=("$iface ($IP)")
-        else
-            LAN_IFACES+=("$iface (no IP)")
-        fi
-    else
-        # Остальные - проверяем по наличию внешнего IP
-        if [ -n "$IP" ]; then
-            # Проверяем, это внешняя сеть или внутренняя
-            if echo "$IP" | grep -qE "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"; then
-                LAN_IFACES+=("$iface ($IP)")
-            else
-                WAN_IFACES+=("$iface ($IP)")
-            fi
-        else
-            LAN_IFACES+=("$iface (no IP)")
-        fi
-    fi
-done
-
-# Вывод результатов
-echo ""
-echo -e "${WHITE}Обнаруженные интерфейсы:${NC}"
+echo -e "${CYAN}╔═══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║${NC} ${YELLOW}DNS Server Setup - DIAGNOSTIC VERSION${NC}"
+echo -e "${CYAN}╚═══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-if [ ${#WAN_IFACES[@]} -gt 0 ]; then
-    echo -e "  ${CYAN}WAN (интернет):${NC}"
-    for iface in "${WAN_IFACES[@]}"; do
-        echo "    - $iface"
-    done
-fi
+# Параметры
+DOMAIN="au-team.irpo"
+FORWARDER="77.88.8.8"
 
-if [ ${#LAN_IFACES[@]} -gt 0 ]; then
-    echo -e "  ${GREEN}LAN (локальная сеть):${NC}"
-    for iface in "${LAN_IFACES[@]}"; do
-        echo "    - $iface"
-    done
-fi
-
-if [ ${#VLAN_IFACES[@]} -gt 0 ]; then
-    echo -e "  ${YELLOW}VLAN:${NC}"
-    for iface in "${VLAN_IFACES[@]}"; do
-        echo "    - $iface"
-    done
-fi
-
-if [ ${#GRE_IFACES[@]} -gt 0 ]; then
-    echo -e "  ${MAGENTA}GRE/Tunnel:${NC}"
-    for iface in "${GRE_IFACES[@]}"; do
-        echo "    - $iface"
-    done
-fi
-
-# ============================================================
-# АВТОВЫБОР LAN ИНТЕРФЕЙСА
-# ============================================================
+# Ввод IP адресов
+echo -e "${CYAN}Введите IP адреса устройств:${NC}"
 echo ""
-echo -e "${WHITE}[AUTO] Выбор LAN интерфейса...${NC}"
-echo "------------------------------------------------------------------------"
 
-# Приоритет выбора LAN интерфейса
-LAN_IFACE=""
+read -r -p "HQ-RTR IP [192.168.10.1]: " HQ_RTR_IP
+[ -z "$HQ_RTR_IP" ] && HQ_RTR_IP="192.168.10.1"
 
-# 1. Сначала ищем ens37
-for iface in "${LAN_IFACES[@]}"; do
-    if [[ "$iface" == ens37* ]]; then
-        LAN_IFACE="ens37"
-        break
-    fi
-done
+read -r -p "BR-RTR IP [192.168.20.1]: " BR_RTR_IP
+[ -z "$BR_RTR_IP" ] && BR_RTR_IP="192.168.20.1"
 
-# 2. Если не нашли, ищем eth1
-if [ -z "$LAN_IFACE" ]; then
-    for iface in "${LAN_IFACES[@]}"; do
-        if [[ "$iface" == eth1* ]]; then
-            LAN_IFACE="eth1"
-            break
-        fi
-    done
+read -r -p "HQ-SRV IP (DNS сервер) [192.168.10.2]: " HQ_SRV_IP
+[ -z "$HQ_SRV_IP" ] && HQ_SRV_IP="192.168.10.2"
+
+read -r -p "BR-SRV IP [192.168.20.2]: " BR_SRV_IP
+[ -z "$BR_SRV_IP" ] && BR_SRV_IP="192.168.20.2"
+
+read -r -p "Docker IP [172.16.10.1]: " DOCKER_IP
+[ -z "$DOCKER_IP" ] && DOCKER_IP="172.16.10.1"
+
+read -r -p "Web IP [172.16.20.1]: " WEB_IP
+[ -z "$WEB_IP" ] && WEB_IP="172.16.20.1"
+
+DNS_SERVER_IP="$HQ_SRV_IP"
+
+echo ""
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+echo -e "  DNS IP: $DNS_SERVER_IP"
+echo -e "  Домен: $DOMAIN"
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+echo ""
+
+#===========================================
+# ДИАГНОСТИКА И ИСПРАВЛЕНИЕ
+#===========================================
+
+# 1. Проверка и создание пользователя named
+echo ""
+msg_in "Проверка пользователя named..."
+if id "named" >/dev/null 2>&1; then
+    msg_ok "Пользователь named существует"
+    NAMED_USER="named"
+elif id "bind" >/dev/null 2>&1; then
+    msg_ok "Пользователь bind существует"
+    NAMED_USER="bind"
+else
+    msg_wrn "Пользователь named/bind не найден, создаём..."
+    useradd -r -s /sbin/nologin named 2>/dev/null || useradd -r -s /sbin/nologin bind 2>/dev/null
+    NAMED_USER="named"
+    msg_ok "Пользователь создан"
 fi
 
-# 3. Если не нашли, берём первый LAN без IP (предпочтительно для настройки)
-if [ -z "$LAN_IFACE" ]; then
-    for iface in "${LAN_IFACES[@]}"; do
-        if [[ "$iface" == *"(no IP)"* ]]; then
-            LAN_IFACE=$(echo "$iface" | cut -d' ' -f1)
-            break
-        fi
-    done
+# 2. Установка пакета
+msg_in "Установка bind..."
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq 2>/dev/null
+    apt-get install -y bind bind-utils 2>/dev/null || apt-get install -y bind 2>/dev/null
+elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y bind bind-utils 2>/dev/null
+elif command -v yum >/dev/null 2>&1; then
+    yum install -y bind bind-utils 2>/dev/null
 fi
 
-# 4. Если всё ещё не нашли, берём первый LAN
-if [ -z "$LAN_IFACE" ] && [ ${#LAN_IFACES[@]} -gt 0 ]; then
-    LAN_IFACE=$(echo "${LAN_IFACES[0]}" | cut -d' ' -f1)
+# Проверка установки
+if ! command -v named >/dev/null 2>&1 && [ ! -x /usr/sbin/named ]; then
+    die "Пакет bind не установлен! Установите вручную: apt-get install bind"
 fi
+msg_ok "Bind установлен"
 
-# 5. Последний вариант - ищем любой интерфейс кроме WAN
-if [ -z "$LAN_IFACE" ]; then
-    for iface in $ALL_IFACES; do
-        if [[ "$iface" != "lo" ]] && [[ "$iface" != *.* ]] && [[ "$iface" != gre* ]]; then
-            # Проверяем, не это ли WAN (ens33 с внешним IP)
-            if [[ "$iface" != "ens33" ]]; then
-                LAN_IFACE="$iface"
-                break
-            fi
-        fi
-    done
+# 3. Создание директорий
+msg_in "Создание директорий..."
+
+# Определяем рабочую директорию
+NAMED_DIR="/var/named"
+if [ ! -d "$NAMED_DIR" ]; then
+    mkdir -p "$NAMED_DIR"
 fi
+mkdir -p "$NAMED_DIR/data"
+mkdir -p "$NAMED_DIR/slaves" 2>/dev/null
 
-if [ -z "$LAN_IFACE" ]; then
-    echo -e "${RED}Не удалось определить LAN интерфейс!${NC}"
+# Установка прав
+chown -R $NAMED_USER:$NAMED_USER "$NAMED_DIR" 2>/dev/null || chown -R root:$NAMED_USER "$NAMED_DIR"
+chmod 750 "$NAMED_DIR"
+chmod 770 "$NAMED_DIR/data" 2>/dev/null
+
+msg_ok "Директории созданы: $NAMED_DIR"
+
+# 4. Определение обратной зоны
+REV_ZONE=$(echo "$HQ_RTR_IP" | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
+msg_in "Обратная зона: $REV_ZONE"
+
+# 5. Создание named.conf
+msg_in "Создание named.conf..."
+
+cat > /etc/named.conf << NAMED_CONF
+options {
+    listen-on port 53 { 127.0.0.1; $DNS_SERVER_IP; };
+    directory       "$NAMED_DIR";
+    dump-file       "$NAMED_DIR/data/cache_dump.db";
+    statistics-file "$NAMED_DIR/data/named_stats.txt";
+    memstatistics-file "$NAMED_DIR/data/named_mem_stats.txt";
+    
+    allow-query     { any; };
+    recursion yes;
+    dnssec-enable no;
+    dnssec-validation no;
+    
+    forwarders { $FORWARDER; };
+};
+
+zone "$DOMAIN" IN {
+    type master;
+    file "$DOMAIN.zone";
+    allow-update { none; };
+};
+
+zone "$REV_ZONE" IN {
+    type master;
+    file "$DOMAIN.rev";
+    allow-update { none; };
+};
+NAMED_CONF
+
+chown root:$NAMED_USER /etc/named.conf 2>/dev/null
+chmod 640 /etc/named.conf
+
+msg_ok "named.conf создан"
+
+# 6. Создание зоны прямого просмотра
+msg_in "Создание зоны $DOMAIN..."
+
+SERIAL=$(date +%Y%m%d01)
+
+cat > "$NAMED_DIR/$DOMAIN.zone" << ZONE_EOF
+\$TTL 86400
+@   IN  SOA ns1.$DOMAIN. root.$DOMAIN. (
+        $SERIAL
+        3600
+        1800
+        604800
+        86400
+)
+
+@       IN  NS      ns1.$DOMAIN.
+ns1     IN  A       $DNS_SERVER_IP
+
+hq-rtr  IN  A       $HQ_RTR_IP
+br-rtr  IN  A       $BR_RTR_IP
+hq-srv  IN  A       $HQ_SRV_IP
+br-srv  IN  A       $BR_SRV_IP
+docker  IN  A       $DOCKER_IP
+web     IN  A       $WEB_IP
+ZONE_EOF
+
+chown $NAMED_USER:$NAMED_USER "$NAMED_DIR/$DOMAIN.zone" 2>/dev/null || chown root:$NAMED_USER "$NAMED_DIR/$DOMAIN.zone"
+chmod 640 "$NAMED_DIR/$DOMAIN.zone"
+
+msg_ok "Зона создана"
+
+# 7. Создание зоны обратного просмотра
+msg_in "Создание обратной зоны..."
+
+HQ_RTR_LAST=$(echo "$HQ_RTR_IP" | cut -d'.' -f4)
+HQ_SRV_LAST=$(echo "$HQ_SRV_IP" | cut -d'.' -f4)
+
+cat > "$NAMED_DIR/$DOMAIN.rev" << REV_EOF
+\$TTL 86400
+@   IN  SOA ns1.$DOMAIN. root.$DOMAIN. (
+        $SERIAL
+        3600
+        1800
+        604800
+        86400
+)
+
+@       IN  NS      ns1.$DOMAIN.
+
+$HQ_RTR_LAST   IN  PTR     hq-rtr.$DOMAIN.
+$HQ_SRV_LAST   IN  PTR     hq-srv.$DOMAIN.
+REV_EOF
+
+chown $NAMED_USER:$NAMED_USER "$NAMED_DIR/$DOMAIN.rev" 2>/dev/null || chown root:$NAMED_USER "$NAMED_DIR/$DOMAIN.rev"
+chmod 640 "$NAMED_DIR/$DOMAIN.rev"
+
+msg_ok "Обратная зона создана"
+
+#===========================================
+# ПРОВЕРКА КОНФИГУРАЦИИ
+#===========================================
+echo ""
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+echo -e "${CYAN}ПРОВЕРКА КОНФИГУРАЦИИ${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+echo ""
+
+# Проверка named.conf
+msg_in "Проверка named.conf..."
+if named-checkconf 2>&1; then
+    msg_ok "named.conf валиден"
+else
+    msg_er "ОШИБКА в named.conf!"
     echo ""
-    read -p "Введите имя интерфейса вручную: " LAN_IFACE
-fi
-
-echo -e "${GREEN}Выбран LAN интерфейс: $LAN_IFACE${NC}"
-
-# ============================================================
-# АВТОВЫБОР WAN ИНТЕРФЕЙСА
-# ============================================================
-WAN_IFACE=""
-for iface in "${WAN_IFACES[@]}"; do
-    if [[ "$iface" == ens33* ]]; then
-        WAN_IFACE="ens33"
-        break
-    fi
-done
-
-if [ -z "$WAN_IFACE" ]; then
-    for iface in "${WAN_IFACES[@]}"; do
-        WAN_IFACE=$(echo "$iface" | cut -d' ' -f1)
-        break
-    done
-fi
-
-if [ -n "$WAN_IFACE" ]; then
-    echo -e "${CYAN}WAN интерфейс: $WAN_IFACE${NC}"
-fi
-
-# ============================================================
-# ВЫБОР СЕТИ
-# ============================================================
-echo ""
-echo -e "${WHITE}Выберите сеть для DHCP:${NC}"
-echo "  1) SRV-Net  (192.168.10.0/26) - для серверов [по умолчанию]"
-echo "  2) CLI-Net  (192.168.20.0/28) - для клиентов"
-echo "  3) Mgmt     (192.168.99.0/29) - для управления"
-echo ""
-read -p "Ваш выбор [1]: " NET_CHOICE
-NET_CHOICE=${NET_CHOICE:-1}
-
-case "$NET_CHOICE" in
-    1)
-        NETWORK="192.168.10.0"
-        NETMASK="255.255.255.192"
-        CIDR="26"
-        GATEWAY="192.168.10.1"
-        BROADCAST="192.168.10.63"
-        RANGE_START="192.168.10.10"
-        RANGE_END="192.168.10.60"
-        NETWORK_NAME="SRV-Net"
-        ;;
-    2)
-        NETWORK="192.168.20.0"
-        NETMASK="255.255.255.240"
-        CIDR="28"
-        GATEWAY="192.168.20.1"
-        BROADCAST="192.168.20.15"
-        RANGE_START="192.168.20.5"
-        RANGE_END="192.168.20.14"
-        NETWORK_NAME="CLI-Net"
-        ;;
-    3)
-        NETWORK="192.168.99.0"
-        NETMASK="255.255.255.248"
-        CIDR="29"
-        GATEWAY="192.168.99.1"
-        BROADCAST="192.168.99.7"
-        RANGE_START="192.168.99.2"
-        RANGE_END="192.168.99.6"
-        NETWORK_NAME="Mgmt"
-        ;;
-    *)
-        echo -e "${RED}Неверный выбор, используется SRV-Net${NC}"
-        NETWORK="192.168.10.0"
-        NETMASK="255.255.255.192"
-        CIDR="26"
-        GATEWAY="192.168.10.1"
-        BROADCAST="192.168.10.63"
-        RANGE_START="192.168.10.10"
-        RANGE_END="192.168.10.60"
-        NETWORK_NAME="SRV-Net"
-        ;;
-esac
-
-echo ""
-echo -e "${GREEN}Выбрана сеть: $NETWORK_NAME ($NETWORK/$CIDR)${NC}"
-echo "  Шлюз: $GATEWAY"
-echo "  DHCP диапазон: $RANGE_START - $RANGE_END"
-
-# ============================================================
-# ОЧИСТКА VLAN
-# ============================================================
-echo ""
-echo -e "${WHITE}[AUTO] Проверка VLAN на $LAN_IFACE...${NC}"
-echo "------------------------------------------------------------------------"
-
-VLAN_REMOVED=0
-for vlan_dir in /etc/net/ifaces/${LAN_IFACE}.*; do
-    if [ -d "$vlan_dir" ]; then
-        vlan_name=$(basename "$vlan_dir")
-        echo -e "  ${YELLOW}Удаление VLAN: $vlan_name${NC}"
-        
-        ip link set "$vlan_name" down 2>/dev/null
-        ip link del "$vlan_name" 2>/dev/null
-        rm -rf "$vlan_dir"
-        
-        VLAN_REMOVED=$((VLAN_REMOVED + 1))
-    fi
-done
-
-if [ $VLAN_REMOVED -eq 0 ]; then
-    echo -e "  ${GREEN}VLAN не найдены${NC}"
-else
-    echo -e "  ${GREEN}Удалено VLAN: $VLAN_REMOVED${NC}"
-fi
-
-# ============================================================
-# НАСТРОЙКА IP
-# ============================================================
-echo ""
-echo -e "${WHITE}[AUTO] Настройка IP на $LAN_IFACE...${NC}"
-echo "------------------------------------------------------------------------"
-
-IFACE_DIR="/etc/net/ifaces/$LAN_IFACE"
-mkdir -p "$IFACE_DIR"
-
-# options
-cat > "$IFACE_DIR/options" << EOF
-BOOTPROTO=static
-TYPE=eth
-ONBOOT=yes
-DISABLED=no
-EOF
-
-# ipv4address
-echo "$GATEWAY/$CIDR" > "$IFACE_DIR/ipv4address"
-
-# Удаляем маршрут если есть
-rm -f "$IFACE_DIR/ipv4route"
-
-# Применяем немедленно
-ip addr flush dev "$LAN_IFACE" 2>/dev/null
-ip addr add "$GATEWAY/$CIDR" dev "$LAN_IFACE" 2>/dev/null
-ip link set "$LAN_IFACE" up
-
-# Проверка
-if ip addr show "$LAN_IFACE" | grep -q "$GATEWAY"; then
-    echo -e "${GREEN}IP настроен: $GATEWAY/$CIDR${NC}"
-else
-    echo -e "${RED}Ошибка настройки IP${NC}"
-fi
-
-# ============================================================
-# УСТАНОВКА DHCP
-# ============================================================
-echo ""
-echo -e "${WHITE}[AUTO] Установка DHCP сервера...${NC}"
-echo "------------------------------------------------------------------------"
-
-if ! rpm -q dhcp-server &>/dev/null; then
-    apt-get update -qq
-    apt-get install -y dhcp-server
-    echo -e "${GREEN}DHCP сервер установлен${NC}"
-else
-    echo -e "${GREEN}DHCP сервер уже установлен${NC}"
-fi
-
-# ============================================================
-# КОНФИГУРАЦИЯ DHCP
-# ============================================================
-echo ""
-echo -e "${WHITE}[AUTO] Создание конфигурации DHCP...${NC}"
-echo "------------------------------------------------------------------------"
-
-cat > /etc/dhcp/dhcpd.conf << EOF
-# DHCP Configuration for Demo2026 Exam
-# Автоматическая настройка - прямое соединение
-# Сеть: $NETWORK_NAME
-# Интерфейс: $LAN_IFACE
-
-default-lease-time 600;
-max-lease-time 7200;
-authoritative;
-ddns-update-style none;
-
-# $NETWORK_NAME
-subnet $NETWORK netmask $NETMASK {
-    range $RANGE_START $RANGE_END;
-    option routers $GATEWAY;
-    option subnet-mask $NETMASK;
-    option broadcast-address $BROADCAST;
-    option domain-name "au-team.irpo";
-    option domain-name-servers 8.8.8.8, 8.8.4.4;
-    default-lease-time 600;
-    max-lease-time 7200;
-}
-EOF
-
-echo -e "${GREEN}/etc/dhcp/dhcpd.conf создан${NC}"
-
-# Интерфейсы
-cat > /etc/sysconfig/dhcpd << EOF
-DHCPDARGS="$LAN_IFACE"
-EOF
-
-echo -e "${GREEN}/etc/sysconfig/dhcpd: DHCPDARGS=\"$LAN_IFACE\"${NC}"
-
-# ============================================================
-# IP FORWARDING
-# ============================================================
-echo ""
-echo -e "${WHITE}[AUTO] Включение IP forwarding...${NC}"
-echo "------------------------------------------------------------------------"
-
-SYSCTL_FILE="/etc/sysctl.conf"
-[ -f "/etc/net/sysctl.conf" ] && SYSCTL_FILE="/etc/net/sysctl.conf"
-
-if ! grep -q "net.ipv4.ip_forward" "$SYSCTL_FILE"; then
-    echo "net.ipv4.ip_forward = 1" >> "$SYSCTL_FILE"
-else
-    sed -i 's/net.ipv4.ip_forward.*/net.ipv4.ip_forward = 1/' "$SYSCTL_FILE"
-fi
-sysctl -p > /dev/null 2>&1
-
-echo -e "${GREEN}IP forwarding включён${NC}"
-
-# ============================================================
-# NAT (если есть WAN)
-# ============================================================
-if [ -n "$WAN_IFACE" ] && [ "$WAN_IFACE" != "$LAN_IFACE" ]; then
+    named-checkconf
     echo ""
-    echo -e "${WHITE}[AUTO] Настройка NAT ($LAN_IFACE -> $WAN_IFACE)...${NC}"
-    echo "------------------------------------------------------------------------"
-    
-    # Очищаем старые правила NAT для этой сети
-    iptables -t nat -D POSTROUTING -s "$NETWORK/$CIDR" -o "$WAN_IFACE" -j MASQUERADE 2>/dev/null
-    
-    # Добавляем новое правило
-    iptables -t nat -A POSTROUTING -s "$NETWORK/$CIDR" -o "$WAN_IFACE" -j MASQUERADE
-    
-    # Forward
-    iptables -D FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT 2>/dev/null
-    iptables -A FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT
-    iptables -D FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
-    iptables -A FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state ESTABLISHED,RELATED -j ACCEPT
-    
-    # Сохраняем
-    if [ -d /etc/sysconfig ]; then
-        iptables-save > /etc/sysconfig/iptables 2>/dev/null
-    fi
-    
-    echo -e "${GREEN}NAT настроен: $NETWORK/$CIDR -> $WAN_IFACE${NC}"
+    die "Исправьте ошибки в /etc/named.conf"
 fi
 
-# ============================================================
-# ЗАПУСК DHCP
-# ============================================================
+# Проверка зоны
+msg_in "Проверка зоны $DOMAIN..."
+if named-checkzone "$DOMAIN" "$NAMED_DIR/$DOMAIN.zone" 2>&1; then
+    msg_ok "Зона $DOMAIN валидна"
+else
+    msg_er "ОШИБКА в зоне!"
+    die "Проверьте файл $NAMED_DIR/$DOMAIN.zone"
+fi
+
+# Проверка обратной зоны
+msg_in "Проверка обратной зоны..."
+named-checkzone "$REV_ZONE" "$NAMED_DIR/$DOMAIN.rev" 2>&1 && msg_ok "Обратная зона валидна"
+
+#===========================================
+# FIREWALL
+#===========================================
 echo ""
-echo -e "${WHITE}[AUTO] Запуск DHCP сервера...${NC}"
-echo "------------------------------------------------------------------------"
+msg_in "Настройка firewall..."
 
-systemctl enable dhcpd 2>/dev/null
-systemctl restart dhcpd 2>/dev/null
+if command -v iptables >/dev/null 2>&1; then
+    iptables -I INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null
+    iptables -I INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null
+    msg_ok "iptables настроен"
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-service=dns 2>/dev/null
+    firewall-cmd --reload 2>/dev/null
+    msg_ok "firewalld настроен"
+fi
 
+#===========================================
+# ЗАПУСК СЛУЖБЫ
+#===========================================
+echo ""
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+echo -e "${CYAN}ЗАПУСК DNS СЕРВЕРА${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+echo ""
+
+# Определяем имя сервиса
+SERVICE_NAME=""
+for svc in bind named bind9; do
+    if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+        SERVICE_NAME="$svc"
+        break
+    fi
+done
+
+[ -z "$SERVICE_NAME" ] && SERVICE_NAME="bind"
+
+msg_in "Имя сервиса: $SERVICE_NAME"
+
+# Останавливаем
+systemctl stop "$SERVICE_NAME" 2>/dev/null
+systemctl stop named 2>/dev/null
+
+# Перезагружаем systemd
+systemctl daemon-reload
+
+# Пробуем запустить
+msg_in "Запуск через systemctl..."
+systemctl start "$SERVICE_NAME" 2>&1
 sleep 2
 
-# ============================================================
-# ИТОГИ
-# ============================================================
-echo ""
-echo -e "${CYAN}========================================================================${NC}"
-echo -e "${WHITE}                           РЕЗУЛЬТАТ${NC}"
-echo -e "${CYAN}========================================================================${NC}"
-
-echo ""
-echo -e "${WHITE}Интерфейсы:${NC}"
-ip -brief addr show | grep -E "($LAN_IFACE|$WAN_IFACE)"
-
-echo ""
-echo -e "${WHITE}DHCP сервер:${NC}"
-if systemctl is-active dhcpd &>/dev/null; then
-    echo -e "  Статус: ${GREEN}АКТИВЕН${NC}"
-    ss -ulnp | grep ":67"
+if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    msg_ok "DNS сервер запущен через systemctl!"
+    systemctl enable "$SERVICE_NAME" 2>/dev/null
 else
-    echo -e "  Статус: ${RED}ОШИБКА${NC}"
-    journalctl -u dhcpd -n 5 --no-pager
+    msg_wrn "systemctl не сработал, пробуем напрямую..."
+    
+    # Диагностика
+    echo ""
+    msg_in "ДИАГНОСТИКА:"
+    echo ""
+    
+    # Проверяем логи
+    echo "--- journalctl ---"
+    journalctl -u "$SERVICE_NAME" -n 10 --no-pager 2>/dev/null
+    
+    echo ""
+    echo "--- Проверка файлов ---"
+    ls -la /etc/named.conf
+    ls -la "$NAMED_DIR/"
+    
+    echo ""
+    echo "--- Прямой запуск ---"
+    
+    # Ищем бинарник
+    NAMED_BIN=""
+    for path in /usr/sbin/named /usr/local/sbin/named; do
+        if [ -x "$path" ]; then
+            NAMED_BIN="$path"
+            break
+        fi
+    done
+    
+    if [ -n "$NAMED_BIN" ]; then
+        # Пробуем с отладкой
+        echo "Запуск: $NAMED_BIN -u $NAMED_USER -g"
+        $NAMED_BIN -u $NAMED_USER -g &
+        sleep 3
+        
+        if pgrep -x named >/dev/null; then
+            msg_ok "named запущен в отладочном режиме!"
+        else
+            msg_er "named не запустился даже в отладочном режиме"
+            echo ""
+            echo "Возможные причины:"
+            echo "1. Ошибка в конфигурации - проверьте named-checkconf"
+            echo "2. Порт 53 занят другой программой"
+            echo "3. Недостаточно прав"
+            echo ""
+            echo "Проверьте:"
+            echo "  netstat -tulpn | grep :53"
+            echo "  named -u $NAMED_USER -g"
+        fi
+    fi
 fi
 
+#===========================================
+# RESOLV.CONF
+#===========================================
 echo ""
-echo -e "${WHITE}Конфигурация:${NC}"
-echo "  LAN интерфейс: $LAN_IFACE"
-echo "  IP адрес: $GATEWAY/$CIDR"
-echo "  Сеть: $NETWORK_NAME ($NETWORK/$CIDR)"
-echo "  DHCP диапазон: $RANGE_START - $RANGE_END"
-echo "  Домен: au-team.irpo"
+msg_in "Настройка resolv.conf..."
 
-[ -n "$WAN_IFACE" ] && echo "  NAT: $LAN_IFACE -> $WAN_IFACE"
+[ -f /etc/resolv.conf ] && cp /etc/resolv.conf /etc/resolv.conf.bak.$$ 2>/dev/null
 
+# Добавляем наш DNS
+if ! grep -q "nameserver $DNS_SERVER_IP" /etc/resolv.conf 2>/dev/null; then
+    sed -i "1i\nameserver $DNS_SERVER_IP" /etc/resolv.conf 2>/dev/null || {
+        printf "nameserver %s\n" "$DNS_SERVER_IP" > /etc/resolv.conf
+    }
+fi
+
+if ! grep -q "search.*$DOMAIN" /etc/resolv.conf 2>/dev/null; then
+    echo "search $DOMAIN" >> /etc/resolv.conf
+fi
+
+msg_ok "resolv.conf настроен"
+
+#===========================================
+# ИТОГ
+#===========================================
 echo ""
-echo -e "${CYAN}========================================================================${NC}"
-echo -e "${WHITE}                    ГОТОВО!${NC}"
-echo -e "${CYAN}========================================================================${NC}"
+echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║        ГОТОВО! Проверьте статус DNS сервера                ║${NC}"
+echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo "На HQ-SRV выполните:"
+echo -e "${CYAN}Команды для проверки:${NC}"
+echo -e "  ${YELLOW}systemctl status $SERVICE_NAME${NC}"
+echo -e "  ${YELLOW}nslookup hq-rtr.$DOMAIN${NC}"
+echo -e "  ${YELLOW}nslookup $HQ_RTR_IP${NC}"
+echo -e "  ${YELLOW}dig @$DNS_SERVER_IP hq-srv.$DOMAIN${NC}"
 echo ""
-echo "  mkdir -p /etc/net/ifaces/ens33"
-echo "  echo 'BOOTPROTO=dhcp' > /etc/net/ifaces/ens33/options"
-echo "  echo 'TYPE=eth' >> /etc/net/ifaces/ens33/options"
-echo "  echo 'ONBOOT=yes' >> /etc/net/ifaces/ens33/options"
-echo "  systemctl restart network"
+echo -e "${CYAN}Если не работает:${NC}"
+echo -e "  ${YELLOW}named-checkconf${NC}"
+echo -e "  ${YELLOW}journalctl -u $SERVICE_NAME -n 50${NC}"
+echo -e "  ${YELLOW}named -u $NAMED_USER -g${NC}  (запуск с отладкой)"
 echo ""
