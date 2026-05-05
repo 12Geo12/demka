@@ -2,7 +2,7 @@
 
 # ============================================================================
 # DNS Infrastructure Setup Script for ALT Linux
-# Версия: 2.1 (исправлена установка для ALT Linux)
+# Версия: 2.2 (исправлена структура named.conf)
 # ============================================================================
 
 set -e
@@ -37,7 +37,6 @@ if [ -f /etc/altlinux-release ]; then
     apt-get update
     apt-get install -y bind bind-utils
     
-    SERVICE_NAME="named"
     log_info "Пакеты bind установлены"
 else
     log_error "Поддерживается только ALT Linux"
@@ -164,7 +163,7 @@ if [ ! -f /etc/rndc.key ]; then
     chmod 640 /etc/rndc.key
 fi
 
-# Создание named.conf
+# Создание named.conf (ИСПРАВЛЕНО - logging вне options)
 log_step "Создание named.conf..."
 REVERSE_NET=$(echo $NETWORK_ADDR | sed 's/\.[0-9]*$//')
 
@@ -183,15 +182,15 @@ options {
     forward only;
     
     dnssec-validation no;
-    
-    logging {
-        channel default_log {
-            file "/var/named/data/named.log" versions 3 size 5m;
-            severity info;
-            print-time yes;
-        };
-        category default { default_log; };
+};
+
+logging {
+    channel default_log {
+        file "/var/named/data/named.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
     };
+    category default { default_log; };
 };
 
 include "/etc/rndc.key";
@@ -245,14 +244,6 @@ for i in "${!HOSTS[@]}"; do
     echo "${HOSTS[$i]}   IN  A   ${IPS[$i]}" >> /var/named/zones/$DOMAIN_NAME.zone
 done
 
-# PTR записи
-echo "" >> /var/named/zones/$DOMAIN_NAME.zone
-echo "; PTR Records" >> /var/named/zones/$DOMAIN_NAME.zone
-for i in "${!HOSTS[@]}"; do
-    LAST=$(echo ${IPS[$i]} | awk -F. '{print $4}')
-    echo "${HOSTS[$i]}   IN  PTR   $LAST" >> /var/named/zones/$DOMAIN_NAME.zone
-done
-
 chown named:named /var/named/zones/$DOMAIN_NAME.zone
 chmod 640 /var/named/zones/$DOMAIN_NAME.zone
 
@@ -304,7 +295,7 @@ chown named:named /var/named/data/named.log
 
 # Проверка
 log_step "Проверка конфигурации..."
-named-checkconf /etc/named.conf
+named-checkconf
 named-checkzone $DOMAIN_NAME /var/named/zones/$DOMAIN_NAME.zone
 named-checkzone $REVERSE_NET.in-addr.arpa /var/named/zones/$REVERSE_NET.reverse
 
@@ -351,8 +342,21 @@ for i in "${!HOSTS[@]}"; do
     fi
 done
 
+# Обратное разрешение
+echo ""
+log_step "Тестирование обратного разрешения..."
+for i in "${!HOSTS[@]}"; do
+    RESULT=$(dig @localhost -x ${IPS[$i]} +short 2>/dev/null)
+    if echo "$RESULT" | grep -q "${HOSTS[$i]}.$DOMAIN_NAME"; then
+        log_info "✓ ${IPS[$i]} -> ${HOSTS[$i]}.$DOMAIN_NAME"
+    else
+        log_warn "✗ ${IPS[$i]} -> $RESULT"
+    fi
+done
+
 echo ""
 log_info "Готово! Команды:"
 echo "  systemctl status named"
 echo "  tail -f /var/named/data/named.log"
 echo "  dig @localhost hq-srv.$DOMAIN_NAME"
+echo "  rndc status"
