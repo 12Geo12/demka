@@ -35,8 +35,10 @@ log "Введите параметры:"
 MY_IP=$(ip route get 8.8.8.8 | awk '{print $7; exit}')
 read -p "IP HQ-SRV [$MY_IP]: " IP && IP=${IP:-$MY_IP}
 read -p "Домен [au-team.irpo]: " DOMAIN && DOMAIN=${DOMAIN:-au-team.irpo}
-read -p "Сеть (192.168.10): " NET && NET=${NET:-192.168.10}
-FWD_IP=$(echo $NET | sed 's/\.[0-9]*$/.254')
+
+# ИСПРАВЛЕНО: используем cut вместо sed
+read -p "Сеть (192.168.10): " NET && NET=${NET:-$(echo $IP | cut -d. -f1-3)}
+FWD_IP="${NET}.254"
 read -p "IP шлюза [$FWD_IP]: " FWD && FWD=${FWD:-$FWD_IP}
 
 # Хосты
