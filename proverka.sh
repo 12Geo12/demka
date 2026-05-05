@@ -187,7 +187,7 @@ log_step "Генерация rndc ключа..."
 rm -f /etc/rndc.key /etc/bind/rndc.key
 
 # Генерируем новый
-rndc-confgen -a -q
+rndc-confgen -a 
 
 # Копируем в оба места
 if [ -f /etc/rndc.key ]; then
