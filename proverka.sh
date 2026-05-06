@@ -1,767 +1,442 @@
 #!/bin/bash
-# ============================================================================
-# DNS Server Setup Script для ALT Linux Server
-# Demo 2026 - Модуль 1, Задание 10
-# Автоматическая настройка DNS-сервера с интерактивным вводом параметров
-# ============================================================================
+#===============================================================================
+# ИДЕАЛЬНЫЙ СКРИПТ НАСТРОЙКИ FRR (OSPF + GRE) ДЛЯ ALT LINUX
+# Версия 2.0 - С возможностью добавления сетей
+#===============================================================================
 
-set -e
-
-# ======================== ЦВЕТА И ФУНКЦИИ ========================
+# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
+YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+NC='\033[0m'
 
-log() { echo -e "${GREEN}[+]${NC} $1"; }
-info() { echo -e "${BLUE}[i]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-err() { echo -e "${RED}[X]${NC} $1"; }
-header() { echo -e "\n${CYAN}========================================${NC}"; echo -e "${CYAN}$1${NC}"; echo -e "${CYAN}========================================${NC}\n"; }
+# Пути
+IFACES_DIR="/etc/net/ifaces"
+FRR_CONF="/etc/frr/frr.conf"
+BACKUP_DIR="/root/frr_backups"
 
-# ======================== ПРОВЕРКА ROOT ========================
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        err "Этот скрипт должен быть запущен от имени root!"
-        info "Используйте: sudo $0"
-        exit 1
-    fi
+# Проверка ROOT
+if [[ $EUID -ne 0 ]]; then
+ echo -e "${RED}Ошибка: Запустите от root${NC}"
+ exit 1
+fi
+
+# Функция определения сети
+get_network_from_iface() {
+ local iface=$1
+ local ip_mask=$(ip -4 addr show dev "$iface" | grep -oP 'inet \K[\d./]+')
+ if [[ -z "$ip_mask" ]]; then return; fi
+ local ip=$(echo "$ip_mask" | cut -d'/' -f1)
+ local cidr=$(echo "$ip_mask" | cut -d'/' -f2)
+ local IFS='.'; read -r i1 i2 i3 i4 <<< "$ip"
+ local mask=$(( (0xFFFFFFFF << (32 - cidr)) & 0xFFFFFFFF ))
+ local ip_int=$(( (i1 << 24) | (i2 << 16) | (i3 << 8) | i4 ))
+ local net_int=$(( ip_int & mask ))
+ echo "$(( (net_int >> 24) & 0xFF )).$(( (net_int >> 16) & 0xFF )).$(( (net_int >> 8) & 0xFF )).$(( net_int & 0xFF ))/$cidr"
 }
 
-# ======================== АВТООПРЕДЕЛЕНИЕ СЕТИ ========================
-detect_network_info() {
-    header "Автоопределение сетевых параметров"
-    
-    # Получаем список интерфейсов (исключаем loopback)
-    INTERFACES=$(ls /sys/class/net/ | grep -v lo)
-    
-    info "Обнаруженные сетевые интерфейсы:"
-    echo "$INTERFACES" | while read iface; do
-        ip_addr=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d.]+')
-        if [ -n "$ip_addr" ]; then
-            echo "  - $iface: $ip_addr"
-        else
-            echo "  - $iface: (нет IPv4)"
-        fi
-    done
-    echo ""
-    
-    # Автоопределение основного IP (через маршрут по умолчанию)
-    MAIN_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-    AUTO_IP=$(ip -4 addr show "$MAIN_INTERFACE" 2>/dev/null | grep -oP 'inet \K[\d.]+')
-    
-    if [ -z "$AUTO_IP" ]; then
-        # Альтернативный метод
-        AUTO_IP=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+print_msg() { echo -e "${CYAN}[i]${NC} $1"; }
+print_ok() { echo -e "${GREEN}[OK]${NC} $1"; }
+print_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+print_err() { echo -e "${RED}[X]${NC} $1"; }
+
+#===============================================================================
+# ФУНКЦИЯ ДОБАВЛЕНИЯ СЕТЕЙ
+#===============================================================================
+
+add_networks_interactive() {
+ local networks=""
+ 
+ echo -e "\n${YELLOW}=== Добавление сетей для OSPF ===${NC}"
+ echo ""
+ echo "Доступные интерфейсы и их сети:"
+ echo "--------------------------------"
+ 
+ # Показываем все интерфейсы
+ for iface in $(ls /sys/class/net/ | grep -v lo); do
+  net=$(get_network_from_iface "$iface")
+  if [[ -n "$net" ]]; then
+   printf "  %-10s -> %s\n" "$iface" "$net"
+  fi
+ done
+ 
+ echo ""
+ echo "Выберите способ добавления сетей:"
+ echo " 1) Автоматически (все интерфейсы кроме внешнего)"
+ echo " 2) Выбрать из списка"
+ echo " 3) Ввести сети вручную"
+ echo " 4) Пропустить (добавлю позже)"
+ read -p "Ваш выбор [1]: " add_method
+ 
+ case $add_method in
+  2)
+   # Выбор из списка
+   echo ""
+   echo "Отметьте сети для добавления (y/n):"
+   echo "-----------------------------------"
+   for iface in $(ls /sys/class/net/ | grep -v lo); do
+    if [[ "$iface" == "$EXT_IFACE" ]] || [[ "$iface" == "gre1" ]]; then
+     continue
+    fi
+    net=$(get_network_from_iface "$iface")
+    if [[ -n "$net" ]]; then
+     read -p "  $iface ($net)? [y]: " ans
+     if [[ "$ans" != "n" ]]; then
+      networks+=" network $net area 0\n"
+     fi
+    fi
+   done
+   ;;
+   
+  3)
+   # Ручной ввод
+   echo ""
+   echo "Вводите сети в формате: IP/CIDR (например, 192.168.10.0/24)"
+   echo "Для завершения введите пустую строку"
+   echo "-----------------------------------"
+   
+   while true; do
+    read -p "Сеть (или Enter для завершения): " net
+    if [[ -z "$net" ]]; then
+     break
     fi
     
-    if [ -n "$AUTO_IP" ]; then
-        AUTO_NET=$(echo "$AUTO_IP" | cut -d. -f1-3)
-        AUTO_GW=$(ip route | grep default | awk '{print $3}' | head -1)
-        log "Автоопределено: IP=$AUTO_IP, Сеть=$AUTO_NET, Шлюз=$AUTO_GW"
+    # Проверка формата
+    if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+     networks+=" network $net area 0\n"
+     print_ok "Добавлена сеть: $net"
     else
-        warn "Не удалось автоматически определить IP-адрес"
-        AUTO_NET="192.168.10"
-        AUTO_GW="${AUTO_NET}.254"
+     print_warn "Неверный формат! Используйте IP/CIDR (например, 192.168.10.0/24)"
     fi
+   done
+   ;;
+   
+  4)
+   print_warn "Сети не добавлены"
+   ;;
+   
+  *)
+   # Автоматически
+   print_msg "Автоматический выбор всех сетей..."
+   for iface in $(ls /sys/class/net/ | grep -v lo); do
+    if [[ "$iface" == "$EXT_IFACE" ]] || [[ "$iface" == "gre1" ]]; then
+     continue
+    fi
+    net=$(get_network_from_iface "$iface")
+    if [[ -n "$net" ]]; then
+     networks+=" network $net area 0\n"
+     print_ok "Добавлена: $net ($iface)"
+    fi
+   done
+   ;;
+ esac
+ 
+ # Всегда добавляем сеть туннеля GRE
+ if [[ -n "$GRE_IP" ]]; then
+  GRE_NET_BASE=$(echo "$GRE_IP" | cut -d'.' -f1-3)
+  GRE_NET_CIDR=$(echo "$GRE_IP" | cut -d'/' -f2)
+  GRE_NET="${GRE_NET_BASE}.0/${GRE_NET_CIDR}"
+  networks+=" network $GRE_NET area 0\n"
+  print_ok "Добавлена сеть туннеля: $GRE_NET"
+ fi
+ 
+ echo -e "$networks"
 }
 
-# ======================== ИНТЕРАКТИВНЫЙ ВВОД ========================
-interactive_input() {
-    header "Ввод параметров DNS-сервера"
-    
-    # Домен
-    echo -e "${YELLOW}Введите доменное имя зоны${NC}"
-    read -p "Домен [au-team.irpo]: " DOMAIN
-    DOMAIN=${DOMAIN:-au-team.irpo}
-    
-    # IP текущего сервера (HQ-SRV)
-    echo -e "\n${YELLOW}Введите IP-адрес текущего сервера (HQ-SRV)${NC}"
-    read -p "IP HQ-SRV [$AUTO_IP]: " HQ_SRV_IP
-    HQ_SRV_IP=${HQ_SRV_IP:-$AUTO_IP}
-    
-    # Сеть
-    echo -e "\n${YELLOW}Введите сеть (первые 3 октета)${NC}"
-    read -p "Сеть [$AUTO_NET]: " NETWORK
-    NETWORK=${NETWORK:-$AUTO_NET}
-    
-    # Шлюз
-    echo -e "\n${YELLOW}Введите IP-адрес шлюза${NC}"
-    read -p "Шлюз [$AUTO_GW]: " GATEWAY
-    GATEWAY=${GATEWAY:-$AUTO_GW}
-    
-    # DNS серверы пересылки
-    echo -e "\n${YELLOW}DNS серверы пересылки (через пробел)${NC}"
-    read -p "Forwarders [77.88.8.7 77.88.8.8]: " FORWARDERS
-    FORWARDERS=${FORWARDERS:-"77.88.8.7 77.88.8.8"}
-    
-    # Подтверждение
-    echo ""
-    header "Проверка введённых данных"
-    echo -e "  Домен:           ${GREEN}$DOMAIN${NC}"
-    echo -e "  IP HQ-SRV:       ${GREEN}$HQ_SRV_IP${NC}"
-    echo -e "  Сеть:            ${GREEN}$NETWORK${NC}"
-    echo -e "  Шлюз:            ${GREEN}$GATEWAY${NC}"
-    echo -e "  Forwarders:      ${GREEN}$FORWARDERS${NC}"
-    echo ""
-    
-    read -p "Продолжить? [Y/n]: " CONFIRM
-    CONFIRM=${CONFIRM:-Y}
-    if [[ ! "$CONFIRM" =~ ^[YyДд]*$ ]]; then
-        err "Отмена операции пользователем"
-        exit 0
-    fi
+#===============================================================================
+# ФУНКЦИЯ ДОБАВЛЕНИЯ СЕТЕЙ ПОСЛЕ НАСТРОЙКИ
+#===============================================================================
+
+add_network_after_setup() {
+ if [[ ! -f "$FRR_CONF" ]]; then
+  print_err "FRR не настроен! Сначала выполните полную настройку."
+  return 1
+ fi
+ 
+ echo -e "\n${YELLOW}=== Добавление новых сетей в OSPF ===${NC}"
+ 
+ # Показываем текущие сети
+ echo ""
+ echo "Текущие сети в OSPF:"
+ grep "network.*area" "$FRR_CONF" | sed 's/^/  /'
+ 
+ echo ""
+ echo "Добавление новых сетей:"
+ echo "----------------------"
+ 
+ # Читаем текущий конфиг
+ current_config=$(cat "$FRR_CONF")
+ 
+ # Добавляем новые сети
+ while true; do
+  read -p "Введите сеть (IP/CIDR) или 'q' для выхода: " net
+  
+  if [[ "$net" == "q" ]]; then
+   break
+  fi
+  
+  if [[ -z "$net" ]]; then
+   continue
+  fi
+  
+  # Проверка формата
+  if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+   # Проверяем, есть ли уже такая сеть
+   if grep -q "network $net area" "$FRR_CONF"; then
+    print_warn "Сеть $net уже существует!"
+   else
+    # Добавляем сеть в конфиг
+    sed -i "/router ospf/a\\    network $net area 0" "$FRR_CONF"
+    print_ok "Сеть $net добавлена"
+   fi
+  else
+   print_warn "Неверный формат!"
+  fi
+ done
+ 
+ # Перезапускаем FRR
+ print_msg "Применение изменений..."
+ systemctl restart frr
+ print_ok "FRR перезапущен"
+ 
+ # Показываем обновлённый конфиг
+ echo ""
+ echo "Обновлённая конфигурация OSPF:"
+ grep -A20 "router ospf" "$FRR_CONF"
 }
 
-# ======================== ВВОД ХОСТОВ ========================
-input_hosts() {
-    header "Ввод DNS записей для устройств"
-    
-    # Инициализируем ассоциативный массив для хостов
-    declare -gA HOSTS_A_RECORDS
-    declare -gA HOSTS_PTR_RECORDS
-    
-    # Предустановленные хосты из задания (кроме HQ-CLI - исключён!)
-    echo -e "${YELLOW}Ввод IP-адресов для устройств (согласно Таблице 3)${NC}"
-    echo -e "${CYAN}Примечание: HQ-CLI исключён из задания${NC}\n"
-    
-    # HQ-RTR (A + PTR)
-    read -p "IP для HQ-RTR (маршрутизатор HQ) [${NETWORK}.254]: " HQ_RTR_IP
-    HQ_RTR_IP=${HQ_RTR_IP:-"${NETWORK}.254"}
-    HOSTS_A_RECORDS["hq-rtr"]="$HQ_RTR_IP"
-    HOSTS_PTR_RECORDS["hq-rtr"]="$HQ_RTR_IP"
-    
-    # BR-RTR (только A)
-    read -p "IP для BR-RTR (маршрутизатор BR) [${NETWORK}.253]: " BR_RTR_IP
-    BR_RTR_IP=${BR_RTR_IP:-"${NETWORK}.253"}
-    HOSTS_A_RECORDS["br-rtr"]="$BR_RTR_IP"
-    
-    # HQ-SRV (A + PTR) - текущий сервер
-    HOSTS_A_RECORDS["hq-srv"]="$HQ_SRV_IP"
-    HOSTS_PTR_RECORDS["hq-srv"]="$HQ_SRV_IP"
-    
-    # BR-SRV (только A)
-    read -p "IP для BR-SRV (сервер BR) [${NETWORK}.10]: " BR_SRV_IP
-    BR_SRV_IP=${BR_SRV_IP:-"${NETWORK}.10"}
-    HOSTS_A_RECORDS["br-srv"]="$BR_SRV_IP"
-    
-    # ISP записи
-    echo -e "\n${YELLOW}Записи для ISP (интерфейсы провайдера)${NC}"
-    
-    # docker.au-team.irpo
-    read -p "IP для docker.au-team.irpo (ISP -> HQ-RTR): " DOCKER_IP
-    if [ -n "$DOCKER_IP" ]; then
-        HOSTS_A_RECORDS["docker"]="$DOCKER_IP"
-    fi
-    
-    # web.au-team.irpo
-    read -p "IP для web.au-team.irpo (ISP -> BR-RTR): " WEB_IP
-    if [ -n "$WEB_IP" ]; then
-        HOSTS_A_RECORDS["web"]="$WEB_IP"
-    fi
-    
-    # Дополнительные хосты
-    echo -e "\n${YELLOW}Добавить дополнительные записи?${NC}"
-    echo "Формат: имя:ip (например, server1:192.168.10.100)"
-    echo "Пустой ввод - завершить"
-    
-    while true; do
-        read -p "Дополнительная запись: " EXTRA_HOST
-        [ -z "$EXTRA_HOST" ] && break
-        
-        EXTRA_NAME="${EXTRA_HOST%%:*}"
-        EXTRA_IP="${EXTRA_HOST##*:}"
-        
-        if [ -n "$EXTRA_NAME" ] && [ -n "$EXTRA_IP" ]; then
-            HOSTS_A_RECORDS["$EXTRA_NAME"]="$EXTRA_IP"
-            log "Добавлено: $EXTRA_NAME -> $EXTRA_IP"
-            
-            read -p "Создать PTR запись? [y/N]: " ADD_PTR
-            if [[ "$ADD_PTR" =~ ^[YyДд]+$ ]]; then
-                HOSTS_PTR_RECORDS["$EXTRA_NAME"]="$EXTRA_IP"
-            fi
-        fi
-    done
-    
-    # Вывод всех записей
-    echo ""
-    header "Сводка DNS записей"
-    echo -e "${CYAN}A-записи (прямое разрешение):${NC}"
-    for name in "${!HOSTS_A_RECORDS[@]}"; do
-        echo -e "  $name.$DOMAIN -> ${HOSTS_A_RECORDS[$name]}"
-    done
-    
-    echo -e "\n${CYAN}PTR-записи (обратное разрешение):${NC}"
-    for name in "${!HOSTS_PTR_RECORDS[@]}"; do
-        echo -e "  ${HOSTS_PTR_RECORDS[$name]} -> $name.$DOMAIN"
-    done
-    echo ""
-}
+#===============================================================================
+# ОСНОВНАЯ НАСТРОЙКА
+#===============================================================================
 
-# ======================== УСТАНОВКА BIND ========================
-install_bind() {
-    header "Установка BIND DNS сервера"
-    
-    # Проверка ALT Linux
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        if [[ "$ID" == "altlinux" ]] || [[ "$ID" == "alt" ]]; then
-            log "Обнаружена ALT Linux: $PRETTY_NAME"
-            
-            # Обновление и установка
-            log "Обновление списков пакетов..."
-            apt-get update -qq
-            
-            log "Установка bind и bind-utils..."
-            apt-get install -y bind bind-utils
-        else
-            warn "Не ALT Linux, пытаемся установить через apt-get..."
-            apt-get update && apt-get install -y bind bind-utils || {
-                err "Не удалось установить BIND"
-                exit 1
-            }
-        fi
-    fi
-    
-    log "BIND успешно установлен"
-}
-
-# ======================== НАСТРОЙКА RNDC ========================
-setup_rndc() {
-    header "Настройка RNDC ключа"
-    
-    log "Генерация RNDC ключа..."
-    
-    # Удаляем старые ключи
-    rm -f /etc/rndc.key /etc/bind/rndc.key 2>/dev/null || true
-    
-    # Генерируем новый ключ
-    rndc-confgen -a -k rndc-key
-    
-    # Настраиваем права
-    if [ -f /etc/rndc.key ]; then
-        cp /etc/rndc.key /etc/bind/rndc.key
-        chmod 640 /etc/rndc.key /etc/bind/rndc.key
-        chown root:named /etc/rndc.key /etc/bind/rndc.key
-        log "RNDC ключ успешно создан"
-    else
-        warn "Не удалось создать RNDC ключ, продолжаем..."
-    fi
-}
-
-# ======================== КОНФИГУРАЦИЯ BIND ========================
-configure_bind() {
-    header "Создание конфигурационных файлов BIND"
-    
-    # Создаём директорию для зон
-    mkdir -p /etc/bind/zones
-    
-    # ======================== options.conf ========================
-    log "Создание /etc/bind/options.conf..."
-    
-    # Формируем список forwarders
-    FORWARDERS_CONFIG=""
-    for fwd in $FORWARDERS; do
-        FORWARDERS_CONFIG+="        $fwd;\n"
-    done
-    
-    cat > /etc/bind/options.conf << EOF
-options {
-    // Слушаем на всех интерфейсах
-    listen-on port 53 { any; };
-    listen-on-v6 port 53 { none; };
-    
-    // Рабочая директория
-    directory "/var/named";
-    
-    // PID файл
-    pid-file "/run/named/named.pid";
-    
-    // Разрешаем запросы от всех
-    allow-query { any; };
-    
-    // Разрешаем рекурсию
-    allow-recursion { any; };
-    recursion yes;
-    
-    // Серверы пересылки (forwarders)
-    forwarders {
-$(echo -e "$FORWARDERS_CONFIG")
-    };
-    forward only;
-    
-    // Отключаем DNSSEC для локальной сети
-    dnssec-validation no;
-    
-    // Логирование
-    statistics-file "/var/named/data/named_stats.txt";
-    session-keyfile "/run/named/session.key";
-};
+setup_frr() {
+ # Установка
+ print_msg "Установка пакетов..."
+ apt-get update >/dev/null 2>&1
+ apt-get install -y frr >/dev/null 2>&1
+ print_ok "FRR установлен"
+ 
+ #===============================================================================
+ # ШАГ 1: РОЛЬ И ROUTER ID
+ #===============================================================================
+ 
+ echo -e "\n${YELLOW}=== Шаг 1: Идентификация роутера ===${NC}"
+ 
+ HOST=$(hostname | tr '[:upper:]' '[:lower:]')
+ DEFAULT_ROLE=""
+ DEFAULT_RID=""
+ 
+ if [[ "$HOST" =~ "hq-rtr" ]]; then
+  DEFAULT_ROLE="HQ-RTR"; DEFAULT_RID="1.1.1.1"
+ elif [[ "$HOST" =~ "br-rtr" ]]; then
+  DEFAULT_ROLE="BR-RTR"; DEFAULT_RID="2.2.2.2"
+ fi
+ 
+ echo "Выберите роль:"
+ echo " 1) HQ-RTR (Router ID: 1.1.1.1)"
+ echo " 2) BR-RTR (Router ID: 2.2.2.2)"
+ echo " 3) Другая роль / Ввести Router ID вручную"
+ read -p "Ваш выбор [1]: " role_choice
+ 
+ case $role_choice in
+  2) ROLE="BR-RTR"; RID="2.2.2.2" ;;
+  3)
+   read -p "Введите имя роли (например, ISP): " ROLE
+   read -p "Введите Router ID (например, 3.3.3.3): " RID
+   ;;
+  *) ROLE="HQ-RTR"; RID="1.1.1.1" ;;
+ esac
+ print_ok "Роль: $ROLE, Router ID: $RID"
+ 
+ #===============================================================================
+ # ШАГ 2: НАСТРОЙКА GRE
+ #===============================================================================
+ 
+ echo -e "\n${YELLOW}=== Шаг 2: Настройка GRE туннеля ===${NC}"
+ 
+ # Выбор внешнего интерфейса
+ IFS= read -r -a IFACES <<< $(ls /sys/class/net/ | grep -v lo)
+ echo "Доступные интерфейсы:"
+ for i in "${!IFACES[@]}"; do
+  ip=$(ip -4 addr show "${IFACES[$i]}" | grep -oP 'inet \K[\d./]+' | head -1)
+  printf " %2s) %-10s %s\n" "$((i+1))" "${IFACES[$i]}" "$ip"
+ done
+ 
+ read -p "Выберите ВНЕШНИЙ интерфейс: " ext_idx
+ EXT_IFACE="${IFACES[$((ext_idx-1))]}"
+ EXT_IP=$(ip -4 addr show "$EXT_IFACE" | grep -oP 'inet \K[\d./]+' | head -1)
+ print_ok "Выбран внешний интерфейс: $EXT_IFACE ($EXT_IP)"
+ 
+ read -p "Введите ВНЕШНИЙ IP удаленного роутера: " REMOTE_IP
+ 
+ # Настройка IP туннеля
+ if [[ "$ROLE" == "HQ-RTR" ]]; then
+  DEF_GRE_IP="172.16.100.1/29"
+ else
+  DEF_GRE_IP="172.16.100.2/29"
+ fi
+ 
+ read -p "Локальный IP туннеля [$DEF_GRE_IP]: " GRE_IP
+ GRE_IP="${GRE_IP:-$DEF_GRE_IP}"
+ 
+ # Создание конфигов GRE
+ print_msg "Настройка /etc/net/ifaces/gre1..."
+ mkdir -p "$IFACES_DIR/gre1"
+ cat > "$IFACES_DIR/gre1/options" << EOF
+TYPE=gre
+REMOTE_ADDRESS=$REMOTE_IP
+LOCAL_ADDRESS=$EXT_IP
+TTL=64
 EOF
-
-    # ======================== local.conf (зоны) ========================
-    log "Создание /etc/bind/local.conf..."
-    
-    cat > /etc/bind/local.conf << EOF
-// ============================================================
-// Конфигурация зон DNS сервера
-// Сгенерировано: $(date)
-// ============================================================
-
-// Прямая зона домена
-zone "$DOMAIN" IN {
-    type master;
-    file "/etc/bind/zones/db.$DOMAIN";
-    allow-update { none; };
-};
-
-// Обратная зона
-zone "${NETWORK}.in-addr.arpa" IN {
-    type master;
-    file "/etc/bind/zones/db.${NETWORK}";
-    allow-update { none; };
-};
-
-// Стандартные зоны
-zone "localhost" IN {
-    type master;
-    file "/etc/bind/zones/db.local";
-    allow-update { none; };
-};
-
-zone "0.0.127.in-addr.arpa" IN {
-    type master;
-    file "/etc/bind/zones/db.127.0.0";
-    allow-update { none; };
-};
-
-zone "0.in-addr.arpa" IN {
-    type master;
-    file "/etc/bind/zones/db.empty";
-    allow-update { none; };
-};
-
-zone "255.in-addr.arpa" IN {
-    type master;
-    file "/etc/bind/zones/db.empty";
-    allow-update { none; };
-};
+ 
+ echo "$GRE_IP" > "$IFACES_DIR/gre1/ipv4address"
+ 
+ # Активация
+ ip tunnel del gre1 2>/dev/null
+ ip tunnel add gre1 mode gre local $EXT_IP remote $REMOTE_IP ttl 64
+ ip addr add $GRE_IP dev gre1
+ ip link set gre1 up
+ print_ok "Туннель gre1 активирован"
+ 
+ #===============================================================================
+ # ШАГ 3: НАСТРОЙКА OSPF С ДОБАВЛЕНИЕМ СЕТЕЙ
+ #===============================================================================
+ 
+ echo -e "\n${YELLOW}=== Шаг 3: Настройка OSPF ===${NC}"
+ 
+ read -p "Пароль для OSPF аутентификации [P@ssw0rd]: " PASS
+ PASS="${PASS:-P@ssw0rd}"
+ 
+ # Добавление сетей через функцию
+ NETWORKS_CONFIG=$(add_networks_interactive)
+ 
+ # Запись конфига FRR
+ print_msg "Генерация /etc/frr/frr.conf..."
+ cat > $FRR_CONF << EOF
+frr version 9.0
+frr defaults traditional
+hostname $(hostname)
+log syslog informational
+!
+router ospf
+ ospf router-id $RID
+ passive-interface default
+ no passive-interface gre1
+ ip ospf authentication
+ ip ospf authentication-key $PASS
+$(echo -e "$NETWORKS_CONFIG" | sed 's/^/    /')
+!
+line vty
+!
 EOF
-
-    # ======================== named.conf ========================
-    log "Создание /etc/named.conf..."
-    
-    cat > /etc/named.conf << EOF
-// ============================================================
-// Главный конфигурационный файл BIND
-// ALT Linux Server - DNS Setup
-// ============================================================
-
-// Опции сервера
-include "/etc/bind/options.conf";
-
-// RNDC ключ
-include "/etc/bind/rndc.key";
-
-// Определения зон
-include "/etc/bind/local.conf";
-EOF
-
-    log "Конфигурационные файлы созданы"
+ 
+ print_ok "Конфигурация FRR записана"
+ 
+ # Включение и запуск
+ systemctl enable frr >/dev/null 2>&1
+ systemctl restart frr
+ sleep 3
+ 
+ #===============================================================================
+ # ИТОГИ
+ #===============================================================================
+ 
+ clear
+ echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
+ echo -e "${GREEN}║ НАСТРОЙКА УСПЕШНО ЗАВЕРШЕНА ║${NC}"
+ echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
+ 
+ echo -e "\n${WHITE}ПАРАМЕТРЫ:${NC}"
+ echo "Роль: $ROLE"
+ echo "Router ID: $RID"
+ echo "Туннель: $GRE_IP"
+ echo ""
+ 
+ echo -e "${WHITE}ТЕКУЩИЙ СТАТУС OSPF:${NC}"
+ vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "Соседи пока не обнаружены"
+ echo ""
+ 
+ echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════╗${NC}"
+ echo -e "${MAGENTA}║ ГЛАВНЫЕ КОМАНДЫ ║${NC}"
+ echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════╝${NC}"
+ 
+ echo -e "${CYAN}1. Просмотр соседей OSPF:${NC}"
+ echo " vtysh -c 'show ip ospf neighbor'"
+ echo ""
+ 
+ echo -e "${CYAN}2. Просмотр OSPF маршрутов:${NC}"
+ echo " vtysh -c 'show ip route ospf'"
+ echo ""
+ 
+ echo -e "${CYAN}3. Добавить сеть после настройки:${NC}"
+ echo " Запустите скрипт и выберите пункт 5"
+ echo ""
 }
 
-# ======================== СОЗДАНИЕ ЗОН ========================
-create_zones() {
-    header "Создание файлов зон"
-    
-    SERIAL=$(date +%Y%m%d01)
-    
-    # ======================== Прямая зона ========================
-    log "Создание прямой зоны: $DOMAIN"
-    
-    cat > /etc/bind/zones/db.$DOMAIN << EOF
-; ============================================================
-; Прямая зона DNS: $DOMAIN
-; Сгенерировано: $(date)
-; ============================================================
+#===============================================================================
+# ГЛАВНОЕ МЕНЮ
+#===============================================================================
 
-\$TTL 86400
-@   IN  SOA hq-srv.$DOMAIN. root.$DOMAIN. (
-            $SERIAL  ; Serial (серийный номер)
-            3600     ; Refresh (обновление)
-            1800     ; Retry (повтор)
-            604800   ; Expire (истечение)
-            86400    ; Minimum TTL (минимум)
-            )
+clear
+echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║ FRR OSPF/GRE Setup v2.0 ║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 
-; NS записи
-        IN  NS      hq-srv.$DOMAIN.
+echo ""
+echo "Выберите действие:"
+echo " 1) Настроить FRR (OSPF + GRE)"
+echo " 2) Удалить прошлые настройки"
+echo " 3) Показать текущую конфигурацию"
+echo " 4) Добавить сети в существующую конфигурацию"
+echo " 5) Выход"
+read -p "Ваш выбор [1]: " main_choice
 
-; MX запись (если нужен почтовый сервер)
-        IN  MX  10  hq-srv.$DOMAIN.
+case $main_choice in
+ 2)
+  # Удаление (оставляем как было)
+  echo "Удаление настроек..."
+  ip link set gre1 down 2>/dev/null
+  ip tunnel del gre1 2>/dev/null
+  rm -rf "$IFACES_DIR/gre1"
+  systemctl restart frr
+  print_ok "Настройки удалены"
+  ;;
+  
+ 3)
+  # Показать конфигурацию
+  echo -e "\n${WHITE}=== Текущая конфигурация ===${NC}"
+  
+  echo -e "\n${CYAN}GRE туннели:${NC}"
+  ip link show | grep -E "gre[0-9]+" || echo " Нет активных GRE туннелей"
+  
+  echo -e "\n${CYAN}Конфигурация FRR (OSPF):${NC}"
+  if [[ -f "$FRR_CONF" ]]; then
+   grep -A20 "router ospf" "$FRR_CONF" 2>/dev/null || echo " OSPF не настроен"
+  else
+   echo " Файл $FRR_CONF не найден"
+  fi
+  
+  echo -e "\n${CYAN}OSPF соседи:${NC}"
+  vtysh -c "show ip ospf neighbor" 2>/dev/null || echo " OSPF не активен"
+  ;;
+  
+ 4)
+  # Добавить сети
+  add_network_after_setup
+  ;;
+  
+ 5)
+  echo "Выход..."
+  exit 0
+  ;;
+  
+ *)
+  setup_frr
+  ;;
+esac
 
-; ============================================================
-; A-записи устройств
-; ============================================================
-
-; DNS сервер (HQ-SRV)
-hq-srv      IN  A   $HQ_SRV_IP
-
-; Маршрутизаторы
-hq-rtr      IN  A   ${HOSTS_A_RECORDS["hq-rtr"]}
-br-rtr      IN  A   ${HOSTS_A_RECORDS["br-rtr"]}
-
-; Сервер филиала
-br-srv      IN  A   ${HOSTS_A_RECORDS["br-srv"]}
-
-; ISP интерфейсы
-EOF
-
-    # Добавляем docker и web если есть
-    if [ -n "${HOSTS_A_RECORDS["docker"]}" ]; then
-        echo "docker      IN  A   ${HOSTS_A_RECORDS["docker"]}" >> /etc/bind/zones/db.$DOMAIN
-    fi
-    if [ -n "${HOSTS_A_RECORDS["web"]}" ]; then
-        echo "web         IN  A   ${HOSTS_A_RECORDS["web"]}" >> /etc/bind/zones/db.$DOMAIN
-    fi
-    
-    # Добавляем дополнительные записи
-    for name in "${!HOSTS_A_RECORDS[@]}"; do
-        if [[ ! "$name" =~ ^(hq-srv|hq-rtr|br-rtr|br-srv|docker|web)$ ]]; then
-            echo "$name       IN  A   ${HOSTS_A_RECORDS[$name]}" >> /etc/bind/zones/db.$DOMAIN
-        fi
-    done
-
-    # ======================== Обратная зона ========================
-    log "Создание обратной зоны: ${NETWORK}.in-addr.arpa"
-    
-    cat > /etc/bind/zones/db.${NETWORK} << EOF
-; ============================================================
-; Обратная зона DNS: ${NETWORK}.in-addr.arpa
-; Сгенерировано: $(date)
-; ============================================================
-
-\$TTL 86400
-@   IN  SOA hq-srv.$DOMAIN. root.$DOMAIN. (
-            $SERIAL  ; Serial
-            3600     ; Refresh
-            1800     ; Retry
-            604800   ; Expire
-            86400    ; Minimum TTL
-            )
-
-; NS запись
-        IN  NS      hq-srv.$DOMAIN.
-
-; ============================================================
-; PTR-записи (обратное разрешение)
-; ============================================================
-
-EOF
-
-    # Добавляем PTR записи
-    for name in "${!HOSTS_PTR_RECORDS[@]}"; do
-        ip="${HOSTS_PTR_RECORDS[$name]}"
-        last_octet=$(echo "$ip" | cut -d. -f4)
-        echo "$last_octet     IN  PTR     $name.$DOMAIN." >> /etc/bind/zones/db.${NETWORK}
-    done
-
-    # ======================== localhost зона ========================
-    log "Создание стандартных зон..."
-    
-    cat > /etc/bind/zones/db.local << 'EOF'
-$TTL 86400
-@   IN  SOA localhost. root.localhost. (
-            1       ; Serial
-            3600    ; Refresh
-            1800    ; Retry
-            604800  ; Expire
-            86400 ) ; Minimum TTL
-
-        IN  NS      localhost.
-        IN  A       127.0.0.1
-EOF
-
-    cat > /etc/bind/zones/db.127.0.0 << 'EOF'
-$TTL 86400
-@   IN  SOA localhost. root.localhost. (
-            1       ; Serial
-            3600    ; Refresh
-            1800    ; Retry
-            604800  ; Expire
-            86400 ) ; Minimum TTL
-
-        IN  NS      localhost.
-1       IN  PTR     localhost.
-EOF
-
-    cat > /etc/bind/zones/db.empty << 'EOF'
-$TTL 86400
-@   IN  SOA localhost. root.localhost. (
-            1       ; Serial
-            3600    ; Refresh
-            1800    ; Retry
-            604800  ; Expire
-            86400 ) ; Minimum TTL
-
-        IN  NS      localhost.
-EOF
-
-    log "Файлы зон успешно созданы"
-}
-
-# ======================== НАСТРОЙКА ПРАВ ========================
-set_permissions() {
-    header "Настройка прав доступа"
-    
-    log "Установка владельца и прав для /etc/bind..."
-    chown -R root:named /etc/bind
-    chmod 755 /etc/bind
-    chmod 640 /etc/bind/*.conf 2>/dev/null || true
-    chmod 640 /etc/bind/*.key 2>/dev/null || true
-    chmod 644 /etc/bind/zones/*
-    
-    log "Настройка /var/named..."
-    mkdir -p /var/named/data
-    mkdir -p /var/named/dynamic
-    mkdir -p /var/named/slaves
-    
-    chown -R named:named /var/named
-    chmod 750 /var/named
-    chmod 770 /var/named/data /var/named/dynamic /var/named/slaves
-    
-    # Создаём файл лога
-    touch /var/named/data/named.log
-    chown named:named /var/named/data/named.log
-    
-    log "Права доступа настроены"
-}
-
-# ======================== FIREWALL ========================
-configure_firewall() {
-    header "Настройка firewall"
-    
-    # Проверяем iptables
-    if command -v iptables &> /dev/null; then
-        log "Добавление правил iptables для DNS..."
-        
-        # UDP 53
-        iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || \
-            iptables -I INPUT -p udp --dport 53 -j ACCEPT
-        
-        # TCP 53
-        iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || \
-            iptables -I INPUT -p tcp --dport 53 -j ACCEPT
-        
-        log "Порты DNS открыты в iptables"
-    fi
-    
-    # Проверяем firewalld
-    if systemctl is-active firewalld &>/dev/null; then
-        log "Настройка firewalld..."
-        firewall-cmd --permanent --add-service=dns 2>/dev/null || true
-        firewall-cmd --reload 2>/dev/null || true
-        log "Сервис DNS добавлен в firewalld"
-    fi
-}
-
-# ======================== ПРОВЕРКА КОНФИГУРАЦИИ ========================
-verify_config() {
-    header "Проверка конфигурации BIND"
-    
-    ERROR_FOUND=0
-    
-    log "Проверка named.conf..."
-    if named-checkconf; then
-        log "✓ named.conf: синтаксис корректен"
-    else
-        err "✗ Ошибка в named.conf"
-        ERROR_FOUND=1
-    fi
-    
-    log "Проверка прямой зоны $DOMAIN..."
-    if named-checkzone "$DOMAIN" /etc/bind/zones/db.$DOMAIN; then
-        log "✓ Прямая зона $DOMAIN: корректна"
-    else
-        err "✗ Ошибка в прямой зоне"
-        ERROR_FOUND=1
-    fi
-    
-    log "Проверка обратной зоны ${NETWORK}.in-addr.arpa..."
-    if named-checkzone "${NETWORK}.in-addr.arpa" /etc/bind/zones/db.${NETWORK}; then
-        log "✓ Обратная зона: корректна"
-    else
-        err "✗ Ошибка в обратной зоне"
-        ERROR_FOUND=1
-    fi
-    
-    if [ $ERROR_FOUND -eq 1 ]; then
-        err "Обнаружены ошибки конфигурации!"
-        err "Исправьте ошибки и запустите скрипт снова."
-        exit 1
-    fi
-}
-
-# ======================== ЗАПУСК СЕРВИСА ========================
-start_service() {
-    header "Запуск DNS сервера"
-    
-    # Отключаем SELinux если есть
-    if command -v setenforce &> /dev/null; then
-        setenforce 0 2>/dev/null || true
-    fi
-    
-    log "Перезапуск сервиса bind..."
-    systemctl daemon-reload
-    systemctl enable bind
-    systemctl restart bind
-    
-    sleep 3
-    
-    # Проверка статуса
-    if systemctl is-active --quiet bind; then
-        log "✓ DNS-сервер успешно запущен!"
-    else
-        err "✗ Не удалось запустить DNS-сервер"
-        warn "Журнал ошибок:"
-        journalctl -u bind -n 20 --no-pager
-        exit 1
-    fi
-}
-
-# ======================== ТЕСТИРОВАНИЕ ========================
-test_dns() {
-    header "Тестирование DNS сервера"
-    
-    log "Проверка прямого разрешения (A-записи):"
-    echo ""
-    
-    # Тестируем все A-записи
-    for name in "${!HOSTS_A_RECORDS[@]}"; do
-        result=$(dig @localhost $name.$DOMAIN +short 2>/dev/null || echo "ошибка")
-        expected="${HOSTS_A_RECORDS[$name]}"
-        
-        if [ "$result" = "$expected" ]; then
-            echo -e "  ${GREEN}✓${NC} $name.$DOMAIN -> $result"
-        else
-            echo -e "  ${RED}✗${NC} $name.$DOMAIN -> $result (ожидалось: $expected)"
-        fi
-    done
-    
-    echo ""
-    log "Проверка обратного разрешения (PTR-записи):"
-    echo ""
-    
-    # Тестируем PTR записи
-    for name in "${!HOSTS_PTR_RECORDS[@]}"; do
-        ip="${HOSTS_PTR_RECORDS[$name]}"
-        result=$(dig @localhost -x $ip +short 2>/dev/null | head -1 || echo "ошибка")
-        expected="$name.$DOMAIN."
-        
-        if [ "$result" = "$expected" ]; then
-            echo -e "  ${GREEN}✓${NC} $ip -> $result"
-        else
-            echo -e "  ${RED}✗${NC} $ip -> $result (ожидалось: $expected)"
-        fi
-    done
-    
-    echo ""
-    log "Проверка серверов пересылки:"
-    result=$(dig @localhost google.com +short 2>/dev/null | head -1)
-    if [ -n "$result" ]; then
-        echo -e "  ${GREEN}✓${NC} google.com -> $result (через forwarders)"
-    else
-        echo -e "  ${YELLOW}!${NC} Не удалось проверить forwarders (возможно, нет интернета)"
-    fi
-}
-
-# ======================== ИНФОРМАЦИЯ ========================
-print_info() {
-    header "Настройка DNS сервера завершена!"
-    
-    echo -e "${CYAN}Информация о сервере:${NC}"
-    echo -e "  Домен:          $DOMAIN"
-    echo -e "  IP сервера:     $HQ_SRV_IP"
-    echo -e "  Сеть:           $NETWORK.0/24"
-    echo ""
-    
-    echo -e "${CYAN}Файлы конфигурации:${NC}"
-    echo -e "  /etc/named.conf              - главный конфиг"
-    echo -e "  /etc/bind/options.conf       - опции сервера"
-    echo -e "  /etc/bind/local.conf         - определение зон"
-    echo -e "  /etc/bind/zones/db.$DOMAIN  - прямая зона"
-    echo -e "  /etc/bind/zones/db.$NETWORK - обратная зона"
-    echo ""
-    
-    echo -e "${CYAN}Полезные команды:${NC}"
-    echo -e "  systemctl status bind        - статус сервера"
-    echo -e "  systemctl restart bind       - перезапуск"
-    echo -e "  journalctl -u bind -f        - просмотр логов"
-    echo ""
-    echo -e "  nslookup hq-srv.$DOMAIN    - проверка DNS"
-    echo -e "  dig @localhost $DOMAIN ANY - информация о зоне"
-    echo -e "  dig @localhost -x $HQ_SRV_IP - обратный запрос"
-    echo ""
-    
-    echo -e "${CYAN}Для проверки с другого компьютера:${NC}"
-    echo -e "  nslookup hq-srv.$DOMAIN $HQ_SRV_IP"
-    echo ""
-}
-
-# ======================== MAIN ========================
-main() {
-    clear
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║     DNS Server Setup Script для ALT Linux Server            ║"
-    echo "║              Demo 2026 - Модуль 1, Задание 10               ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-    
-    # Проверка root
-    check_root
-    
-    # Автоопределение сети
-    detect_network_info
-    
-    # Интерактивный ввод
-    interactive_input
-    
-    # Ввод хостов
-    input_hosts
-    
-    # Установка BIND
-    install_bind
-    
-    # Настройка RNDC
-    setup_rndc
-    
-    # Конфигурация BIND
-    configure_bind
-    
-    # Создание зон
-    create_zones
-    
-    # Права доступа
-    set_permissions
-    
-    # Firewall
-    configure_firewall
-    
-    # Проверка конфигурации
-    verify_config
-    
-    # Запуск
-    start_service
-    
-    # Тестирование
-    test_dns
-    
-    # Информация
-    print_info
-}
-
-# Запуск
-main "$@"
+echo ""
+echo "Готово!"
