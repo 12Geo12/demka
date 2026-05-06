@@ -248,7 +248,7 @@ log_info "Директории созданы"
 log_step "Генерация rndc ключа..."
 
 if [ ! -f /etc/rndc.key ]; then
-    rndc-confgen -a 2>/dev/null || true
+    rndc-confgen -a -q 2>/dev/null || true
 fi
 
 if [ -f /etc/rndc.key ]; then
