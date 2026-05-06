@@ -1,10 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # FRR OSPF/GRE - FINAL EXAM READY (UNIVERSAL)
-# Исправления:
-# 1. Автоматически обрезает маску у IP (чтобы не падал при создании туннеля)
-# 2. Исправлена проверка статуса (убрана ошибка Ambiguous command)
-# 3. Полная настройка OSPF и маршрутов
+# С ИНТЕРАКТИВНЫМ ВЫБОРОМ СЕТЕЙ
 #===============================================================================
 
 RED='\033[0;31m'
@@ -33,7 +30,6 @@ full_cleanup() {
    ip tunnel del gre1 2>/dev/null
    sleep 1
    
-   # Сброс конфига FRR
    cat > "$FRR_CONF" << 'EOF'
 frr version 9.0
 frr defaults traditional
@@ -81,9 +77,7 @@ setup_frr() {
    for iface in $(ls /sys/class/net/ | grep -v lo); do
       line=$(ip -4 addr show "$iface" 2>/dev/null | grep "inet " | head -1)
       if [[ -n "$line" ]]; then
-         # Берем полный IP с маской
          ip_full=$(echo "$line" | grep -oP 'inet \K[\d.]+/\d+')
-         # Берем ТОЛЬКО IP без маски (для создания туннеля)
          ip_only=$(echo "$ip_full" | cut -d'/' -f1)
          
          printf " ${YELLOW}%d)${NC} %-10s ${WHITE}%s${NC}\n" "$i" "$iface" "$ip_full"
@@ -98,7 +92,7 @@ setup_frr() {
    echo ""
    read -p "${YELLOW}Номер внешнего интерфейса:${NC} " ext_idx
    EXT_IFACE="${IFACES[$((ext_idx-1))]}"
-   EXT_IP="${IPS_ONLY[$((ext_idx-1))]}" # Используем IP БЕЗ МАСКИ
+   EXT_IP="${IPS_ONLY[$((ext_idx-1))]}"
    print_ok "Выбран: $EXT_IFACE ($EXT_IP)"
 
    # 6. IP соседа
@@ -127,7 +121,6 @@ setup_frr() {
    ip tunnel del gre1 2>/dev/null
    sleep 1
 
-   # ВАЖНО: local должен быть без маски!
    if ! ip tunnel add gre1 mode gre local "$EXT_IP" remote "$REMOTE_IP" ttl 64; then
       print_err "Ошибка создания туннеля! Проверьте IP."
       exit 1
@@ -139,7 +132,7 @@ setup_frr() {
    if ping -c 2 "$REMOTE_TUNNEL" &>/dev/null; then
       print_ok "✓ Туннель работает"
    else
-      print_err " Туннель создан, но пинг не идет (проверьте фаервол)"
+      print_err "⚠ Туннель создан, но пинг не идет (проверьте фаервол)"
    fi
 
    # 9. Автозагрузка туннеля
@@ -159,22 +152,65 @@ EOF
    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
    grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-   # 11. Сети OSPF
-   echo -e "\n${YELLOW}=== СЕТИ OSPF ===${NC}"
-   echo "Добавляем все локальные сети..."
+   # 11. СЕТИ OSPF - ИНТЕРАКТИВНЫЙ ВЫБОР
+   echo -e "\n${YELLOW}=== СЕТИ ДЛЯ OSPF ===${NC}"
+   echo "Найдены локальные сети:"
    
-   declare -a OSPF_NETS
+   declare -a LOCAL_NETS
+   
    # Добавляем туннель
    TUNNEL_NET=$(echo "$LOCAL_TUNNEL" | cut -d. -f1-3).0/30
-   OSPF_NETS+=("$TUNNEL_NET")
+   echo "  - $TUNNEL_NET (gre1 туннель)"
+   LOCAL_NETS+=("$TUNNEL_NET")
    
    # Добавляем остальные интерфейсы
    for idx in "${!IFACES[@]}"; do
       if [[ "${IFACES[$idx]}" != "$EXT_IFACE" && "${IFACES[$idx]}" != "lo" ]]; then
-         OSPF_NETS+=("${IPS_FULL[$idx]}")
+         echo "  - ${IPS_FULL[$idx]} (${IFACES[$idx]})"
+         LOCAL_NETS+=("${IPS_FULL[$idx]}")
       fi
    done
    
+   echo ""
+   echo "Выберите способ добавления сетей:"
+   echo "  1) Автоматически (все найденные сети)"
+   echo "  2) Ввести сети вручную"
+   echo ""
+   read -p "Ваш выбор [1]: " net_choice
+   net_choice="${net_choice:-1}"
+   
+   declare -a OSPF_NETS
+   
+   if [[ "$net_choice" == "2" ]]; then
+      # Ручной ввод
+      echo ""
+      echo "Введите сети в формате IP/CIDR (например, 192.168.10.0/24)"
+      echo "Пустая строка - завершить ввод"
+      echo ""
+      
+      while true; do
+         read -p "Сеть: " net
+         [[ -z "$net" ]] && break
+         
+         if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+            OSPF_NETS+=("$net")
+            print_ok "Добавлена: $net"
+         else
+            print_err "Неверный формат! Используйте IP/CIDR"
+         fi
+      done
+      
+      # Если ничего не ввели - добавляем туннель
+      if [[ ${#OSPF_NETS[@]} -eq 0 ]]; then
+         OSPF_NETS=("$TUNNEL_NET")
+         print_msg "Добавлена сеть туннеля: $TUNNEL_NET"
+      fi
+   else
+      # Автоматически
+      OSPF_NETS=("${LOCAL_NETS[@]}")
+      print_ok "Добавлены все найденные сети"
+   fi
+
    # Формируем конфиг OSPF
    OSPF_CONFIG=""
    for net in "${OSPF_NETS[@]}"; do
@@ -257,3 +293,5 @@ case $choice in
  4) exit 0 ;;
  *) setup_frr ;;
 esac
+
+echo -e "\n${GREEN}Готово!${NC}"
