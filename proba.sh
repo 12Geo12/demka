@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# FRR OSPF/GRE Setup - FIXED v4.1
-# Исправлено: добавление сетей в конфиг + ожидание ввода
+# FRR OSPF/GRE Setup - MANUAL ONLY VERSION
+# Только ручной ввод сетей
 #===============================================================================
 
 RED='\033[0;31m'
@@ -40,95 +40,6 @@ line vty
 EOF
  systemctl restart frr 2>/dev/null || true
  print_ok "Очищено"
-}
-
-# Определение сети
-get_network() {
- local iface=$1
- local ip_mask=$(ip -4 addr show dev "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
- [[ -z "$ip_mask" ]] && return
- local ip=$(echo "$ip_mask" | cut -d'/' -f1)
- local cidr=$(echo "$ip_mask" | cut -d'/' -f2)
- local IFS='.'; read -r i1 i2 i3 i4 <<< "$ip"
- local mask=$(( (0xFFFFFFFF << (32 - cidr)) & 0xFFFFFFFF ))
- local ip_int=$(( (i1 << 24) | (i2 << 16) | (i3 << 8) | i4 ))
- local net_int=$(( ip_int & mask ))
- echo "$(( (net_int >> 24) & 0xFF )).$(( (net_int >> 16) & 0xFF )).$(( (net_int >> 8) & 0xFF )).$(( net_int & 0xFF ))/$cidr"
-}
-
-# Ручное/авто добавление сетей - ИСПРАВЛЕНО
-add_networks_manual() {
- local networks=""
- local add_method=""
- 
- # Показываем доступные интерфейсы
- echo ""
- echo -e "${YELLOW}=== ДОБАВЛЕНИЕ СЕТЕЙ ДЛЯ OSPF ===${NC}"
- echo ""
- echo "Доступные интерфейсы:"
- echo "---------------------"
- for iface in $(ls /sys/class/net/ | grep -v lo); do
-  net=$(get_network "$iface")
-  if [[ -n "$net" && "$iface" != "$EXT_IFACE" && "$iface" != "gre1" ]]; then
-   printf "  • %-10s -> %s\n" "$iface" "$net"
-  fi
- done
- 
- echo ""
- echo "---------------------"
- echo "Как добавить сети?"
- echo "  1) Автоматически (рекомендуется)"
- echo "  2) Ввести вручную"
- echo "---------------------"
- 
- # Ждём ввод
- read -p "Ваш выбор [1]: " add_method
- add_method="${add_method:-1}"  # По умолчанию 1
- 
- if [[ "$add_method" == "2" ]]; then
-  # Ручной ввод
-  echo ""
-  echo "Вводите сети в формате: IP/CIDR"
-  echo "Пример: 192.168.10.0/24"
-  echo "Для завершения нажмите Enter"
-  echo "---------------------"
-  
-  while true; do
-   read -p "Сеть: " net
-   [[ -z "$net" ]] && break
-   
-   if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-    networks+="  network $net area 0"$'\n'
-    print_ok "Добавлена: $net"
-   else
-    print_err "Неверный формат!"
-   fi
-  done
- else
-  # Автоматически
-  echo ""
-  print_msg "Автоматическое определение сетей..."
-  for iface in $(ls /sys/class/net/ | grep -v lo); do
-   [[ "$iface" == "$EXT_IFACE" || "$iface" == "gre1" ]] && continue
-   net=$(get_network "$iface")
-   if [[ -n "$net" && ! "$net" =~ ^169\.254\. && ! "$net" =~ ^127\. ]]; then
-    networks+="  network $net area 0"$'\n'
-    print_ok "Добавлена: $net ($iface)"
-   fi
-  done
- fi
- 
- # Добавляем сеть туннеля
- if [[ -n "$GRE_IP" ]]; then
-  GRE_NET_BASE=$(echo "$GRE_IP" | cut -d'.' -f1-3)
-  GRE_NET_CIDR=$(echo "$GRE_IP" | grep -oP '/\K\d+$' || echo "29")
-  GRE_NET="${GRE_NET_BASE}.0/${GRE_NET_CIDR}"
-  networks+="  network $GRE_NET area 0"$'\n'
-  print_ok "Добавлена сеть туннеля: $GRE_NET"
- fi
- 
- # Возвращаем сети
- echo "$networks"
 }
 
 setup_frr() {
@@ -243,26 +154,77 @@ EOF
   exit 1
  fi
 
- # Добавление сетей - ИСПРАВЛЕНО
- echo ""
- NETWORKS=$(add_networks_manual)
+ #===============================================================================
+ # РУЧНОЙ ВВОД СЕТЕЙ - ИСПРАВЛЕНО
+ #===============================================================================
  
  echo ""
- print_ok "Будут добавлены сети:"
+ echo -e "${YELLOW}=== ДОБАВЛЕНИЕ СЕТЕЙ ДЛЯ OSPF ===${NC}"
+ echo ""
+ echo "Вводите сети в формате: IP/CIDR"
+ echo "Примеры:"
+ echo "  192.168.10.0/26"
+ echo "  192.168.4.0/28"
+ echo "  172.16.100.0/29  (сеть туннеля)"
+ echo ""
+ echo "Для завершения ввода нажмите Enter"
+ echo "=========================================="
+ 
+ NETWORKS=""
+ 
+ while true; do
+  read -p "Сеть: " net
+  
+  # Если пустая строка - завершаем
+  if [[ -z "$net" ]]; then
+   break
+  fi
+  
+  # Проверка формата
+  if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+   NETWORKS+="  network $net area 0"$'\n'
+   print_ok "Добавлена: $net"
+  else
+   print_err "Неверный формат! Используйте IP/CIDR (например, 192.168.10.0/24)"
+  fi
+ done
+
+ # Если ничего не ввели - добавляем хотя бы туннель
+ if [[ -z "$NETWORKS" ]]; then
+  GRE_NET_BASE=$(echo "$GRE_IP" | cut -d'.' -f1-3)
+  GRE_NET_CIDR=$(echo "$GRE_IP" | grep -oP '/\K\d+$' || echo "29")
+  GRE_NET="${GRE_NET_BASE}.0/${GRE_NET_CIDR}"
+  NETWORKS="  network $GRE_NET area 0"$'\n'
+  print_warn "Сети не введены. Добавлена только сеть туннеля: $GRE_NET"
+ fi
+
+ #===============================================================================
+ # ПАРОЛЬ И КОНФИГ
+ #===============================================================================
+ 
+ echo ""
+ read -p "Пароль OSPF [P@ssw0rd]: " PASS
+ PASS="${PASS:-P@ssw0rd}"
+
+ # Показываем что будет записано
+ echo ""
+ echo -e "${YELLOW}=== БУДЕТ ЗАПИСАНО В КОНФИГ ===${NC}"
+ echo "router ospf"
+ echo " ospf router-id $RID"
+ echo " passive-interface default"
+ echo " no passive-interface gre1"
+ echo " ip ospf authentication"
+ echo " ip ospf authentication-key $PASS"
+ echo " area 0 authentication"
  echo "$NETWORKS"
  
- read -p "Продолжить? [Y/n]: " cont_ans
- if [[ "$cont_ans" =~ ^[Nn]$ ]]; then
+ read -p "Записать конфиг? [Y/n]: " write_ans
+ if [[ "$write_ans" =~ ^[Nn]$ ]]; then
   print_err "Отменено!"
   exit 1
  fi
 
- # Пароль
- echo -e "\n${YELLOW}Пароль OSPF [P@ssw0rd]:${NC} \c"
- read -r PASS
- PASS="${PASS:-P@ssw0rd}"
-
- # Конфиг - ИСПРАВЛЕНО
+ # Запись конфига
  print_msg "Запись конфигурации..."
  cat > "$FRR_CONF" << EOF
 frr version 9.0
@@ -285,8 +247,8 @@ EOF
  print_ok "Конфигурация записана"
 
  # Показываем финальный конфиг
- echo -e "\n${YELLOW}=== ФИНАЛЬНЫЙ КОНФИГ OSPF ===${NC}"
- grep -A25 "router ospf" "$FRR_CONF"
+ echo -e "\n${YELLOW}=== ФИНАЛЬНЫЙ КОНФИГ ===${NC}"
+ cat "$FRR_CONF"
 
  # Запуск
  systemctl enable frr >/dev/null 2>&1
@@ -319,10 +281,10 @@ EOF
 # Меню
 clear
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║ FRR OSPF/GRE Setup v4.1 ║${NC}"
+echo -e "${CYAN}║ FRR OSPF/GRE Setup - MANUAL ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo " 1) Настроить FRR"
+echo " 1) Настроить FRR (ручной ввод сетей)"
 echo " 2) Удалить настройки"
 echo " 3) Показать статус"
 echo " 4) Выход"
