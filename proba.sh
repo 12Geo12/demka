@@ -1,6 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# FRR OSPF/GRE Setup - FIXED VERSION
+# FRR OSPF/GRE Setup - MANUAL NETWORKS VERSION
+# Версия 4.0 - ИСПРАВЛЕНО: ручной ввод сетей + правильный формат
 #===============================================================================
 
 RED='\033[0;31m'
@@ -23,9 +24,11 @@ print_err() { echo -e "${RED}[X]${NC} $1"; }
 
 # Очистка
 full_cleanup() {
- print_msg "Очистка..."
+ print_msg "Очистка старых настроек..."
  ip link set gre1 down 2>/dev/null
+ sleep 1
  ip tunnel del gre1 2>/dev/null
+ sleep 1
  rm -rf "$IFACES_DIR/gre1" 2>/dev/null
  cat > "$FRR_CONF" << 'EOF'
 frr version 9.0
@@ -53,9 +56,75 @@ get_network() {
  echo "$(( (net_int >> 24) & 0xFF )).$(( (net_int >> 16) & 0xFF )).$(( (net_int >> 8) & 0xFF )).$(( net_int & 0xFF ))/$cidr"
 }
 
+# Ручное добавление сетей
+add_networks_manual() {
+ local networks=""
+ 
+ echo -e "\n${YELLOW}=== Добавление сетей для OSPF ===${NC}"
+ echo ""
+ echo "Доступные интерфейсы:"
+ for iface in $(ls /sys/class/net/ | grep -v lo); do
+  net=$(get_network "$iface")
+  if [[ -n "$net" && "$iface" != "$EXT_IFACE" && "$iface" != "gre1" ]]; then
+   printf "  • %-10s %s\n" "$iface" "$net"
+  fi
+ done
+ 
+ echo ""
+ echo "Выберите способ добавления сетей:"
+ echo " 1) Автоматически (все локальные интерфейсы)"
+ echo " 2) Ввести сети вручную"
+ echo ""
+ read -p "Ваш выбор [1]: " add_method
+ 
+ if [[ "$add_method" == "2" ]]; then
+  echo ""
+  echo "Вводите сети в формате: IP/CIDR (например, 192.168.10.0/24)"
+  echo "Для завершения введите пустую строку"
+  echo "-----------------------------------"
+  
+  while true; do
+   read -p "Сеть (или Enter для завершения): " net
+   if [[ -z "$net" ]]; then
+    break
+   fi
+   
+   if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+    networks+="  network $net area 0"$'\n'
+    print_ok "Добавлена: $net"
+   else
+    print_err "Неверный формат! Используйте IP/CIDR"
+   fi
+  done
+ else
+  # Автоматически
+  echo ""
+  print_msg "Автоматическое определение сетей..."
+  for iface in $(ls /sys/class/net/ | grep -v lo); do
+   [[ "$iface" == "$EXT_IFACE" || "$iface" == "gre1" ]] && continue
+   net=$(get_network "$iface")
+   if [[ -n "$net" && ! "$net" =~ ^169\.254\. && ! "$net" =~ ^127\. ]]; then
+    networks+="  network $net area 0"$'\n'
+    print_ok "Добавлена: $net ($iface)"
+   fi
+  done
+ fi
+ 
+ # Добавляем сеть туннеля
+ if [[ -n "$GRE_IP" ]]; then
+  GRE_NET_BASE=$(echo "$GRE_IP" | cut -d'.' -f1-3)
+  GRE_NET_CIDR=$(echo "$GRE_IP" | grep -oP '/\K\d+$' || echo "29")
+  GRE_NET="${GRE_NET_BASE}.0/${GRE_NET_CIDR}"
+  networks+="  network $GRE_NET area 0"$'\n'
+  print_ok "Добавлена сеть туннеля: $GRE_NET"
+ fi
+ 
+ echo "$networks"
+}
+
 setup_frr() {
  # Очистка
- echo -e "\n${YELLOW}Очистка старых настроек? [Y/n]:${NC} \c"
+ echo -e "\n${YELLOW}Очистить старые настройки? [Y/n]:${NC} \c"
  read -r cleanup_ans
  if [[ ! "$cleanup_ans" =~ ^[Nn]$ ]]; then
   full_cleanup
@@ -67,6 +136,7 @@ setup_frr() {
   print_msg "Установка FRR..."
   apt-get update >/dev/null 2>&1
   apt-get install -y frr >/dev/null 2>&1
+  print_ok "FRR установлен"
  fi
 
  # Роль
@@ -126,7 +196,7 @@ EOF
  ip tunnel del gre1 2>/dev/null
  sleep 1
 
- # Создание туннеля - ИСПРАВЛЕНО
+ # Создание туннеля
  print_msg "Создание туннеля..."
  if ! ip tunnel add gre1 mode gre local "$EXT_IP" remote "$REMOTE_IP" ttl 64; then
   print_err "Не удалось создать туннель!"
@@ -149,36 +219,31 @@ EOF
 
  if ip link show gre1 &>/dev/null; then
   print_ok "✓ Туннель gre1 активирован"
+  # Проверка пинга
+  if [[ "$ROLE" == "HQ-RTR" ]]; then
+   REMOTE_GRE="172.16.100.2"
+  else
+   REMOTE_GRE="172.16.100.1"
+  fi
+  if ping -c 2 "$REMOTE_GRE" &>/dev/null; then
+   print_ok "✓ Туннель работает (ping прошёл)"
+  else
+   print_err "⚠ Туннель создан, но ping не проходит"
+  fi
  else
   print_err "Туннель не активен!"
   exit 1
  fi
 
- # Авто-определение сетей
- echo -e "\n${YELLOW}Определение сетей OSPF...${NC}"
- NETWORKS=""
- for iface in $(ls /sys/class/net/ | grep -v lo); do
-  [[ "$iface" == "$EXT_IFACE" || "$iface" == "gre1" ]] && continue
-  net=$(get_network "$iface")
-  if [[ -n "$net" && ! "$net" =~ ^169\.254\. && ! "$net" =~ ^127\. ]]; then
-   NETWORKS+="    network $net area 0\n"
-   print_ok "Добавлена: $net ($iface)"
-  fi
- done
-
- # Сеть туннеля
- GRE_NET_BASE=$(echo "$GRE_IP" | cut -d'.' -f1-3)
- GRE_NET_CIDR=$(echo "$GRE_IP" | grep -oP '/\K\d+$' || echo "29")
- GRE_NET="${GRE_NET_BASE}.0/${GRE_NET_CIDR}"
- NETWORKS+="    network $GRE_NET area 0\n"
- print_ok "Добавлена: $GRE_NET (gre1)"
+ # Добавление сетей
+ NETWORKS=$(add_networks_manual)
 
  # Пароль
  echo -e "\n${YELLOW}Пароль OSPF [P@ssw0rd]:${NC} \c"
  read -r PASS
  PASS="${PASS:-P@ssw0rd}"
 
- # Конфиг
+ # Конфиг - ИСПРАВЛЕНО
  print_msg "Запись конфигурации..."
  cat > "$FRR_CONF" << EOF
 frr version 9.0
@@ -192,13 +257,17 @@ router ospf
  no passive-interface gre1
  ip ospf authentication
  ip ospf authentication-key $PASS
-$NETWORKS
-!
+ area 0 authentication
+$NETWORKS!
 line vty
 !
 EOF
 
  print_ok "Конфигурация записана"
+
+ # Показываем конфиг
+ echo -e "\n${YELLOW}Конфигурация OSPF:${NC}"
+ grep -A20 "router ospf" "$FRR_CONF"
 
  # Запуск
  systemctl enable frr >/dev/null 2>&1
@@ -208,39 +277,50 @@ EOF
  # Итоги
  clear
  echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
- echo -e "${GREEN}║ ✅ ГОТОВО ║${NC}"
+ echo -e "${GREEN}║ ✅ НАСТРОЙКА ЗАВЕРШЕНА ║${NC}"
  echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
- echo -e "\n${WHITE}Параметры:${NC}"
+ echo -e "\n${WHITE}ПАРАМЕТРЫ:${NC}"
  echo "  Роль: $ROLE"
  echo "  Router ID: $RID"
  echo "  Туннель: $GRE_IP"
  echo ""
- echo -e "${WHITE}OSPF соседи:${NC}"
- vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "  Нет соседей"
+ echo -e "${WHITE}OSPF СОСЕДИ:${NC}"
+ vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "  Пока нет соседей"
  echo ""
- echo -e "${WHITE}Команды:${NC}"
+ echo -e "${WHITE}OSPF МАРШРУТЫ:${NC}"
+ vtysh -c "show ip route ospf" 2>/dev/null | head -15 || echo "  Пока нет маршрутов"
+ echo ""
+ echo -e "${MAGENTA}КОМАНДЫ:${NC}"
  echo "  vtysh -c 'show ip ospf neighbor'"
  echo "  vtysh -c 'show ip route ospf'"
+ echo "  vtysh -c 'show running-config ospf'"
+ echo ""
 }
 
 # Меню
 clear
-echo -e "${CYAN}FRR Setup v3.1${NC}"
+echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║ FRR OSPF/GRE Setup v4.0 ║${NC}"
+echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo "1) Настроить FRR"
-echo "2) Удалить настройки"
-echo "3) Статус"
-echo "4) Выход"
-echo -e "\n${YELLOW}Выбор:${NC} \c"
-read -r choice
+echo " 1) Настроить FRR (ручной ввод сетей)"
+echo " 2) Удалить все настройки"
+echo " 3) Показать статус"
+echo " 4) Выход"
+echo ""
+read -p "Выбор [1]: " choice
 
 case $choice in
  2) full_cleanup ;;
  3)
-  echo -e "\n${WHITE}GRE:${NC}"
-  ip link show | grep gre || echo "Нет"
-  echo -e "\n${WHITE}OSPF:${NC}"
-  vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "Не активен"
+  echo -e "\n${WHITE}=== GRE туннели ===${NC}"
+  ip link show | grep -E "gre[0-9]+" || echo "Нет активных"
+  echo -e "\n${WHITE}=== FRR OSPF ===${NC}"
+  if [[ -f "$FRR_CONF" ]]; then
+   grep -A20 "router ospf" "$FRR_CONF" 2>/dev/null || echo "OSPF не настроен"
+  fi
+  echo -e "\n${WHITE}=== OSPF соседи ===${NC}"
+  vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "OSPF не активен"
   ;;
  4) exit 0 ;;
  *) setup_frr ;;
