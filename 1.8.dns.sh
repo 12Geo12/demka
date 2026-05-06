@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ============================================================================
-# DNS Infrastructure Setup Script - EXAM READY VERSION
-# Версия: 7.0 (ALL NETWORKS + FIREWALL)
+# DNS Infrastructure Setup Script - WORKING VERSION
+# Версия: 8.0 (ИСПРАВЛЕНО: chroot + directory)
 # ============================================================================
 
 set -e
@@ -26,7 +26,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-log_header "DNS Infrastructure Setup Script (Exam Version)"
+log_header "DNS Infrastructure Setup Script"
 
 # ============================================================================
 # ОЧИСТКА
@@ -35,22 +35,21 @@ log_step "=== ОЧИСТКА СТАРЫХ КОНФИГУРАЦИЙ ==="
 echo ""
 log_warn "ВНИМАНИЕ: Будут удалены все старые конфигурации DNS!"
 read -p "Продолжить очистку? [y/N]: " clean_confirm
-if [[ "$clean_confirm" =~ ^[Yy]$ ]]; then
-    systemctl stop named 2>/dev/null || true
-    systemctl stop bind 2>/dev/null || true
-    
-    rm -rf /var/lib/bind/etc/named.conf 2>/dev/null || true
-    rm -rf /var/lib/bind/var/named/master/*.db 2>/dev/null || true
-    rm -rf /var/lib/bind/var/named/data/* 2>/dev/null || true
-    rm -rf /var/lib/bind/var/named/dynamic/* 2>/dev/null || true
-    rm -f /etc/named.conf 2>/dev/null || true
-    rm -f /etc/rndc.key 2>/dev/null || true
-    
-    log_info "Очистка завершена"
-else
+if [[ ! "$clean_confirm" =~ ^[Yy]$ ]]; then
     log_error "Отменено пользователем"
     exit 1
 fi
+
+systemctl stop named 2>/dev/null || true
+systemctl stop bind 2>/dev/null || true
+
+rm -rf /var/lib/bind/etc/named.conf 2>/dev/null || true
+rm -rf /var/lib/bind/var/named/master/*.db 2>/dev/null || true
+rm -rf /var/lib/bind/var/named/data/* 2>/dev/null || true
+rm -rf /var/lib/bind/var/named/dynamic/* 2>/dev/null || true
+rm -f /etc/named.conf 2>/dev/null || true
+
+log_info "Очистка завершена"
 
 # ============================================================================
 # УСТАНОВКА ПАКЕТОВ
@@ -58,7 +57,7 @@ fi
 log_step "Установка BIND..."
 
 if [ -f /etc/altlinux-release ]; then
-    apt-get update
+    apt-get update || true
     apt-get install -y bind bind-utils
     log_info "BIND установлен"
 else
@@ -88,7 +87,6 @@ fi
 
 log_info "Обнаружен IP: $LOCAL_IP"
 
-# Разбираем IP на октеты
 IP_OCT1=$(echo "$LOCAL_IP" | cut -d'.' -f1)
 IP_OCT2=$(echo "$LOCAL_IP" | cut -d'.' -f2)
 IP_OCT3=$(echo "$LOCAL_IP" | cut -d'.' -f3)
@@ -99,7 +97,6 @@ log_info "Октеты IP: $IP_OCT1.$IP_OCT2.$IP_OCT3.$IP_OCT4"
 SUBNET="${IP_OCT1}.${IP_OCT2}.${IP_OCT3}"
 log_info "Локальная подсеть: ${SUBNET}.0/24"
 
-# Обратная зона для ЛОКАЛЬНОЙ подсети
 REV_ZONE="${IP_OCT3}.${IP_OCT2}.${IP_OCT1}"
 log_info "Обратная зона: ${REV_ZONE}.in-addr.arpa"
 
@@ -107,14 +104,13 @@ HOSTNAME=$(hostname)
 log_info "Имя хоста: $HOSTNAME"
 
 # ============================================================================
-# КОНФИГУРАЦИЯ ПО УМОЛЧАНИЮ (ДЛЯ ЭКЗАМЕНА)
+# КОНФИГУРАЦИЯ
 # ============================================================================
 log_header "Конфигурация DNS"
 echo ""
 
-# Стандартные значения для экзамена
 DEFAULT_HQ_RTR="192.168.4.2"
-DEFAULT_HQ_SRV="$LOCAL_IP"  # Текущий IP машины (HQ-SRV)
+DEFAULT_HQ_SRV="$LOCAL_IP"
 DEFAULT_BR_RTR="192.168.5.2"
 DEFAULT_BR_SRV="192.168.6.2"
 DEFAULT_DOCKER="172.16.5.1"
@@ -135,14 +131,6 @@ if [[ "$exam_choice" =~ ^[Yy]$ ]]; then
     DOMAIN_NAME="$DEFAULT_DOMAIN"
     FWD1="77.88.8.8"
     FWD2="77.88.8.1"
-    
-    log_info "IP-адреса:"
-    echo "   HQ-RTR: $HQ_RTR_IP (сеть 192.168.4.x)"
-    echo "   HQ-SRV: $HQ_SRV_IP (сеть ${SUBNET}.x)"
-    echo "   BR-RTR: $BR_RTR_IP (сеть 192.168.5.x)"
-    echo "   BR-SRV: $BR_SRV_IP (сеть 192.168.6.x)"
-    echo "   Docker: $DOCKER_IP (сеть 172.16.5.x)"
-    echo "   WEB:    $WEB_IP (сеть 172.16.6.x)"
 else
     log_info "РУЧНОЙ РЕЖИМ"
     
@@ -179,9 +167,8 @@ else
 fi
 
 # ============================================================================
-# ВЫЧИСЛЕНИЕ ВСЕХ ОБРАТНЫХ ЗОН
+# ВЫЧИСЛЕНИЕ ОБРАТНЫХ ЗОН
 # ============================================================================
-# Извлекаем сети для всех устройств
 HQ_RTR_NET=$(echo "$HQ_RTR_IP" | cut -d'.' -f1-3)
 HQ_RTR_OCT1=$(echo "$HQ_RTR_NET" | cut -d'.' -f1)
 HQ_RTR_OCT2=$(echo "$HQ_RTR_NET" | cut -d'.' -f2)
@@ -247,9 +234,8 @@ log_info "Директории созданы"
 # ============================================================================
 log_step "Генерация rndc ключа..."
 
-if [ ! -f /etc/rndc.key ]; then
-    rndc-confgen -a -q 2>/dev/null || true
-fi
+rm -f /etc/rndc.key 2>/dev/null || true
+rndc-confgen -a -q 2>/dev/null || true
 
 if [ -f /etc/rndc.key ]; then
     chown root:named /etc/rndc.key
@@ -258,16 +244,18 @@ if [ -f /etc/rndc.key ]; then
     chown named:named ${CHROOT_ETC}/rndc.key
     chmod 640 ${CHROOT_ETC}/rndc.key
     log_info "rndc.key создан"
+else
+    log_error "Не удалось создать rndc.key!"
+    exit 1
 fi
 
 # ============================================================================
-# NAMED.CONF (СО ВСЕМИ ОБРАТНЫМИ ЗОНАМИ)
+# NAMED.CONF
 # ============================================================================
 log_step "Создание named.conf..."
 
 cat > ${CHROOT_ETC}/named.conf << EOF
 // DNS Configuration for $DOMAIN_NAME
-// Exam Ready - All reverse zones included
 
 options {
     listen-on port 53 { 127.0.0.1; $HQ_SRV_IP; any; };
@@ -296,42 +284,36 @@ controls {
     inet 127.0.0.1 allow { localhost; } keys { "rndc-key"; };
 };
 
-// Прямая зона
 zone "$DOMAIN_NAME" IN {
     type master;
     file "master/$DOMAIN_NAME.db";
     allow-update { none; };
 };
 
-// Обратная зона - ЛОКАЛЬНАЯ СЕТЬ
 zone "${REV_ZONE}.in-addr.arpa" IN {
     type master;
     file "master/${DOMAIN_NAME}_rev.db";
     allow-update { none; };
 };
 
-// Обратная зона - HQ-RTR (192.168.4.x)
 zone "${HQ_RTR_REV}.in-addr.arpa" IN {
     type master;
     file "master/${DOMAIN_NAME}_hq_rtr_rev.db";
     allow-update { none; };
 };
 
-// Обратная зона - BR-RTR (192.168.5.x)
 zone "${BR_RTR_REV}.in-addr.arpa" IN {
     type master;
     file "master/${DOMAIN_NAME}_br_rtr_rev.db";
     allow-update { none; };
 };
 
-// Обратная зона - BR-SRV (192.168.6.x)
 zone "${BR_SRV_REV}.in-addr.arpa" IN {
     type master;
     file "master/${DOMAIN_NAME}_br_srv_rev.db";
     allow-update { none; };
 };
 
-// Стандартные зоны
 zone "localhost" IN {
     type master;
     file "named.localhost";
@@ -351,10 +333,11 @@ EOF
 chown root:named ${CHROOT_ETC}/named.conf
 chmod 640 ${CHROOT_ETC}/named.conf
 
+# Создаем симлинки
 ln -sf ${CHROOT_ETC}/named.conf /etc/named.conf
 ln -sf ${CHROOT_ETC}/rndc.key /etc/rndc.key
 
-log_info "named.conf создан со всеми обратными зонами"
+log_info "named.conf создан"
 
 # ============================================================================
 # ПРЯМАЯ ЗОНА
@@ -413,8 +396,6 @@ EOF
 chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
 chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
 
-log_info "Локальная обратная зона создана"
-
 # ============================================================================
 # ОБРАТНАЯ ЗОНА - HQ-RTR
 # ============================================================================
@@ -439,8 +420,6 @@ EOF
 
 chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_hq_rtr_rev.db
 chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_hq_rtr_rev.db
-
-log_info "Обратная зона HQ-RTR создана"
 
 # ============================================================================
 # ОБРАТНАЯ ЗОНА - BR-RTR
@@ -467,8 +446,6 @@ EOF
 chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_rtr_rev.db
 chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_rtr_rev.db
 
-log_info "Обратная зона BR-RTR создана"
-
 # ============================================================================
 # ОБРАТНАЯ ЗОНА - BR-SRV
 # ============================================================================
@@ -494,15 +471,12 @@ EOF
 chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_srv_rev.db
 chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_srv_rev.db
 
-log_info "Обратная зона BR-SRV создана"
-
 # ============================================================================
 # СТАНДАРТНЫЕ ЗОНЫ
 # ============================================================================
 log_step "Создание стандартных зон..."
 
-if [ ! -f ${CHROOT_VAR}/named.localhost ]; then
-    cat > ${CHROOT_VAR}/named.localhost << 'EOF'
+cat > ${CHROOT_VAR}/named.localhost << 'EOF'
 $TTL 1D
 @ IN SOA @ root.localhost. (
     1 ; Serial
@@ -514,10 +488,8 @@ $TTL 1D
     NS @
     A 127.0.0.1
 EOF
-fi
 
-if [ ! -f ${CHROOT_VAR}/named.loopback ]; then
-    cat > ${CHROOT_VAR}/named.loopback << 'EOF'
+cat > ${CHROOT_VAR}/named.loopback << 'EOF'
 $TTL 1D
 @ IN SOA @ root.localhost. (
     1 ; Serial
@@ -529,10 +501,8 @@ $TTL 1D
     NS @
     PTR localhost.
 EOF
-fi
 
-if [ ! -f ${CHROOT_VAR}/named.root ]; then
-    cat > ${CHROOT_VAR}/named.root << 'EOF'
+cat > ${CHROOT_VAR}/named.root << 'EOF'
 . 3600000 NS a.root-servers.net.
 a.root-servers.net. 3600000 A 198.41.0.4
 . 3600000 NS b.root-servers.net.
@@ -546,7 +516,6 @@ e.root-servers.net. 3600000 A 192.203.230.10
 . 3600000 NS f.root-servers.net.
 f.root-servers.net. 3600000 A 192.5.5.241
 EOF
-fi
 
 chown named:named ${CHROOT_VAR}/named.localhost
 chown named:named ${CHROOT_VAR}/named.loopback
@@ -570,35 +539,21 @@ chown named:named ${CHROOT_VAR}/data/named.run 2>/dev/null || true
 log_info "Права установлены"
 
 # ============================================================================
-# ОБНОВЛЕНИЕ CHROOT
-# ============================================================================
-log_step "Обновление chroot..."
-update_chrooted named || true
-log_info "Chroot обновлен"
-
-# ============================================================================
-# НАСТРОЙКА FIREWALL
+# FIREWALL
 # ============================================================================
 log_step "Открытие портов firewall..."
 
-# Открываем UDP порт 53
 iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || {
     iptables -I INPUT -p udp --dport 53 -j ACCEPT
     log_info "Открыт UDP порт 53"
 }
 
-# Открываем TCP порт 53
 iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || {
     iptables -I INPUT -p tcp --dport 53 -j ACCEPT
     log_info "Открыт TCP порт 53"
 }
 
-# Сохраняем правила
-if command -v service &> /dev/null; then
-    service iptables save 2>/dev/null || true
-    log_info "Правила firewall сохранены"
-fi
-
+service iptables save 2>/dev/null || true
 log_info "Firewall настроен"
 
 # ============================================================================
@@ -617,7 +572,7 @@ EOF
 log_info "resolv.conf настроен"
 
 # ============================================================================
-# ПРОВЕРКА КОНФИГУРАЦИИ
+# ПРОВЕРКА
 # ============================================================================
 log_step "Проверка конфигурации..."
 echo ""
@@ -659,6 +614,12 @@ fi
 
 log_info "Сервис: $SERVICE"
 
+# Удаляем старый override если есть
+rm -rf /etc/systemd/system/bind.service.d/ 2>/dev/null || true
+rm -rf /etc/systemd/system/named.service.d/ 2>/dev/null || true
+
+systemctl daemon-reload
+
 systemctl enable $SERVICE
 systemctl restart $SERVICE
 sleep 3
@@ -669,7 +630,7 @@ if systemctl is-active --quiet $SERVICE; then
 else
     log_error "✗ BIND не запустился!"
     systemctl status $SERVICE
-    journalctl -xeu $SERVICE -n 20 --no-pager
+    journalctl -xeu $SERVICE -n 30 --no-pager
     exit 1
 fi
 
@@ -712,19 +673,17 @@ echo "   Домен:           $DOMAIN_NAME"
 echo "   DNS сервер:      $HQ_SRV_IP"
 echo "   Forwarders:      $FWD1, $FWD2"
 echo ""
-echo " ФАЙЛЫ:"
+echo "📁 ФАЙЛЫ:"
 echo "   Главный конфиг:  /var/lib/bind/etc/named.conf"
 echo "   Прямая зона:     /var/lib/bind/var/named/master/$DOMAIN_NAME.db"
 echo "   Обратные зоны:   /var/lib/bind/var/named/master/*_rev.db"
 echo ""
 echo "🔥 FIREWALL:"
-echo "   ✅ UDP порт 53 открыт"
-echo "   ✅ TCP порт 53 открыт"
+echo "   ✅ UDP/TCP порт 53 открыт"
 echo ""
 echo "🔧 КОМАНДЫ:"
 echo "   systemctl status $SERVICE"
 echo "   dig @localhost hq-srv.$DOMAIN_NAME +short"
-echo "   dig @192.168.10.10 hq-rtr.$DOMAIN_NAME +short (с другой машины)"
 echo ""
 echo "📝 DNS ЗАПИСИ:"
 echo "   hq-rtr.$DOMAIN_NAME -> $HQ_RTR_IP"
