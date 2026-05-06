@@ -1,8 +1,10 @@
 #!/bin/bash
+
 # ============================================================================
 # DNS Infrastructure Setup Script for Demo-2026 (Исправленная версия для chroot)
-# Версия: 4.0 (исправлена работа с chroot в ALT Linux)
+# Версия: 4.1 (исправлены проверки named-checkconf и named-checkzone)
 # ============================================================================
+
 set -e
 
 # Цвета для вывода
@@ -27,6 +29,7 @@ fi
 # Определение ОС и установка пакетов
 # ============================================================================
 log_step "Определение ОС и установка BIND..."
+
 if [ -f /etc/altlinux-release ]; then
     OS_VERSION=$(cat /etc/altlinux-release | grep -oP '\d+\.\d+' | head -1)
     log_info "Обнаружен ALT Linux версии: $OS_VERSION"
@@ -52,7 +55,7 @@ log_step "Автоопределение параметров сети..."
 echo ""
 
 # Автоопределение локального IP
-LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
+LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
 log_info "Обнаружен локальный IP: $LOCAL_IP"
 
 # Определение подсети
@@ -65,7 +68,7 @@ log_info "Имя хоста: $HOSTNAME"
 
 echo ""
 echo "============================================"
-echo "        Настройка DNS сервера"
+echo " Настройка DNS сервера"
 echo "============================================"
 echo ""
 
@@ -111,6 +114,7 @@ echo "1) Яндекс DNS (77.88.8.8, 77.88.8.1)"
 echo "2) Яндекс DNS альтернативные (77.88.8.7, 77.88.8.3)"
 echo "3) Google DNS (8.8.8.8, 8.8.4.4)"
 echo "4) Cloudflare (1.1.1.1, 1.0.0.1)"
+
 read -p "Выбор [1]: " FWD_CHOICE
 FWD_CHOICE=${FWD_CHOICE:-1}
 
@@ -125,7 +129,7 @@ esac
 # Сводка
 echo ""
 echo "============================================"
-echo "           Сводка конфигурации"
+echo " Сводка конфигурации"
 echo "============================================"
 echo " Домен: $DOMAIN_NAME"
 echo " HQ-RTR: $HQ_RTR_IP"
@@ -174,9 +178,11 @@ log_info "Директории в chroot созданы"
 # Генерация rndc ключа
 # ============================================================================
 log_step "Генерация rndc ключа..."
+
 if [ ! -f /etc/rndc.key ]; then
     rndc-confgen -a -q 2>/dev/null || true
 fi
+
 if [ -f /etc/rndc.key ]; then
     chown root:named /etc/rndc.key
     chmod 640 /etc/rndc.key
@@ -251,42 +257,48 @@ zone "." IN {
     type hint;
     file "named.root";
 };
+
 EOF
 
 chown root:named ${CHROOT_ETC}/named.conf
 chmod 640 ${CHROOT_ETC}/named.conf
+
 log_info "named.conf создан в chroot"
 
 # ============================================================================
 # Создание файла прямой зоны
 # ============================================================================
 log_step "Создание прямой зоны в chroot..."
+
 SERIAL=$(date +%Y%m%d01)
 
 cat > ${CHROOT_VAR}/master/$DOMAIN_NAME.db << EOF
 \$TTL 86400
 @ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
     $SERIAL ; Serial
-    3600    ; Refresh
-    1800    ; Retry
-    604800  ; Expire
-    86400   ; Minimum TTL
+    3600 ; Refresh
+    1800 ; Retry
+    604800 ; Expire
+    86400 ; Minimum TTL
 )
+
 ; NS запись
 @ IN NS hq-srv.$DOMAIN_NAME.
 
 ; A записи согласно Таблице 3
-hq-rtr  IN A $HQ_RTR_IP
-br-rtr  IN A $BR_RTR_IP
-hq-srv  IN A $HQ_SRV_IP
-br-srv  IN A $BR_SRV_IP
-docker  IN A $DOCKER_IP
-web     IN A $WEB_IP
+hq-rtr IN A $HQ_RTR_IP
+br-rtr IN A $BR_RTR_IP
+hq-srv IN A $HQ_SRV_IP
+br-srv IN A $BR_SRV_IP
+docker IN A $DOCKER_IP
+web IN A $WEB_IP
+
 EOF
 
 # КРИТИЧНО: Владелец root:named как в задании!
 chown root:named ${CHROOT_VAR}/master/$DOMAIN_NAME.db
 chmod 0640 ${CHROOT_VAR}/master/$DOMAIN_NAME.db
+
 log_info "Файл прямой зоны создан: ${CHROOT_VAR}/master/$DOMAIN_NAME.db"
 
 # ============================================================================
@@ -302,22 +314,25 @@ cat > ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db << EOF
 \$TTL 86400
 @ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
     $SERIAL ; Serial
-    3600    ; Refresh
-    1800    ; Retry
-    604800  ; Expire
-    86400   ; Minimum TTL
+    3600 ; Refresh
+    1800 ; Retry
+    604800 ; Expire
+    86400 ; Minimum TTL
 )
+
 ; NS запись
 @ IN NS hq-srv.$DOMAIN_NAME.
 
 ; PTR записи для HQ-RTR и HQ-SRV (Таблица 3)
 $HQ_RTR_PTR IN PTR hq-rtr.$DOMAIN_NAME.
 $HQ_SRV_PTR IN PTR hq-srv.$DOMAIN_NAME.
+
 EOF
 
 # КРИТИЧНО: Владелец root:named как в задании!
 chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
 chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
+
 log_info "Файл обратной зоны создан: ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db"
 
 # ============================================================================
@@ -330,14 +345,14 @@ if [ ! -f ${CHROOT_VAR}/named.localhost ]; then
     cat > ${CHROOT_VAR}/named.localhost << 'EOF'
 $TTL 1D
 @ IN SOA @ root.localhost. (
-    1   ; Serial
-    1H  ; Refresh
+    1 ; Serial
+    1H ; Refresh
     15M ; Retry
-    1W  ; Expire
-    1D  ; Minimum
+    1W ; Expire
+    1D ; Minimum
 )
-NS @
-A 127.0.0.1
+    NS @
+    A 127.0.0.1
 EOF
 fi
 
@@ -346,38 +361,39 @@ if [ ! -f ${CHROOT_VAR}/named.loopback ]; then
     cat > ${CHROOT_VAR}/named.loopback << 'EOF'
 $TTL 1D
 @ IN SOA @ root.localhost. (
-    1   ; Serial
-    1H  ; Refresh
+    1 ; Serial
+    1H ; Refresh
     15M ; Retry
-    1W  ; Expire
-    1D  ; Minimum
+    1W ; Expire
+    1D ; Minimum
 )
-NS @
-PTR localhost.
+    NS @
+    PTR localhost.
 EOF
 fi
 
 # named.root (корневые серверы)
 if [ ! -f ${CHROOT_VAR}/named.root ]; then
     cat > ${CHROOT_VAR}/named.root << 'EOF'
-.                        3600000  NS  a.root-servers.net.
-a.root-servers.net.     3600000  A   198.41.0.4
-.                        3600000  NS  b.root-servers.net.
-b.root-servers.net.     3600000  A   199.9.14.201
-.                        3600000  NS  c.root-servers.net.
-c.root-servers.net.     3600000  A   192.33.4.12
-.                        3600000  NS  d.root-servers.net.
-d.root-servers.net.     3600000  A   199.7.91.13
-.                        3600000  NS  e.root-servers.net.
-e.root-servers.net.     3600000  A   192.203.230.10
-.                        3600000  NS  f.root-servers.net.
-f.root-servers.net.     3600000  A   192.5.5.241
+. 3600000 NS a.root-servers.net.
+a.root-servers.net. 3600000 A 198.41.0.4
+. 3600000 NS b.root-servers.net.
+b.root-servers.net. 3600000 A 199.9.14.201
+. 3600000 NS c.root-servers.net.
+c.root-servers.net. 3600000 A 192.33.4.12
+. 3600000 NS d.root-servers.net.
+d.root-servers.net. 3600000 A 199.7.91.13
+. 3600000 NS e.root-servers.net.
+e.root-servers.net. 3600000 A 192.203.230.10
+. 3600000 NS f.root-servers.net.
+f.root-servers.net. 3600000 A 192.5.5.241
 EOF
 fi
 
 chown named:named ${CHROOT_VAR}/named.localhost
 chown named:named ${CHROOT_VAR}/named.loopback
 chown named:named ${CHROOT_VAR}/named.root
+
 log_info "Стандартные зоны созданы в chroot"
 
 # ============================================================================
@@ -405,13 +421,14 @@ update_chrooted named || true
 log_info "Chroot-окружение обновлено"
 
 # ============================================================================
-# Проверка конфигурации
+# ПРОВЕРКА КОНФИГУРАЦИИ (ИСПРАВЛЕНО!)
 # ============================================================================
 log_step "Проверка конфигурации..."
 echo ""
 
 echo "=== named-checkconf ==="
-if named-checkconf -t ${CHROOT_DIR} ${CHROOT_ETC}/named.conf; then
+# ИСПРАВЛЕНИЕ: разделяем chroot dir и путь внутри chroot
+if named-checkconf -t ${CHROOT_DIR} /etc/named.conf; then
     log_info "Конфигурация валидна!"
 else
     log_error "Ошибка в named.conf!"
@@ -420,16 +437,19 @@ fi
 
 echo ""
 echo "=== named-checkzone (прямая зона) ==="
-named-checkzone -t ${CHROOT_DIR} $DOMAIN_NAME ${CHROOT_VAR}/master/$DOMAIN_NAME.db
+# ИСПРАВЛЕНИЕ: правильный синтаксис для chroot
+named-checkzone -t ${CHROOT_DIR} $DOMAIN_NAME /var/named/master/$DOMAIN_NAME.db
 
 echo ""
 echo "=== named-checkzone (обратная зона) ==="
-named-checkzone -t ${CHROOT_DIR} $REV_ZONE.in-addr.arpa ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
+# ИСПРАВЛЕНИЕ: правильный синтаксис для chroot
+named-checkzone -t ${CHROOT_DIR} $REV_ZONE.in-addr.arpa /var/named/master/${DOMAIN_NAME}_rev.db
 
 # ============================================================================
 # Настройка firewall
 # ============================================================================
 log_step "Настройка firewall..."
+
 if systemctl is-active --quiet firewalld 2>/dev/null; then
     firewall-cmd --permanent --add-service=dns 2>/dev/null || true
     firewall-cmd --reload 2>/dev/null || true
@@ -441,18 +461,22 @@ iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || \
     iptables -I INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
 iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || \
     iptables -I INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+
 log_info "Firewall настроен"
 
 # ============================================================================
 # Настройка resolv.conf
 # ============================================================================
 log_step "Настройка /etc/resolv.conf..."
+
 cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+
 cat > /etc/resolv.conf << EOF
 # DNS configuration for $DOMAIN_NAME
 search $DOMAIN_NAME
 nameserver 127.0.0.1
 EOF
+
 log_info "resolv.conf настроен"
 
 # ============================================================================
@@ -468,6 +492,7 @@ elif systemctl list-unit-files | grep -q '^bind.service'; then
 else
     SERVICE="named"
 fi
+
 log_info "Используем сервис: $SERVICE"
 
 # Включаем и запускаем
@@ -522,14 +547,15 @@ done
 # ============================================================================
 echo ""
 echo "============================================"
-echo "       Настройка DNS завершена!"
+echo " Настройка DNS завершена!"
 echo "============================================"
 echo ""
 echo "Полезные команды:"
 echo "  systemctl status $SERVICE"
-echo "  named-checkconf -t ${CHROOT_DIR} ${CHROOT_ETC}/named.conf"
+echo "  named-checkconf -t ${CHROOT_DIR} /etc/named.conf"
 echo "  dig @localhost hq-srv.$DOMAIN_NAME"
 echo "  dig @localhost -x $HQ_SRV_IP"
 echo "  rndc status"
 echo ""
+
 log_info "Готово!"
