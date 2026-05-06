@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ============================================================================
-# DNS Infrastructure Setup Script for Demo-2026 (Исправленная версия для chroot)
-# Версия: 4.1 (исправлены проверки named-checkconf и named-checkzone)
+# DNS Infrastructure Setup Script for Demo-2026 (Версия с полной очисткой)
+# Версия: 4.2 (очистка + исправление обратной зоны)
 # ============================================================================
 
 set -e
@@ -22,6 +22,35 @@ log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 # Проверка прав root
 if [ "$EUID" -ne 0 ]; then
     log_error "Запустите скрипт от имени root!"
+    exit 1
+fi
+
+# ============================================================================
+# ПОЛНАЯ ОЧИСТКА СТАРЫХ КОНФИГУРАЦИЙ
+# ============================================================================
+log_step "=== ОЧИСТКА СТАРЫХ КОНФИГУРАЦИЙ ==="
+
+echo ""
+log_warn "ВНИМАНИЕ: Будут удалены все старые конфигурации DNS!"
+read -p "Продолжить очистку? [y/N]: " clean_confirm
+if [[ "$clean_confirm" =~ ^[Yy]$ ]]; then
+    log_info "Остановка сервисов..."
+    systemctl stop named 2>/dev/null || true
+    systemctl stop bind 2>/dev/null || true
+    
+    log_info "Удаление старых файлов в chroot..."
+    rm -rf /var/lib/bind/etc/named.conf 2>/dev/null || true
+    rm -rf /var/lib/bind/var/named/master/*.db 2>/dev/null || true
+    rm -rf /var/lib/bind/var/named/data/* 2>/dev/null || true
+    rm -rf /var/lib/bind/var/named/dynamic/* 2>/dev/null || true
+    
+    log_info "Удаление старых конфигов в /etc..."
+    rm -f /etc/named.conf 2>/dev/null || true
+    rm -f /etc/rndc.key 2>/dev/null || true
+    
+    log_info "Очистка завершена"
+else
+    log_error "Отменено пользователем"
     exit 1
 fi
 
@@ -58,7 +87,7 @@ echo ""
 LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
 log_info "Обнаружен локальный IP: $LOCAL_IP"
 
-# Определение подсети
+# Определение подсети (первые 3 октета)
 SUBNET=$(echo "$LOCAL_IP" | cut -d'.' -f1-3)
 log_info "Подсеть: $SUBNET.x"
 
@@ -126,6 +155,18 @@ case $FWD_CHOICE in
     *) FWD1="77.88.8.8"; FWD2="77.88.8.1" ;;
 esac
 
+# ============================================================================
+# ВЫЧИСЛЕНИЕ ОБРАТНОЙ ЗОНЫ (ИСПРАВЛЕНО!)
+# ============================================================================
+# Берем первые 3 октета из HQ_RTR_IP и переворачиваем их
+# Например: 192.168.4.x -> 4.168.192.in-addr.arpa
+OCT1=$(echo "$SUBNET" | cut -d'.' -f1)
+OCT2=$(echo "$SUBNET" | cut -d'.' -f2)
+OCT3=$(echo "$SUBNET" | cut -d'.' -f3)
+REV_ZONE="${OCT3}.${OCT2}.${OCT1}"
+
+log_info "Обратная зона: $REV_ZONE.in-addr.arpa"
+
 # Сводка
 echo ""
 echo "============================================"
@@ -138,6 +179,7 @@ echo " BR-RTR: $BR_RTR_IP"
 echo " BR-SRV: $BR_SRV_IP"
 echo " Docker: $DOCKER_IP"
 echo " WEB: $WEB_IP"
+echo " Reverse Zone: $REV_ZONE.in-addr.arpa"
 echo " Forwarders: $FWD1, $FWD2"
 echo "============================================"
 echo ""
@@ -152,10 +194,6 @@ fi
 # Создание структуры директорий в chroot-окружении
 # ============================================================================
 log_step "Создание структуры директорий в chroot-окружении..."
-
-# Остановка сервисов перед изменениями
-systemctl stop named 2>/dev/null || true
-systemctl stop bind 2>/dev/null || true
 
 # Создание директорий в /var/lib/bind (chroot-окружении)
 mkdir -p ${CHROOT_ETC}
@@ -194,8 +232,7 @@ fi
 # ============================================================================
 log_step "Создание ${CHROOT_ETC}/named.conf..."
 
-# Определение обратной зоны
-REV_ZONE=$(echo "$SUBNET" | awk -F. '{print $3"."$2"."$1}')
+log_info "Используем обратную зону: $REV_ZONE.in-addr.arpa"
 
 cat > ${CHROOT_ETC}/named.conf << EOF
 // DNS Configuration for $DOMAIN_NAME
@@ -310,6 +347,8 @@ log_step "Создание обратной зоны в chroot..."
 HQ_RTR_PTR=$(echo "$HQ_RTR_IP" | cut -d'.' -f4)
 HQ_SRV_PTR=$(echo "$HQ_SRV_IP" | cut -d'.' -f4)
 
+log_info "Создание PTR записей: $HQ_RTR_PTR -> hq-rtr, $HQ_SRV_PTR -> hq-srv"
+
 cat > ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db << EOF
 \$TTL 86400
 @ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
@@ -421,28 +460,32 @@ update_chrooted named || true
 log_info "Chroot-окружение обновлено"
 
 # ============================================================================
-# ПРОВЕРКА КОНФИГУРАЦИИ (ИСПРАВЛЕНО!)
+# ПРОВЕРКА КОНФИГУРАЦИИ
 # ============================================================================
 log_step "Проверка конфигурации..."
 echo ""
 
+# Показываем содержимое named.conf для отладки
+log_info "Проверка переменной REV_ZONE: $REV_ZONE"
+log_info "Полное имя обратной зоны: $REV_ZONE.in-addr.arpa"
+
+echo ""
 echo "=== named-checkconf ==="
-# ИСПРАВЛЕНИЕ: разделяем chroot dir и путь внутри chroot
 if named-checkconf -t ${CHROOT_DIR} /etc/named.conf; then
     log_info "Конфигурация валидна!"
 else
     log_error "Ошибка в named.conf!"
+    log_error "Показываю содержимое файла:"
+    cat ${CHROOT_ETC}/named.conf
     exit 1
 fi
 
 echo ""
 echo "=== named-checkzone (прямая зона) ==="
-# ИСПРАВЛЕНИЕ: правильный синтаксис для chroot
 named-checkzone -t ${CHROOT_DIR} $DOMAIN_NAME /var/named/master/$DOMAIN_NAME.db
 
 echo ""
 echo "=== named-checkzone (обратная зона) ==="
-# ИСПРАВЛЕНИЕ: правильный синтаксис для chroot
 named-checkzone -t ${CHROOT_DIR} $REV_ZONE.in-addr.arpa /var/named/master/${DOMAIN_NAME}_rev.db
 
 # ============================================================================
