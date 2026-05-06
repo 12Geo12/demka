@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ============================================================================
-# DNS Infrastructure Setup Script - FINAL WORKING VERSION
-# Версия: 9.0 (ПРОВЕРЕНО И РАБОТАЕТ)
+# DNS Infrastructure Setup Script - FINAL WORKING VERSION v9.1
+# Исправлена генерация rndc.key
 # ============================================================================
 
 set -e
@@ -44,10 +44,12 @@ systemctl stop named 2>/dev/null || true
 systemctl stop bind 2>/dev/null || true
 
 rm -rf /var/lib/bind/etc/named.conf 2>/dev/null || true
+rm -rf /var/lib/bind/etc/rndc.key 2>/dev/null || true
 rm -rf /var/lib/bind/var/named/master/*.db 2>/dev/null || true
 rm -rf /var/lib/bind/var/named/data/* 2>/dev/null || true
 rm -rf /var/lib/bind/var/named/dynamic/* 2>/dev/null || true
 rm -f /etc/named.conf 2>/dev/null || true
+rm -f /etc/rndc.key 2>/dev/null || true
 
 log_info "Очистка завершена"
 
@@ -233,24 +235,45 @@ ln -sf /var/lib/bind/var/named /var/named 2>/dev/null || true
 log_info "Директории созданы"
 
 # ============================================================================
-# RNDC KEY
+# RNDC KEY - ИСПРАВЛЕНО!
 # ============================================================================
 log_step "Генерация rndc ключа..."
 
-rm -f /etc/rndc.key 2>/dev/null || true
-rndc-confgen -a -q 2>/dev/null || true
-
-if [ -f /etc/rndc.key ]; then
-    chown root:named /etc/rndc.key
-    chmod 640 /etc/rndc.key
-    cp /etc/rndc.key ${CHROOT_ETC}/rndc.key
-    chown named:named ${CHROOT_ETC}/rndc.key
-    chmod 640 ${CHROOT_ETC}/rndc.key
-    log_info "rndc.key создан"
+# Метод 1: Пробуем rndc-confgen
+if rndc-confgen -a -q 2>/dev/null && [ -f /etc/rndc.key ]; then
+    log_info "rndc.key создан через rndc-confgen"
 else
-    log_error "Не удалось создать rndc.key!"
-    exit 1
+    # Метод 2: Создаем вручную
+    log_warn "rndc-confgen не сработал, создаю вручную..."
+    
+    # Генерируем случайный секрет
+    SECRET=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -d '\n')
+    
+    # Создаем файл
+    cat > /etc/rndc.key << EOF
+key "rndc-key" {
+    algorithm hmac-sha256;
+    secret "$SECRET";
+};
+EOF
+    
+    if [ -f /etc/rndc.key ]; then
+        log_info "rndc.key создан вручную"
+    else
+        log_error "Не удалось создать rndc.key!"
+        exit 1
+    fi
 fi
+
+# Устанавливаем права и копируем в chroot
+chown root:named /etc/rndc.key
+chmod 640 /etc/rndc.key
+
+cp /etc/rndc.key ${CHROOT_ETC}/rndc.key
+chown named:named ${CHROOT_ETC}/rndc.key
+chmod 640 ${CHROOT_ETC}/rndc.key
+
+log_info "rndc.key скопирован в chroot"
 
 # ============================================================================
 # NAMED.CONF
@@ -478,7 +501,6 @@ chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_srv_rev.db
 # ============================================================================
 log_step "Создание стандартных зон..."
 
-# named.localhost
 cat > ${CHROOT_VAR}/named.localhost << 'EOF'
 $TTL 1D
 @ IN SOA @ root.localhost. (
@@ -492,7 +514,6 @@ $TTL 1D
     A 127.0.0.1
 EOF
 
-# named.loopback (ИСПРАВЛЕНО: добавлена "1" перед PTR)
 cat > ${CHROOT_VAR}/named.loopback << 'EOF'
 $TTL 1D
 @ IN SOA @ root.localhost. (
@@ -506,7 +527,6 @@ $TTL 1D
 1   IN PTR localhost.
 EOF
 
-# named.root
 cat > ${CHROOT_VAR}/named.root << 'EOF'
 . 3600000 NS a.root-servers.net.
 a.root-servers.net. 3600000 A 198.41.0.4
@@ -619,7 +639,6 @@ fi
 
 log_info "Сервис: $SERVICE"
 
-# Удаляем старый override
 rm -rf /etc/systemd/system/bind.service.d/ 2>/dev/null || true
 rm -rf /etc/systemd/system/named.service.d/ 2>/dev/null || true
 
