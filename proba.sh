@@ -1,425 +1,535 @@
 #!/bin/bash
-#===============================================================================
-# DHCP Server - Полная диагностика и исправление
-# Для Demo2026 - Alt Linux
-#===============================================================================
+# ============================================================================
+# DNS Infrastructure Setup Script for Demo-2026 (Исправленная версия для chroot)
+# Версия: 4.0 (исправлена работа с chroot в ALT Linux)
+# ============================================================================
+set -e
 
-#--- Цвета --------------------------------------------------------------------
+# Цвета для вывода
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
 NC='\033[0m'
 
-#--- Функции ------------------------------------------------------------------
-msg_ok() { echo -e "${GREEN}[OK]${NC} $1"; }
-msg_er() { echo -e "${RED}[ERR]${NC} $1"; }
-msg_in() { echo -e "${BLUE}[INFO]${NC} $1"; }
-msg_wa() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-line() { echo -e "${CYAN}================================================${NC}"; }
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 
-#--- Заголовок ----------------------------------------------------------------
-clear
-echo -e "${CYAN}"
-echo "╔══════════════════════════════════════════════════════╗"
-echo "║      DHCP Server - Диагностика и Исправление         ║"
-echo "╚══════════════════════════════════════════════════════╝"
-echo -e "${NC}"
-
-# Проверка root
+# Проверка прав root
 if [ "$EUID" -ne 0 ]; then
-    msg_er "Запустите от root: su -"
+    log_error "Запустите скрипт от имени root!"
     exit 1
 fi
 
-#===============================================================================
-# 1. ИНФОРМАЦИЯ О СИСТЕМЕ
-#===============================================================================
-line
-echo -e "${WHITE}1. Системная информация${NC}"
-line
-echo ""
-echo -e "  Хостнейм:     ${YELLOW}$(hostname)${NC}"
-echo -e "  OS:           ${YELLOW}$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'\"' -f2)${NC}"
-echo -e "  Ядро:         ${YELLOW}$(uname -r)${NC}"
-
-#===============================================================================
-# 2. СЕТЕВЫЕ ИНТЕРФЕЙСЫ
-#===============================================================================
-echo ""
-line
-echo -e "${WHITE}2. Сетевые интерфейсы${NC}"
-line
-echo ""
-
-echo -e "${CYAN}>>> ip addr show${NC}"
-echo ""
-ip -brief addr show 2>/dev/null || ip addr show
-
-echo ""
-echo -e "${CYAN}>>> VLAN интерфейсы:${NC}"
-echo ""
-ip -brief addr show type vlan 2>/dev/null || echo "  (нет VLAN интерфейсов)"
-
-echo ""
-echo -e "${CYAN}>>> Таблица маршрутизации:${NC}"
-echo ""
-ip route show
-
-#===============================================================================
-# 3. ПРОВЕРКА DHCP ПАКЕТА
-#===============================================================================
-echo ""
-line
-echo -e "${WHITE}3. Проверка DHCP пакета${NC}"
-line
-echo ""
-
-# Проверяем разные имена пакетов
-PKG_FOUND=""
-PKG_NAME=""
-
-if rpm -q dhcp-server >/dev/null 2>&1; then
-    PKG_FOUND="yes"
-    PKG_NAME="dhcp-server"
-    msg_ok "Пакет установлен: ${YELLOW}dhcp-server${NC}"
-elif rpm -q dhcp >/dev/null 2>&1; then
-    PKG_FOUND="yes"
-    PKG_NAME="dhcp"
-    msg_ok "Пакет установлен: ${YELLOW}dhcp${NC}"
-elif dpkg -l isc-dhcp-server >/dev/null 2>&1; then
-    PKG_FOUND="yes"
-    PKG_NAME="isc-dhcp-server"
-    msg_ok "Пакет установлен: ${YELLOW}isc-dhcp-server${NC}"
+# ============================================================================
+# Определение ОС и установка пакетов
+# ============================================================================
+log_step "Определение ОС и установка BIND..."
+if [ -f /etc/altlinux-release ]; then
+    OS_VERSION=$(cat /etc/altlinux-release | grep -oP '\d+\.\d+' | head -1)
+    log_info "Обнаружен ALT Linux версии: $OS_VERSION"
+    apt-get update
+    apt-get install -y bind bind-utils
+    log_info "BIND установлен успешно"
 else
-    PKG_FOUND="no"
-    msg_wa "Пакет DHCP не установлен!"
+    log_error "Поддерживается только ALT Linux"
+    exit 1
 fi
 
-# Проверяем команду dhcpd
+# ============================================================================
+# Переменные для chroot
+# ============================================================================
+CHROOT_DIR="/var/lib/bind"
+CHROOT_ETC="${CHROOT_DIR}/etc"        # /etc внутри chroot
+CHROOT_VAR="${CHROOT_DIR}/var/named"  # /var/named внутри chroot
+
+# ============================================================================
+# Автоопределение сети и интерактивный ввод
+# ============================================================================
+log_step "Автоопределение параметров сети..."
 echo ""
-echo -e "${CYAN}>>> which dhcpd${NC}"
-if which dhcpd 2>/dev/null; then
-    msg_ok "Команда dhcpd найдена"
-else
-    msg_wa "Команда dhcpd НЕ найдена в PATH"
+
+# Автоопределение локального IP
+LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
+log_info "Обнаружен локальный IP: $LOCAL_IP"
+
+# Определение подсети
+SUBNET=$(echo "$LOCAL_IP" | cut -d'.' -f1-3)
+log_info "Подсеть: $SUBNET.x"
+
+# Определение имени хоста
+HOSTNAME=$(hostname)
+log_info "Имя хоста: $HOSTNAME"
+
+echo ""
+echo "============================================"
+echo "        Настройка DNS сервера"
+echo "============================================"
+echo ""
+
+# Ввод IP-адресов устройств
+read -p "IP-адрес HQ-RTR [$SUBNET.1]: " HQ_RTR_IP
+HQ_RTR_IP=${HQ_RTR_IP:-"$SUBNET.1"}
+
+read -p "IP-адрес HQ-SRV [$LOCAL_IP]: " HQ_SRV_IP
+HQ_SRV_IP=${HQ_SRV_IP:-"$LOCAL_IP"}
+
+read -p "IP-адрес BR-RTR: " BR_RTR_IP
+while [ -z "$BR_RTR_IP" ]; do
+    log_error "BR-RTR IP обязателен!"
+    read -p "IP-адрес BR-RTR: " BR_RTR_IP
+done
+
+read -p "IP-адрес BR-SRV: " BR_SRV_IP
+while [ -z "$BR_SRV_IP" ]; do
+    log_error "BR-SRV IP обязателен!"
+    read -p "IP-адрес BR-SRV: " BR_SRV_IP
+done
+
+read -p "IP-адрес Docker (внешний): " DOCKER_IP
+while [ -z "$DOCKER_IP" ]; do
+    log_error "Docker IP обязателен!"
+    read -p "IP-адрес Docker: " DOCKER_IP
+done
+
+read -p "IP-адрес WEB (внешний): " WEB_IP
+while [ -z "$WEB_IP" ]; do
+    log_error "WEB IP обязателен!"
+    read -p "IP-адрес WEB: " WEB_IP
+done
+
+# Доменное имя
+read -p "Доменное имя [au-team.irpo]: " DOMAIN_NAME
+DOMAIN_NAME=${DOMAIN_NAME:-"au-team.irpo"}
+
+# Выбор DNS-серверов пересылки
+echo ""
+log_info "Выбор DNS-серверов пересылки (forwarders):"
+echo "1) Яндекс DNS (77.88.8.8, 77.88.8.1)"
+echo "2) Яндекс DNS альтернативные (77.88.8.7, 77.88.8.3)"
+echo "3) Google DNS (8.8.8.8, 8.8.4.4)"
+echo "4) Cloudflare (1.1.1.1, 1.0.0.1)"
+read -p "Выбор [1]: " FWD_CHOICE
+FWD_CHOICE=${FWD_CHOICE:-1}
+
+case $FWD_CHOICE in
+    1) FWD1="77.88.8.8"; FWD2="77.88.8.1" ;;
+    2) FWD1="77.88.8.7"; FWD2="77.88.8.3" ;;
+    3) FWD1="8.8.8.8"; FWD2="8.8.4.4" ;;
+    4) FWD1="1.1.1.1"; FWD2="1.0.0.1" ;;
+    *) FWD1="77.88.8.8"; FWD2="77.88.8.1" ;;
+esac
+
+# Сводка
+echo ""
+echo "============================================"
+echo "           Сводка конфигурации"
+echo "============================================"
+echo " Домен: $DOMAIN_NAME"
+echo " HQ-RTR: $HQ_RTR_IP"
+echo " HQ-SRV: $HQ_SRV_IP"
+echo " BR-RTR: $BR_RTR_IP"
+echo " BR-SRV: $BR_SRV_IP"
+echo " Docker: $DOCKER_IP"
+echo " WEB: $WEB_IP"
+echo " Forwarders: $FWD1, $FWD2"
+echo "============================================"
+echo ""
+
+read -p "Всё верно? Продолжить? [y/N]: " confirm
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    log_error "Отменено пользователем"
+    exit 1
 fi
 
-# Прямой поиск
-echo ""
-echo -e "${CYAN}>>> Поиск dhcpd:${NC}"
-find /usr -name "dhcpd" -type f 2>/dev/null | head -5
+# ============================================================================
+# Создание структуры директорий в chroot-окружении
+# ============================================================================
+log_step "Создание структуры директорий в chroot-окружении..."
 
-#===============================================================================
-# 4. УСТАНОВКА DHCP (если нужно)
-#===============================================================================
-if [ "$PKG_FOUND" = "no" ]; then
-    echo ""
-    line
-    echo -e "${WHITE}4. Установка DHCP сервера${NC}"
-    line
-    echo ""
-    
-    msg_in "Определение пакетного менеджера..."
-    
-    if command -v apt-get >/dev/null 2>&1; then
-        msg_in "Установка dhcp-server через apt-get..."
-        apt-get update
-        apt-get install -y dhcp-server
-    elif command -v dnf >/dev/null 2>&1; then
-        msg_in "Установка dhcp-server через dnf..."
-        dnf install -y dhcp-server
-    elif command -v yum >/dev/null 2>&1; then
-        msg_in "Установка dhcp через yum..."
-        yum install -y dhcp
-    fi
-    
-    # Повторная проверка
-    if which dhcpd >/dev/null 2>&1; then
-        msg_ok "DHCP установлен успешно!"
+# Остановка сервисов перед изменениями
+systemctl stop named 2>/dev/null || true
+systemctl stop bind 2>/dev/null || true
+
+# Создание директорий в /var/lib/bind (chroot-окружении)
+mkdir -p ${CHROOT_ETC}
+mkdir -p ${CHROOT_VAR}
+mkdir -p ${CHROOT_VAR}/master
+mkdir -p ${CHROOT_VAR}/data
+mkdir -p ${CHROOT_VAR}/dynamic
+mkdir -p ${CHROOT_VAR}/slaves
+
+# КРИТИЧНО: Установка владельца и прав в chroot
+chown -R named:named ${CHROOT_DIR}
+chmod 750 ${CHROOT_VAR}
+chmod 750 ${CHROOT_VAR}/master
+chmod 750 ${CHROOT_VAR}/data
+chmod 750 ${CHROOT_VAR}/dynamic
+
+log_info "Директории в chroot созданы"
+
+# ============================================================================
+# Генерация rndc ключа
+# ============================================================================
+log_step "Генерация rndc ключа..."
+if [ ! -f /etc/rndc.key ]; then
+    rndc-confgen -a -q 2>/dev/null || true
+fi
+if [ -f /etc/rndc.key ]; then
+    chown root:named /etc/rndc.key
+    chmod 640 /etc/rndc.key
+    log_info "rndc.key создан"
+fi
+
+# ============================================================================
+# Создание named.conf в chroot-окружении
+# ============================================================================
+log_step "Создание ${CHROOT_ETC}/named.conf..."
+
+# Определение обратной зоны
+REV_ZONE=$(echo "$SUBNET" | awk -F. '{print $3"."$2"."$1}')
+
+cat > ${CHROOT_ETC}/named.conf << EOF
+// DNS Configuration for $DOMAIN_NAME
+// Generated by setup script for chroot environment
+
+options {
+    listen-on port 53 { 127.0.0.1; $HQ_SRV_IP; };
+    listen-on-v6 port 53 { none; };
+    directory "/var/named";
+    dump-file "data/cache_dump.db";
+    statistics-file "data/named_stats.txt";
+    memstatistics-file "data/named_mem_stats.txt";
+    allow-query { any; };
+    allow-recursion { any; };
+    forwarders { $FWD1; $FWD2; };
+    recursion yes;
+    dnssec-validation no;
+};
+
+logging {
+    channel default_debug {
+        file "data/named.run";
+        severity dynamic;
+    };
+};
+
+include "/etc/rndc.key";
+
+controls {
+    inet 127.0.0.1 allow { localhost; } keys { "rndc-key"; };
+};
+
+// Прямая зона
+zone "$DOMAIN_NAME" IN {
+    type master;
+    file "master/$DOMAIN_NAME.db";
+    allow-update { none; };
+};
+
+// Обратная зона
+zone "$REV_ZONE.in-addr.arpa" IN {
+    type master;
+    file "master/${DOMAIN_NAME}_rev.db";
+    allow-update { none; };
+};
+
+// Стандартные зоны
+zone "localhost" IN {
+    type master;
+    file "named.localhost";
+};
+
+zone "1.0.0.127.in-addr.arpa" IN {
+    type master;
+    file "named.loopback";
+};
+
+zone "." IN {
+    type hint;
+    file "named.root";
+};
+EOF
+
+chown root:named ${CHROOT_ETC}/named.conf
+chmod 640 ${CHROOT_ETC}/named.conf
+log_info "named.conf создан в chroot"
+
+# ============================================================================
+# Создание файла прямой зоны
+# ============================================================================
+log_step "Создание прямой зоны в chroot..."
+SERIAL=$(date +%Y%m%d01)
+
+cat > ${CHROOT_VAR}/master/$DOMAIN_NAME.db << EOF
+\$TTL 86400
+@ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
+    $SERIAL ; Serial
+    3600    ; Refresh
+    1800    ; Retry
+    604800  ; Expire
+    86400   ; Minimum TTL
+)
+; NS запись
+@ IN NS hq-srv.$DOMAIN_NAME.
+
+; A записи согласно Таблице 3
+hq-rtr  IN A $HQ_RTR_IP
+br-rtr  IN A $BR_RTR_IP
+hq-srv  IN A $HQ_SRV_IP
+br-srv  IN A $BR_SRV_IP
+docker  IN A $DOCKER_IP
+web     IN A $WEB_IP
+EOF
+
+# КРИТИЧНО: Владелец root:named как в задании!
+chown root:named ${CHROOT_VAR}/master/$DOMAIN_NAME.db
+chmod 0640 ${CHROOT_VAR}/master/$DOMAIN_NAME.db
+log_info "Файл прямой зоны создан: ${CHROOT_VAR}/master/$DOMAIN_NAME.db"
+
+# ============================================================================
+# Создание файла обратной зоны
+# ============================================================================
+log_step "Создание обратной зоны в chroot..."
+
+# Последние октеты IP-адресов для PTR записей
+HQ_RTR_PTR=$(echo "$HQ_RTR_IP" | cut -d'.' -f4)
+HQ_SRV_PTR=$(echo "$HQ_SRV_IP" | cut -d'.' -f4)
+
+cat > ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db << EOF
+\$TTL 86400
+@ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
+    $SERIAL ; Serial
+    3600    ; Refresh
+    1800    ; Retry
+    604800  ; Expire
+    86400   ; Minimum TTL
+)
+; NS запись
+@ IN NS hq-srv.$DOMAIN_NAME.
+
+; PTR записи для HQ-RTR и HQ-SRV (Таблица 3)
+$HQ_RTR_PTR IN PTR hq-rtr.$DOMAIN_NAME.
+$HQ_SRV_PTR IN PTR hq-srv.$DOMAIN_NAME.
+EOF
+
+# КРИТИЧНО: Владелец root:named как в задании!
+chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
+chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
+log_info "Файл обратной зоны создан: ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db"
+
+# ============================================================================
+# Создание стандартных зон в chroot
+# ============================================================================
+log_step "Создание стандартных зон в chroot..."
+
+# named.localhost
+if [ ! -f ${CHROOT_VAR}/named.localhost ]; then
+    cat > ${CHROOT_VAR}/named.localhost << 'EOF'
+$TTL 1D
+@ IN SOA @ root.localhost. (
+    1   ; Serial
+    1H  ; Refresh
+    15M ; Retry
+    1W  ; Expire
+    1D  ; Minimum
+)
+NS @
+A 127.0.0.1
+EOF
+fi
+
+# named.loopback
+if [ ! -f ${CHROOT_VAR}/named.loopback ]; then
+    cat > ${CHROOT_VAR}/named.loopback << 'EOF'
+$TTL 1D
+@ IN SOA @ root.localhost. (
+    1   ; Serial
+    1H  ; Refresh
+    15M ; Retry
+    1W  ; Expire
+    1D  ; Minimum
+)
+NS @
+PTR localhost.
+EOF
+fi
+
+# named.root (корневые серверы)
+if [ ! -f ${CHROOT_VAR}/named.root ]; then
+    cat > ${CHROOT_VAR}/named.root << 'EOF'
+.                        3600000  NS  a.root-servers.net.
+a.root-servers.net.     3600000  A   198.41.0.4
+.                        3600000  NS  b.root-servers.net.
+b.root-servers.net.     3600000  A   199.9.14.201
+.                        3600000  NS  c.root-servers.net.
+c.root-servers.net.     3600000  A   192.33.4.12
+.                        3600000  NS  d.root-servers.net.
+d.root-servers.net.     3600000  A   199.7.91.13
+.                        3600000  NS  e.root-servers.net.
+e.root-servers.net.     3600000  A   192.203.230.10
+.                        3600000  NS  f.root-servers.net.
+f.root-servers.net.     3600000  A   192.5.5.241
+EOF
+fi
+
+chown named:named ${CHROOT_VAR}/named.localhost
+chown named:named ${CHROOT_VAR}/named.loopback
+chown named:named ${CHROOT_VAR}/named.root
+log_info "Стандартные зоны созданы в chroot"
+
+# ============================================================================
+# Финальные права доступа в chroot
+# ============================================================================
+log_step "Установка финальных прав в chroot..."
+
+# Убеждаемся что named может писать в data и dynamic
+chown named:named ${CHROOT_VAR}/data
+chown named:named ${CHROOT_VAR}/dynamic
+chmod 750 ${CHROOT_VAR}/data
+chmod 750 ${CHROOT_VAR}/dynamic
+
+# Создаём файл лога
+touch ${CHROOT_VAR}/data/named.run 2>/dev/null || true
+chown named:named ${CHROOT_VAR}/data/named.run 2>/dev/null || true
+
+log_info "Права в chroot установлены"
+
+# ============================================================================
+# Обновление chroot (критически важно!)
+# ============================================================================
+log_step "Обновление chroot-окружения..."
+update_chrooted named || true
+log_info "Chroot-окружение обновлено"
+
+# ============================================================================
+# Проверка конфигурации
+# ============================================================================
+log_step "Проверка конфигурации..."
+echo ""
+
+echo "=== named-checkconf ==="
+if named-checkconf -t ${CHROOT_DIR} ${CHROOT_ETC}/named.conf; then
+    log_info "Конфигурация валидна!"
+else
+    log_error "Ошибка в named.conf!"
+    exit 1
+fi
+
+echo ""
+echo "=== named-checkzone (прямая зона) ==="
+named-checkzone -t ${CHROOT_DIR} $DOMAIN_NAME ${CHROOT_VAR}/master/$DOMAIN_NAME.db
+
+echo ""
+echo "=== named-checkzone (обратная зона) ==="
+named-checkzone -t ${CHROOT_DIR} $REV_ZONE.in-addr.arpa ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
+
+# ============================================================================
+# Настройка firewall
+# ============================================================================
+log_step "Настройка firewall..."
+if systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --add-service=dns 2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
+    log_info "Firewalld настроен"
+fi
+
+# iptables правила
+iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || true
+iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || true
+log_info "Firewall настроен"
+
+# ============================================================================
+# Настройка resolv.conf
+# ============================================================================
+log_step "Настройка /etc/resolv.conf..."
+cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+cat > /etc/resolv.conf << EOF
+# DNS configuration for $DOMAIN_NAME
+search $DOMAIN_NAME
+nameserver 127.0.0.1
+EOF
+log_info "resolv.conf настроен"
+
+# ============================================================================
+# Запуск BIND
+# ============================================================================
+log_step "Запуск BIND..."
+
+# Определяем имя сервиса
+if systemctl list-unit-files | grep -q '^named.service'; then
+    SERVICE="named"
+elif systemctl list-unit-files | grep -q '^bind.service'; then
+    SERVICE="bind"
+else
+    SERVICE="named"
+fi
+log_info "Используем сервис: $SERVICE"
+
+# Включаем и запускаем
+systemctl enable $SERVICE
+systemctl restart $SERVICE
+sleep 3
+
+# Проверка статуса
+echo ""
+if systemctl is-active --quiet $SERVICE; then
+    log_info "✓ BIND запущен успешно!"
+else
+    log_error "✗ BIND не запустился!"
+    log_info "Диагностика:"
+    systemctl status $SERVICE
+    journalctl -xeu $SERVICE -n 20 --no-pager
+    exit 1
+fi
+
+# ============================================================================
+# Тестирование DNS
+# ============================================================================
+echo ""
+log_step "Тестирование DNS..."
+echo ""
+
+# Тест прямого разрешения
+log_info "Прямое разрешение:"
+for host in hq-rtr br-rtr hq-srv br-srv docker web; do
+    RESULT=$(dig @localhost $host.$DOMAIN_NAME +short 2>/dev/null)
+    if [ -n "$RESULT" ]; then
+        log_info "✓ $host.$DOMAIN_NAME -> $RESULT"
     else
-        msg_er "Ошибка установки DHCP!"
-        exit 1
-    fi
-fi
-
-#===============================================================================
-# 5. КОНФИГУРАЦИЯ DHCP
-#===============================================================================
-echo ""
-line
-echo -e "${WHITE}5. Конфигурация DHCP${NC}"
-line
-echo ""
-
-DHCP_CONF="/etc/dhcp/dhcpd.conf"
-
-if [ -f "$DHCP_CONF" ]; then
-    echo -e "${CYAN}>>> cat $DHCP_CONF${NC}"
-    echo ""
-    cat "$DHCP_CONF"
-else
-    msg_wa "Конфиг не существует: $DHCP_CONF"
-fi
-
-#===============================================================================
-# 6. ИНТЕРФЕЙСЫ ДЛЯ DHCP
-#===============================================================================
-echo ""
-line
-echo -e "${WHITE}6. Интерфейсы для DHCP${NC}"
-line
-echo ""
-
-if [ -f /etc/sysconfig/dhcpd ]; then
-    echo -e "${CYAN}>>> cat /etc/sysconfig/dhcpd${NC}"
-    cat /etc/sysconfig/dhcpd
-elif [ -f /etc/default/isc-dhcp-server ]; then
-    echo -e "${CYAN}>>> cat /etc/default/isc-dhcp-server${NC}"
-    cat /etc/default/isc-dhcp-server
-else
-    msg_wa "Файл интерфейсов не найден"
-fi
-
-#===============================================================================
-# 7. ПРОВЕРКА КОНФИГУРАЦИИ
-#===============================================================================
-echo ""
-line
-echo -e "${WHITE}7. Проверка конфигурации${NC}"
-line
-echo ""
-
-echo -e "${CYAN}>>> dhcpd -t -cf $DHCP_CONF${NC}"
-echo ""
-
-if dhcpd -t -cf "$DHCP_CONF" 2>&1; then
-    msg_ok "Конфигурация валидна"
-else
-    msg_er "Ошибка в конфигурации!"
-fi
-
-#===============================================================================
-# 8. СТАТУС СЕРВИСА
-#===============================================================================
-echo ""
-line
-echo -e "${WHITE}8. Статус сервиса${NC}"
-line
-echo ""
-
-# Ищем имя сервиса
-SERVICE_NAME=""
-for svc in dhcpd dhcp-server isc-dhcp-server; do
-    if systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
-        SERVICE_NAME="$svc"
-        break
+        log_warn "✗ $host.$DOMAIN_NAME -> не найден"
     fi
 done
 
-if [ -n "$SERVICE_NAME" ]; then
-    echo -e "${CYAN}>>> systemctl status $SERVICE_NAME${NC}"
-    echo ""
-    systemctl status "$SERVICE_NAME" --no-pager 2>&1 | head -20
-else
-    msg_wa "Сервис DHCP не найден"
-fi
-
-#===============================================================================
-# 9. ПОРТЫ
-#===============================================================================
+# Тест обратного разрешения
 echo ""
-line
-echo -e "${WHITE}9. Проверка портов (UDP 67)${NC}"
-line
+log_info "Обратное разрешение:"
+for ip in $HQ_RTR_IP $HQ_SRV_IP; do
+    RESULT=$(dig @localhost -x $ip +short 2>/dev/null)
+    if [ -n "$RESULT" ]; then
+        log_info "✓ $ip -> $RESULT"
+    else
+        log_warn "✗ $ip -> не найден"
+    fi
+done
+
+# ============================================================================
+# Завершение
+# ============================================================================
 echo ""
-
-echo -e "${CYAN}>>> ss -ulnp | grep 67${NC}"
-ss -ulnp 2>/dev/null | grep 67 || echo "  (порт 67 не слушается)"
-
-#===============================================================================
-# 10. ДЕЙСТВИЕ
-#===============================================================================
+echo "============================================"
+echo "       Настройка DNS завершена!"
+echo "============================================"
 echo ""
-line
-echo -e "${WHITE}10. Что сделать?${NC}"
-line
+echo "Полезные команды:"
+echo "  systemctl status $SERVICE"
+echo "  named-checkconf -t ${CHROOT_DIR} ${CHROOT_ETC}/named.conf"
+echo "  dig @localhost hq-srv.$DOMAIN_NAME"
+echo "  dig @localhost -x $HQ_SRV_IP"
+echo "  rndc status"
 echo ""
-echo "  1) Создать новую конфигурацию DHCP (автоопределение)"
-echo "  2) Перезапустить DHCP сервис"
-echo "  3) Показать логи"
-echo "  4) Выход"
-echo ""
-read -r -p "Выбор [1-4]: " action
-
-case "$action" in
-    1)
-        #=======================================================================
-        # СОЗДАНИЕ КОНФИГУРАЦИИ
-        #=======================================================================
-        echo ""
-        line
-        echo -e "${WHITE}Создание конфигурации${NC}"
-        line
-        echo ""
-        
-        # Функция преобразования префикса в маску
-        prefix_to_mask() {
-            case "$1" in
-                24) echo "255.255.255.0" ;;
-                25) echo "255.255.255.128" ;;
-                26) echo "255.255.255.192" ;;
-                27) echo "255.255.255.224" ;;
-                28) echo "255.255.255.240" ;;
-                29) echo "255.255.255.248" ;;
-                30) echo "255.255.255.252" ;;
-                *)  echo "255.255.255.0" ;;
-            esac
-        }
-        
-        # Показываем интерфейсы
-        echo -e "${CYAN}Интерфейсы для DHCP:${NC}"
-        echo ""
-        
-        TMPFILE="/tmp/dhcp_ifaces_$$"
-        > "$TMPFILE"
-        
-        idx=0
-        for iface in $(ip -brief addr show 2>/dev/null | grep -v "^lo" | awk '{print $1}'); do
-            ip_info=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
-            [ -z "$ip_info" ] && continue
-            
-            ip=$(echo "$ip_info" | cut -d'/' -f1)
-            prefix=$(echo "$ip_info" | cut -d'/' -f2)
-            
-            printf "  ${GREEN}[%d]${NC} %-15s %s\n" "$((idx+1))" "$iface" "$ip_info"
-            echo "$iface|$ip|$prefix" >> "$TMPFILE"
-            idx=$((idx + 1))
-        done
-        
-        TOTAL=$idx
-        
-        if [ $TOTAL -eq 0 ]; then
-            msg_er "Нет интерфейсов с IP"
-            rm -f "$TMPFILE"
-            exit 1
-        fi
-        
-        echo ""
-        echo -e "${YELLOW}Выберите интерфейс [1-$TOTAL] или 'all':${NC}"
-        read -r -p "> " sel
-        
-        # Бэкап
-        [ -f "$DHCP_CONF" ] && cp "$DHCP_CONF" "${DHCP_CONF}.bak"
-        
-        # Создаём конфиг
-        cat > "$DHCP_CONF" << 'HEADER'
-# DHCP Configuration - Demo2026
-authoritative;
-default-lease-time 600;
-max-lease-time 7200;
-log-facility local7;
-option domain-name "au-team.irpo";
-
-HEADER
-        
-        SELECTED_IFACES=""
-        
-        generate_subnet() {
-            local data=$1
-            local iface=$(echo "$data" | cut -d'|' -f1)
-            local ip=$(echo "$data" | cut -d'|' -f2)
-            local prefix=$(echo "$data" | cut -d'|' -f3)
-            
-            local mask=$(prefix_to_mask "$prefix")
-            local o1=$(echo "$ip" | cut -d'.' -f1)
-            local o2=$(echo "$ip" | cut -d'.' -f2)
-            local o3=$(echo "$ip" | cut -d'.' -f3)
-            local network="${o1}.${o2}.${o3}.0"
-            local gateway="${o1}.${o2}.${o3}.1"
-            
-            # Диапазон
-            case "$prefix" in
-                26) last=62 ;;
-                27) last=30 ;;
-                28) last=14 ;;
-                29) last=6 ;;
-                *)  last=254 ;;
-            esac
-            local range="${o1}.${o2}.${o3}.2 ${o1}.${o2}.${o3}.${last}"
-            
-            echo "# Interface $iface (/${prefix})"
-            echo "subnet $network netmask $mask {"
-            echo "    range $range;"
-            echo "    option domain-name-servers $gateway;"
-            echo "    option domain-name \"au-team.irpo\";"
-            echo "    option routers $gateway;"
-            echo "}"
-            echo ""
-        }
-        
-        if [ "$sel" = "all" ]; then
-            while IFS= read -r line; do
-                generate_subnet "$line" >> "$DHCP_CONF"
-                iface=$(echo "$line" | cut -d'|' -f1)
-                SELECTED_IFACES="$SELECTED_IFACES $iface"
-            done < "$TMPFILE"
-        else
-            data=$(sed -n "${sel}p" "$TMPFILE")
-            generate_subnet "$data" >> "$DHCP_CONF"
-            SELECTED_IFACES=$(echo "$data" | cut -d'|' -f1)
-        fi
-        
-        rm -f "$TMPFILE"
-        
-        msg_ok "Конфиг создан: $DHCP_CONF"
-        
-        # Интерфейсы
-        if [ -d /etc/sysconfig ]; then
-            echo "DHCPDARGS=\"$SELECTED_IFACES\"" > /etc/sysconfig/dhcpd
-            msg_ok "Интерфейсы: /etc/sysconfig/dhcpd"
-        fi
-        
-        # Показываем
-        echo ""
-        cat "$DHCP_CONF"
-        
-        # Проверка
-        echo ""
-        msg_in "Проверка конфигурации..."
-        dhcpd -t -cf "$DHCP_CONF" 2>&1 && msg_ok "OK" || msg_er "Ошибка!"
-        
-        # Запуск
-        echo ""
-        msg_in "Запуск DHCP..."
-        systemctl stop dhcpd 2>/dev/null
-        systemctl enable --now dhcpd 2>/dev/null || systemctl enable --now dhcp-server 2>/dev/null
-        
-        sleep 2
-        systemctl status dhcpd --no-pager 2>&1 | head -10
-        ;;
-        
-    2)
-        echo ""
-        msg_in "Перезапуск DHCP..."
-        systemctl restart dhcpd 2>/dev/null || systemctl restart dhcp-server 2>/dev/null || systemctl restart isc-dhcp-server 2>/dev/null
-        sleep 2
-        systemctl status dhcpd --no-pager 2>&1 | head -10
-        ;;
-        
-    3)
-        echo ""
-        echo -e "${CYAN}>>> journalctl -u dhcpd -n 30${NC}"
-        journalctl -u dhcpd -n 30 --no-pager 2>/dev/null || journalctl -u dhcp-server -n 30 --no-pager 2>/dev/null
-        ;;
-        
-    4)
-        msg_in "Выход"
-        ;;
-esac
-
-echo ""
-msg_ok "Готово!"
-
+log_info "Готово!"
