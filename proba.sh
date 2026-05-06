@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# FRR OSPF/GRE Setup - MANUAL ONLY VERSION
-# Только ручной ввод сетей
+# FRR OSPF/GRE Setup - PERSISTENT VERSION
+# С автоматическим сохранением GRE туннеля
 #===============================================================================
 
 RED='\033[0;31m'
@@ -12,6 +12,8 @@ NC='\033[0m'
 
 IFACES_DIR="/etc/net/ifaces"
 FRR_CONF="/etc/frr/frr.conf"
+GRE_CONFIG="/etc/sysconfig/gre1"
+RC_LOCAL="/etc/rc.d/rc.local"
 
 if [[ $EUID -ne 0 ]]; then
  echo -e "${RED}Запустите от root${NC}"
@@ -30,6 +32,13 @@ full_cleanup() {
  ip tunnel del gre1 2>/dev/null
  sleep 1
  rm -rf "$IFACES_DIR/gre1" 2>/dev/null
+ rm -f "$GRE_CONFIG" 2>/dev/null
+ 
+ # Удаляем из rc.local
+ if [[ -f "$RC_LOCAL" ]]; then
+  sed -i '/# GRE tunnel/,/ip link set gre1 up/d' "$RC_LOCAL" 2>/dev/null || true
+ fi
+ 
  cat > "$FRR_CONF" << 'EOF'
 frr version 9.0
 frr defaults traditional
@@ -44,7 +53,7 @@ EOF
 
 setup_frr() {
  # Очистка
- echo -e "\n${YELLOW}Очистить старые настройки? [Y/n]:${NC} \c"
+ echo -e "\n${YELLOW}Очистить старые настройки? [Y/n]:${NC} "
  read -r cleanup_ans
  if [[ ! "$cleanup_ans" =~ ^[Nn]$ ]]; then
   full_cleanup
@@ -83,25 +92,28 @@ setup_frr() {
   fi
  done
 
- echo -e "\n${YELLOW}Внешний интерфейс (номер):${NC} \c"
+ echo -e "\n${YELLOW}Внешний интерфейс (номер):${NC} "
  read -r ext_idx
  EXT_IFACE="${IFACE_LIST[$((ext_idx-1))]}"
- EXT_IP=$(ip -4 addr show "$EXT_IFACE" 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
+ EXT_IP=$(ip -4 addr show "$EXT_IFACE" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
  print_ok "Выбран: $EXT_IFACE ($EXT_IP)"
 
- echo -e "${YELLOW}Внешний IP удалённого роутера:${NC} \c"
+ echo -e "${YELLOW}Внешний IP удалённого роутера:${NC} "
  read -r REMOTE_IP
  print_ok "Удалённый IP: $REMOTE_IP"
 
- echo -e "${YELLOW}Локальный IP туннеля [$GRE_IP]:${NC} \c"
+ echo -e "${YELLOW}Локальный IP туннеля [$GRE_IP]:${NC} "
  read -r GRE_INPUT
  GRE_IP="${GRE_INPUT:-$GRE_IP}"
  print_ok "Туннель: $GRE_IP"
 
- # Настройка GRE
- print_msg "Настройка GRE..."
- mkdir -p "$IFACES_DIR/gre1"
+ #===============================================================================
+ # НАСТРОЙКА GRE С СОХРАНЕНИЕМ
+ #===============================================================================
  
+ print_msg "Настройка GRE туннеля..."
+ mkdir -p "$IFACES_DIR/gre1"
+
  cat > "$IFACES_DIR/gre1/options" << EOF
 TYPE=gre
 REMOTE_ADDRESS=$REMOTE_IP
@@ -137,6 +149,51 @@ EOF
 
  sleep 2
 
+ #===============================================================================
+ # СОХРАНЕНИЕ КОНФИГУРАЦИИ GRE ДЛЯ АВТОЗАПУСКА
+ #===============================================================================
+ 
+ print_msg "Сохранение конфигурации для автозагрузки..."
+ 
+ # Создаем конфиг для systemd или rc.local
+ cat > "$GRE_CONFIG" << EOF
+# GRE Tunnel Configuration
+# Auto-generated - DO NOT EDIT
+GRE_LOCAL_IP="$EXT_IP"
+GRE_REMOTE_IP="$REMOTE_IP"
+GRE_TUNNEL_IP="$GRE_IP"
+GRE_TTL=64
+EOF
+ chmod 644 "$GRE_CONFIG"
+ 
+ # Добавляем в rc.local для автозагрузки при старте
+ if [[ ! -f "$RC_LOCAL" ]]; then
+  touch "$RC_LOCAL"
+  chmod +x "$RC_LOCAL"
+ fi
+ 
+ # Удаляем старые записи о GRE если есть
+ sed -i '/# GRE tunnel/,/ip link set gre1 up/d' "$RC_LOCAL" 2>/dev/null || true
+ 
+ # Добавляем новые записи в rc.local
+ cat >> "$RC_LOCAL" << EOF
+
+# GRE tunnel configuration
+# Added by FRR OSPF/GRE Setup - $(date +%Y-%m-%d)
+ip tunnel del gre1 2>/dev/null || true
+sleep 2
+ip tunnel add gre1 mode gre local $EXT_IP remote $REMOTE_IP ttl 64
+ip addr add $GRE_IP dev gre1
+ip link set gre1 up
+sleep 2
+# End GRE tunnel configuration
+
+EOF
+
+ chmod +x "$RC_LOCAL"
+ print_ok "Конфигурация GRE сохранена для автозагрузки"
+
+ # Проверка туннеля
  if ip link show gre1 &>/dev/null; then
   print_ok "✓ Туннель gre1 активирован"
   if [[ "$ROLE" == "HQ-RTR" ]]; then
@@ -155,34 +212,34 @@ EOF
  fi
 
  #===============================================================================
- # РУЧНОЙ ВВОД СЕТЕЙ - ИСПРАВЛЕНО
+ # РУЧНОЙ ВВОД СЕТЕЙ
  #===============================================================================
- 
+
  echo ""
  echo -e "${YELLOW}=== ДОБАВЛЕНИЕ СЕТЕЙ ДЛЯ OSPF ===${NC}"
  echo ""
  echo "Вводите сети в формате: IP/CIDR"
  echo "Примеры:"
- echo "  192.168.10.0/26"
- echo "  192.168.4.0/28"
- echo "  172.16.100.0/29  (сеть туннеля)"
+ echo " 192.168.10.0/26"
+ echo " 192.168.4.0/28"
+ echo " 172.16.100.0/29 (сеть туннеля)"
  echo ""
  echo "Для завершения ввода нажмите Enter"
  echo "=========================================="
- 
+
  NETWORKS=""
- 
+
  while true; do
   read -p "Сеть: " net
-  
+
   # Если пустая строка - завершаем
   if [[ -z "$net" ]]; then
    break
   fi
-  
+
   # Проверка формата
   if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-   NETWORKS+="  network $net area 0"$'\n'
+   NETWORKS+=" network $net area 0"$'\n'
    print_ok "Добавлена: $net"
   else
    print_err "Неверный формат! Используйте IP/CIDR (например, 192.168.10.0/24)"
@@ -194,14 +251,14 @@ EOF
   GRE_NET_BASE=$(echo "$GRE_IP" | cut -d'.' -f1-3)
   GRE_NET_CIDR=$(echo "$GRE_IP" | grep -oP '/\K\d+$' || echo "29")
   GRE_NET="${GRE_NET_BASE}.0/${GRE_NET_CIDR}"
-  NETWORKS="  network $GRE_NET area 0"$'\n'
+  NETWORKS=" network $GRE_NET area 0"$'\n'
   print_warn "Сети не введены. Добавлена только сеть туннеля: $GRE_NET"
  fi
 
  #===============================================================================
  # ПАРОЛЬ И КОНФИГ
  #===============================================================================
- 
+
  echo ""
  read -p "Пароль OSPF [P@ssw0rd]: " PASS
  PASS="${PASS:-P@ssw0rd}"
@@ -217,7 +274,7 @@ EOF
  echo " ip ospf authentication-key $PASS"
  echo " area 0 authentication"
  echo "$NETWORKS"
- 
+
  read -p "Записать конфиг? [Y/n]: " write_ans
  if [[ "$write_ans" =~ ^[Nn]$ ]]; then
   print_err "Отменено!"
@@ -258,33 +315,37 @@ EOF
  # Итоги
  clear
  echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
- echo -e "${GREEN}║ ✅ НАСТРОЙКА ЗАВЕРШЕНА ║${NC}"
+ echo -e "${GREEN}║ ✅ НАСТРОЙКА ЗАВЕРШЕНА                                    ║${NC}"
  echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"
  echo -e "\n${WHITE}ПАРАМЕТРЫ:${NC}"
- echo "  Роль: $ROLE"
- echo "  Router ID: $RID"
- echo "  Туннель: $GRE_IP"
+ echo " Роль: $ROLE"
+ echo " Router ID: $RID"
+ echo " Туннель: $GRE_IP"
  echo ""
  echo -e "${WHITE}OSPF СОСЕДИ:${NC}"
- vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "  Пока нет соседей"
+ vtysh -c "show ip ospf neighbor" 2>/dev/null || echo " Пока нет соседей"
  echo ""
  echo -e "${WHITE}OSPF МАРШРУТЫ:${NC}"
- vtysh -c "show ip route ospf" 2>/dev/null | head -15 || echo "  Пока нет маршрутов"
+ vtysh -c "show ip route ospf" 2>/dev/null | head -15 || echo " Пока нет маршрутов"
  echo ""
  echo -e "${MAGENTA}КОМАНДЫ:${NC}"
- echo "  vtysh -c 'show ip ospf neighbor'"
- echo "  vtysh -c 'show ip route ospf'"
- echo "  vtysh -c 'show running-config ospf'"
+ echo " vtysh -c 'show ip ospf neighbor'"
+ echo " vtysh -c 'show ip route ospf'"
+ echo " vtysh -c 'show running-config ospf'"
+ echo ""
+ echo -e "${YELLOW}ВАЖНО:${NC}"
+ echo " GRE туннель настроен для автозагрузки в $RC_LOCAL"
+ echo " После перезагрузки туннель поднимется автоматически"
  echo ""
 }
 
 # Меню
 clear
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║ FRR OSPF/GRE Setup - MANUAL ║${NC}"
+echo -e "${CYAN}║ FRR OSPF/GRE Setup - PERSISTENT                          ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo " 1) Настроить FRR (ручной ввод сетей)"
+echo " 1) Настроить FRR (с сохранением GRE)"
 echo " 2) Удалить настройки"
 echo " 3) Показать статус"
 echo " 4) Выход"
@@ -302,6 +363,12 @@ case $choice in
   fi
   echo -e "\n${WHITE}=== OSPF соседи ===${NC}"
   vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "OSPF не активен"
+  echo -e "\n${WHITE}=== Автозапуск GRE ===${NC}"
+  if [[ -f "$RC_LOCAL" ]]; then
+   grep -A5 "# GRE tunnel" "$RC_LOCAL" 2>/dev/null || echo "Не настроен"
+  else
+   echo "rc.local не существует"
+  fi
   ;;
  4) exit 0 ;;
  *) setup_frr ;;
