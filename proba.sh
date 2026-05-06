@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ============================================================================
-# DNS Infrastructure Setup Script - IDEAL VERSION
-# Версия: 6.0 (АВТОМАТИЧЕСКИЙ РАСЧЕТ)
+# DNS Infrastructure Setup Script - FINAL CORRECTED VERSION
+# Версия: 6.1 (FIXED BAD DOTTED QUAD)
 # ============================================================================
 
 set -e
@@ -89,7 +89,7 @@ fi
 
 log_info "Обнаружен IP: $LOCAL_IP"
 
-# Разбираем IP на октеты ПРАВИЛЬНО
+# Разбираем IP на октеты
 IP_OCT1=$(echo "$LOCAL_IP" | cut -d'.' -f1)
 IP_OCT2=$(echo "$LOCAL_IP" | cut -d'.' -f2)
 IP_OCT3=$(echo "$LOCAL_IP" | cut -d'.' -f3)
@@ -105,28 +105,37 @@ log_info "Подсеть: ${SUBNET}.0/24"
 REV_ZONE="${IP_OCT3}.${IP_OCT2}.${IP_OCT1}"
 log_info "Обратная зона: ${REV_ZONE}.in-addr.arpa"
 
-# Имя хоста
 HOSTNAME=$(hostname)
 log_info "Имя хоста: $HOSTNAME"
 
 # ============================================================================
-# АВТОМАТИЧЕСКИЙ ИЛИ РУЧНОЙ РЕЖИМ
+# РЕЖИМ ВВОДА (АВТО ИЛИ РУЧНОЙ)
 # ============================================================================
 log_header "Настройка DNS"
 echo ""
 
-read -p "Использовать автоматические значения? [y/N]: " auto_choice
+read -p "Использовать автоматические значения (как на экзамене)? [y/N]: " auto_choice
 
 if [[ "$auto_choice" =~ ^[Yy]$ ]]; then
-    log_info "АВТОМАТИЧЕСКИЙ РЕЖИМ"
+    log_info "АВТОМАТИЧЕСКИЙ РЕЖИМ (по требованиям)"
     
-    # Автоматические значения на основе подсети
-    HQ_RTR_IP="${SUBNET}.1"
-    HQ_SRV_IP="${LOCAL_IP}"
-    BR_RTR_IP="${SUBNET}.5.2"
-    BR_SRV_IP="${SUBNET}.6.2"
-    DOCKER_IP="${SUBNET}.16.5.1"
-    WEB_IP="${SUBNET}.16.6.1"
+    # Используем значения из первого скриншота, т.к. сети разные
+    HQ_RTR_IP="${SUBNET}.4.2"  # Или 192.168.4.2, если подсеть отличается? 
+                               # На скриншоте HQ-RTR был 192.168.4.2, а HQ-SRV 192.168.10.10
+                               # Значит HQ-RTR в другой подсети.
+                               # Сделаем HQ_RTR равным 192.168.4.2 для надежности или адаптируем.
+                               # Если ваш IP 192.168.10.10, то HQ-SRV это вы.
+    
+    # Для экзамена:
+    HQ_SRV_IP="${LOCAL_IP}" # Текущий IP машины
+    HQ_RTR_IP="192.168.4.2" # Шлюз HQ (обычно .1 или .2)
+    BR_RTR_IP="192.168.5.2" # Шлюз BR
+    BR_SRV_IP="192.168.6.2" # Сервер BR
+    
+    # Docker и Web (в сети 172.16, как в задании)
+    DOCKER_IP="172.16.5.1"
+    WEB_IP="172.16.6.1"
+    
     DOMAIN_NAME="au-team.irpo"
     FWD1="77.88.8.8"
     FWD2="77.88.8.1"
@@ -139,27 +148,27 @@ if [[ "$auto_choice" =~ ^[Yy]$ ]]; then
     echo "   Docker: $DOCKER_IP"
     echo "   WEB:    $WEB_IP"
 else
-    log_info "РУЧНОЙ РЕЖИМ - ввод IP (Enter для значения по умолчанию)"
+    log_info "РУЧНОЙ РЕЖИМ (Enter для значения по умолчанию)"
     echo ""
     
-    read -p "IP HQ-RTR [${SUBNET}.1]: " HQ_RTR_IP
-    HQ_RTR_IP=${HQ_RTR_IP:-"${SUBNET}.1"}
-    
+    read -p "IP HQ-RTR [192.168.4.2]: " HQ_RTR_IP
+    HQ_RTR_IP=${HQ_RTR_IP:-"192.168.4.2"}
+
     read -p "IP HQ-SRV [$LOCAL_IP]: " HQ_SRV_IP
     HQ_SRV_IP=${HQ_SRV_IP:-"$LOCAL_IP"}
-    
-    read -p "IP BR-RTR [${SUBNET}.5.2]: " BR_RTR_IP
-    BR_RTR_IP=${BR_RTR_IP:-"${SUBNET}.5.2"}
-    
-    read -p "IP BR-SRV [${SUBNET}.6.2]: " BR_SRV_IP
-    BR_SRV_IP=${BR_SRV_IP:-"${SUBNET}.6.2"}
-    
-    read -p "IP Docker [${SUBNET}.16.5.1]: " DOCKER_IP
-    DOCKER_IP=${DOCKER_IP:-"${SUBNET}.16.5.1"}
-    
-    read -p "IP WEB [${SUBNET}.16.6.1]: " WEB_IP
-    WEB_IP=${WEB_IP:-"${SUBNET}.16.6.1"}
-    
+
+    read -p "IP BR-RTR [192.168.5.2]: " BR_RTR_IP
+    BR_RTR_IP=${BR_RTR_IP:-"192.168.5.2"}
+
+    read -p "IP BR-SRV [192.168.6.2]: " BR_SRV_IP
+    BR_SRV_IP=${BR_SRV_IP:-"192.168.6.2"}
+
+    read -p "IP Docker [172.16.5.1]: " DOCKER_IP
+    DOCKER_IP=${DOCKER_IP:-"172.16.5.1"}
+
+    read -p "IP WEB [172.16.6.1]: " WEB_IP
+    WEB_IP=${WEB_IP:-"172.16.6.1"}
+
     read -p "Домен [au-team.irpo]: " DOMAIN_NAME
     DOMAIN_NAME=${DOMAIN_NAME:-"au-team.irpo"}
     
@@ -299,7 +308,6 @@ EOF
 chown root:named ${CHROOT_ETC}/named.conf
 chmod 640 ${CHROOT_ETC}/named.conf
 
-# Симлинки для systemd
 ln -sf ${CHROOT_ETC}/named.conf /etc/named.conf
 ln -sf ${CHROOT_ETC}/rndc.key /etc/rndc.key
 
@@ -343,6 +351,7 @@ log_info "Прямая зона создана"
 log_step "Создание обратной зоны..."
 
 # Извлекаем последние октеты для PTR записей
+# Внимание: если IP из другой сети (например HQ-RTR), берем его последний октет
 HQ_RTR_PTR=$(echo "$HQ_RTR_IP" | cut -d'.' -f4)
 HQ_SRV_PTR=$(echo "$HQ_SRV_IP" | cut -d'.' -f4)
 
@@ -470,11 +479,19 @@ fi
 
 echo ""
 echo "=== named-checkzone (прямая) ==="
-named-checkzone -t ${CHROOT_DIR} $DOMAIN_NAME /var/named/master/$DOMAIN_NAME.db
+if named-checkzone -t ${CHROOT_DIR} $DOMAIN_NAME /var/named/master/$DOMAIN_NAME.db; then
+    log_info "✓ Прямая зона валидна!"
+else
+    log_error "✗ Ошибка в прямой зоне!"
+fi
 
 echo ""
 echo "=== named-checkzone (обратная) ==="
-named-checkzone -t ${CHROOT_DIR} ${REV_ZONE}.in-addr.arpa /var/named/master/${DOMAIN_NAME}_rev.db
+if named-checkzone -t ${CHROOT_DIR} ${REV_ZONE}.in-addr.arpa /var/named/master/${DOMAIN_NAME}_rev.db; then
+    log_info "✓ Обратная зона валидна!"
+else
+    log_error "✗ Ошибка в обратной зоне!"
+fi
 
 # ============================================================================
 # FIREWALL
