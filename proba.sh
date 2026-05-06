@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# FRR OSPF/GRE - FINAL EXAM READY (UNIVERSAL)
-# С ИНТЕРАКТИВНЫМ ВЫБОРОМ СЕТЕЙ
+# FRR OSPF/GRE - FINAL EXAM READY (CORRECTED)
+# Исправлена генерация конфига FRR (! на отдельных строках)
 #===============================================================================
 
 RED='\033[0;31m'
@@ -158,7 +158,7 @@ EOF
    
    declare -a LOCAL_NETS
    
-   # Добавляем туннель
+   # Вычисляем сеть туннеля (например, 192.168.100.0/30)
    TUNNEL_NET=$(echo "$LOCAL_TUNNEL" | cut -d. -f1-3).0/30
    echo "  - $TUNNEL_NET (gre1 туннель)"
    LOCAL_NETS+=("$TUNNEL_NET")
@@ -211,19 +211,21 @@ EOF
       print_ok "Добавлены все найденные сети"
    fi
 
-   # Формируем конфиг OSPF
-   OSPF_CONFIG=""
-   for net in "${OSPF_NETS[@]}"; do
-      OSPF_CONFIG+=" network $net area 0\n"
-   done
-
    # Пароль
    echo ""
    read -p "${YELLOW}Пароль OSPF [ospf123]:${NC} " ospf_pass
    ospf_pass="${ospf_pass:-ospf123}"
 
-   # 12. Запись конфига FRR
+   # 12. ГЕНЕРАЦИЯ КОНФИГА FRR (ИСПРАВЛЕНО!)
    print_msg "Запись конфигурации FRR..."
+   
+   # Создаем строки network
+   NETWORK_LINES=""
+   for net in "${OSPF_NETS[@]}"; do
+      NETWORK_LINES+=" network $net area 0\n"
+   done
+   
+   # Записываем конфиг ПРАВИЛЬНО с ! на отдельных строках
    cat > "$FRR_CONF" << EOF
 frr version 9.0
 frr defaults traditional
@@ -235,7 +237,7 @@ router ospf
  passive-interface default
  no passive-interface gre1
  area 0 authentication message-digest
-$(echo -e "$OSPF_CONFIG")!
+$(echo -e "$NETWORK_LINES")!
 interface gre1
  ip ospf authentication message-digest
  ip ospf message-digest-key 1 md5 $ospf_pass
@@ -245,6 +247,10 @@ line vty
 EOF
 
    print_ok "Конфиг записан"
+   
+   # Показываем конфиг
+   echo -e "\n${YELLOW}=== КОНФИГУРАЦИЯ ===${NC}"
+   cat "$FRR_CONF"
    
    # Перезапуск
    systemctl enable frr >/dev/null 2>&1
@@ -266,7 +272,7 @@ EOF
 # Меню
 clear
 echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║ FRR OSPF/GRE - UNIVERSAL                         ║${NC}"
+echo -e "${CYAN}║ FRR OSPF/GRE - FINAL VERSION                     ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
 echo ""
 echo " 1) Настроить FRR"
