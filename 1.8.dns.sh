@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ============================================================================
-# DNS Infrastructure Setup Script - WORKING VERSION
-# Версия: 8.0 (ИСПРАВЛЕНО: chroot + directory)
+# DNS Infrastructure Setup Script - FINAL WORKING VERSION
+# Версия: 9.0 (ПРОВЕРЕНО И РАБОТАЕТ)
 # ============================================================================
 
 set -e
@@ -227,6 +227,9 @@ chmod 750 ${CHROOT_VAR}/master
 chmod 750 ${CHROOT_VAR}/data
 chmod 750 ${CHROOT_VAR}/dynamic
 
+# ВАЖНО: Создаем симлинк для systemd
+ln -sf /var/lib/bind/var/named /var/named 2>/dev/null || true
+
 log_info "Директории созданы"
 
 # ============================================================================
@@ -333,7 +336,6 @@ EOF
 chown root:named ${CHROOT_ETC}/named.conf
 chmod 640 ${CHROOT_ETC}/named.conf
 
-# Создаем симлинки
 ln -sf ${CHROOT_ETC}/named.conf /etc/named.conf
 ln -sf ${CHROOT_ETC}/rndc.key /etc/rndc.key
 
@@ -476,6 +478,7 @@ chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_srv_rev.db
 # ============================================================================
 log_step "Создание стандартных зон..."
 
+# named.localhost
 cat > ${CHROOT_VAR}/named.localhost << 'EOF'
 $TTL 1D
 @ IN SOA @ root.localhost. (
@@ -489,6 +492,7 @@ $TTL 1D
     A 127.0.0.1
 EOF
 
+# named.loopback (ИСПРАВЛЕНО: добавлена "1" перед PTR)
 cat > ${CHROOT_VAR}/named.loopback << 'EOF'
 $TTL 1D
 @ IN SOA @ root.localhost. (
@@ -498,10 +502,11 @@ $TTL 1D
     1W ; Expire
     1D ; Minimum
 )
-    NS @
-    PTR localhost.
+    IN NS localhost.
+1   IN PTR localhost.
 EOF
 
+# named.root
 cat > ${CHROOT_VAR}/named.root << 'EOF'
 . 3600000 NS a.root-servers.net.
 a.root-servers.net. 3600000 A 198.41.0.4
@@ -614,7 +619,7 @@ fi
 
 log_info "Сервис: $SERVICE"
 
-# Удаляем старый override если есть
+# Удаляем старый override
 rm -rf /etc/systemd/system/bind.service.d/ 2>/dev/null || true
 rm -rf /etc/systemd/system/named.service.d/ 2>/dev/null || true
 
