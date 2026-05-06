@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # ============================================================================
-# DNS Infrastructure Setup Script for Demo-2026
-# Версия: 5.0 (ПОЛНОСТЬЮ РАБОЧИЙ)
+# DNS Infrastructure Setup Script - IDEAL VERSION
+# Версия: 6.0 (АВТОМАТИЧЕСКИЙ РАСЧЕТ)
 # ============================================================================
 
 set -e
 
-# Цвета для вывода
+# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -19,9 +19,8 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
-log_header() { echo -e "${CYAN}\n============================================${NC}"; echo -e "${CYAN}$1${NC}"; echo -e "${CYAN}============================================${NC}\n"; }
+log_header() { echo -e "\n${CYAN}============================================${NC}"; echo -e "${CYAN}$1${NC}"; echo -e "${CYAN}============================================${NC}\n"; }
 
-# Проверка прав root
 if [ "$EUID" -ne 0 ]; then
     log_error "Запустите скрипт от имени root!"
     exit 1
@@ -30,25 +29,20 @@ fi
 log_header "DNS Infrastructure Setup Script"
 
 # ============================================================================
-# ПОЛНАЯ ОЧИСТКА СТАРЫХ КОНФИГУРАЦИЙ
+# ОЧИСТКА
 # ============================================================================
 log_step "=== ОЧИСТКА СТАРЫХ КОНФИГУРАЦИЙ ==="
-
 echo ""
 log_warn "ВНИМАНИЕ: Будут удалены все старые конфигурации DNS!"
 read -p "Продолжить очистку? [y/N]: " clean_confirm
 if [[ "$clean_confirm" =~ ^[Yy]$ ]]; then
-    log_info "Остановка сервисов..."
     systemctl stop named 2>/dev/null || true
     systemctl stop bind 2>/dev/null || true
     
-    log_info "Удаление старых файлов в chroot..."
     rm -rf /var/lib/bind/etc/named.conf 2>/dev/null || true
     rm -rf /var/lib/bind/var/named/master/*.db 2>/dev/null || true
     rm -rf /var/lib/bind/var/named/data/* 2>/dev/null || true
     rm -rf /var/lib/bind/var/named/dynamic/* 2>/dev/null || true
-    
-    log_info "Удаление старых конфигов в /etc..."
     rm -f /etc/named.conf 2>/dev/null || true
     rm -f /etc/rndc.key 2>/dev/null || true
     
@@ -59,154 +53,157 @@ else
 fi
 
 # ============================================================================
-# Определение ОС и установка пакетов
+# УСТАНОВКА ПАКЕТОВ
 # ============================================================================
-log_step "Определение ОС и установка BIND..."
+log_step "Установка BIND..."
 
 if [ -f /etc/altlinux-release ]; then
-    OS_VERSION=$(cat /etc/altlinux-release | grep -oP '\d+\.\d+' | head -1)
-    log_info "Обнаружен ALT Linux версии: $OS_VERSION"
     apt-get update
     apt-get install -y bind bind-utils
-    log_info "BIND установлен успешно"
+    log_info "BIND установлен"
 else
-    log_error "Поддерживается только ALT Linux"
+    log_error "Только ALT Linux поддерживается"
     exit 1
 fi
 
 # ============================================================================
-# Переменные для chroot
+# ПЕРЕМЕННЫЕ
 # ============================================================================
 CHROOT_DIR="/var/lib/bind"
 CHROOT_ETC="${CHROOT_DIR}/etc"
 CHROOT_VAR="${CHROOT_DIR}/var/named"
 
 # ============================================================================
-# Автоопределение сети
+# АВТООПРЕДЕЛЕНИЕ IP И ПОДСЕТИ
 # ============================================================================
-log_step "Автоопределение параметров сети..."
+log_step "Автоопределение сетевых параметров..."
 echo ""
 
-# Автоопределение локального IP
-LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
-log_info "Обнаружен локальный IP: $LOCAL_IP"
+# Получаем локальный IP (первый не 127.0.0.1)
+LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d{1,3}(\.\d{1,3}){3}' | grep -v '127.0.0.1' | head -1)
 
-# Определение подсети
-SUBNET=$(echo "$LOCAL_IP" | cut -d'.' -f1-3)
-log_info "Подсеть: $SUBNET.x"
+if [ -z "$LOCAL_IP" ]; then
+    log_error "Не удалось определить IP-адрес!"
+    exit 1
+fi
 
-# Определение имени хоста
+log_info "Обнаружен IP: $LOCAL_IP"
+
+# Разбираем IP на октеты ПРАВИЛЬНО
+IP_OCT1=$(echo "$LOCAL_IP" | cut -d'.' -f1)
+IP_OCT2=$(echo "$LOCAL_IP" | cut -d'.' -f2)
+IP_OCT3=$(echo "$LOCAL_IP" | cut -d'.' -f3)
+IP_OCT4=$(echo "$LOCAL_IP" | cut -d'.' -f4)
+
+log_info "Октеты IP: $IP_OCT1.$IP_OCT2.$IP_OCT3.$IP_OCT4"
+
+# Подсеть (первые 3 октета)
+SUBNET="${IP_OCT1}.${IP_OCT2}.${IP_OCT3}"
+log_info "Подсеть: ${SUBNET}.0/24"
+
+# ОБРАТНАЯ ЗОНА (переворачиваем первые 3 октета)
+REV_ZONE="${IP_OCT3}.${IP_OCT2}.${IP_OCT1}"
+log_info "Обратная зона: ${REV_ZONE}.in-addr.arpa"
+
+# Имя хоста
 HOSTNAME=$(hostname)
 log_info "Имя хоста: $HOSTNAME"
 
 # ============================================================================
-# ВАЖНО: Правильное вычисление обратной зоны
+# АВТОМАТИЧЕСКИЙ ИЛИ РУЧНОЙ РЕЖИМ
 # ============================================================================
-OCT1=$(echo "$SUBNET" | cut -d'.' -f1)
-OCT2=$(echo "$SUBNET" | cut -d'.' -f2)
-OCT3=$(echo "$SUBNET" | cut -d'.' -f3)
-REV_ZONE="${OCT3}.${OCT2}.${OCT1}"
-
-log_info "Октеты: $OCT1.$OCT2.$OCT3"
-log_info "Обратная зона: $REV_ZONE.in-addr.arpa"
-
-# ============================================================================
-# Интерактивный ввод с возможностью пропуска
-# ============================================================================
-echo ""
-log_header "Настройка DNS сервера"
+log_header "Настройка DNS"
 echo ""
 
-# Возможность пропуска ввода
-read -p "Использовать автоматические значения для всех IP? [y/N]: " auto_choice
+read -p "Использовать автоматические значения? [y/N]: " auto_choice
+
 if [[ "$auto_choice" =~ ^[Yy]$ ]]; then
-    log_info "Используем автоматические значения..."
-    HQ_RTR_IP="$SUBNET.1"
-    HQ_SRV_IP="$LOCAL_IP"
-    BR_RTR_IP="$SUBNET.5.2"
-    BR_SRV_IP="$SUBNET.6.2"
-    DOCKER_IP="$SUBNET.16.5.1"
-    WEB_IP="$SUBNET.16.6.1"
+    log_info "АВТОМАТИЧЕСКИЙ РЕЖИМ"
+    
+    # Автоматические значения на основе подсети
+    HQ_RTR_IP="${SUBNET}.1"
+    HQ_SRV_IP="${LOCAL_IP}"
+    BR_RTR_IP="${SUBNET}.5.2"
+    BR_SRV_IP="${SUBNET}.6.2"
+    DOCKER_IP="${SUBNET}.16.5.1"
+    WEB_IP="${SUBNET}.16.6.1"
     DOMAIN_NAME="au-team.irpo"
     FWD1="77.88.8.8"
     FWD2="77.88.8.1"
+    
+    log_info "Сгенерированы IP:"
+    echo "   HQ-RTR: $HQ_RTR_IP"
+    echo "   HQ-SRV: $HQ_SRV_IP"
+    echo "   BR-RTR: $BR_RTR_IP"
+    echo "   BR-SRV: $BR_SRV_IP"
+    echo "   Docker: $DOCKER_IP"
+    echo "   WEB:    $WEB_IP"
 else
-    # Ввод IP-адресов устройств с дефолтными значениями
-    read -p "IP-адрес HQ-RTR [$SUBNET.1]: " HQ_RTR_IP
-    HQ_RTR_IP=${HQ_RTR_IP:-"$SUBNET.1"}
-
-    read -p "IP-адрес HQ-SRV [$LOCAL_IP]: " HQ_SRV_IP
-    HQ_SRV_IP=${HQ_SRV_IP:-"$LOCAL_IP"}
-
-    read -p "IP-адрес BR-RTR [$SUBNET.5.2]: " BR_RTR_IP
-    BR_RTR_IP=${BR_RTR_IP:-"$SUBNET.5.2"}
-
-    read -p "IP-адрес BR-SRV [$SUBNET.6.2]: " BR_SRV_IP
-    BR_SRV_IP=${BR_SRV_IP:-"$SUBNET.6.2"}
-
-    read -p "IP-адрес Docker [$SUBNET.16.5.1]: " DOCKER_IP
-    DOCKER_IP=${DOCKER_IP:-"$SUBNET.16.5.1"}
-
-    read -p "IP-адрес WEB [$SUBNET.16.6.1]: " WEB_IP
-    WEB_IP=${WEB_IP:-"$SUBNET.16.6.1"}
-
-    # Доменное имя
-    read -p "Доменное имя [au-team.irpo]: " DOMAIN_NAME
-    DOMAIN_NAME=${DOMAIN_NAME:-"au-team.irpo"}
-
-    # Выбор DNS-серверов пересылки
+    log_info "РУЧНОЙ РЕЖИМ - ввод IP (Enter для значения по умолчанию)"
     echo ""
-    log_info "Выбор DNS-серверов пересылки (forwarders):"
-    echo "1) Яндекс DNS (77.88.8.8, 77.88.8.1)"
-    echo "2) Яндекс DNS альтернативные (77.88.8.7, 77.88.8.3)"
-    echo "3) Google DNS (8.8.8.8, 8.8.4.4)"
-    echo "4) Cloudflare (1.1.1.1, 1.0.0.1)"
-
-    read -p "Выбор [1]: " FWD_CHOICE
-    FWD_CHOICE=${FWD_CHOICE:-1}
-
-    case $FWD_CHOICE in
-        1) FWD1="77.88.8.8"; FWD2="77.88.8.1" ;;
-        2) FWD1="77.88.8.7"; FWD2="77.88.8.3" ;;
-        3) FWD1="8.8.8.8"; FWD2="8.8.4.4" ;;
-        4) FWD1="1.1.1.1"; FWD2="1.0.0.1" ;;
+    
+    read -p "IP HQ-RTR [${SUBNET}.1]: " HQ_RTR_IP
+    HQ_RTR_IP=${HQ_RTR_IP:-"${SUBNET}.1"}
+    
+    read -p "IP HQ-SRV [$LOCAL_IP]: " HQ_SRV_IP
+    HQ_SRV_IP=${HQ_SRV_IP:-"$LOCAL_IP"}
+    
+    read -p "IP BR-RTR [${SUBNET}.5.2]: " BR_RTR_IP
+    BR_RTR_IP=${BR_RTR_IP:-"${SUBNET}.5.2"}
+    
+    read -p "IP BR-SRV [${SUBNET}.6.2]: " BR_SRV_IP
+    BR_SRV_IP=${BR_SRV_IP:-"${SUBNET}.6.2"}
+    
+    read -p "IP Docker [${SUBNET}.16.5.1]: " DOCKER_IP
+    DOCKER_IP=${DOCKER_IP:-"${SUBNET}.16.5.1"}
+    
+    read -p "IP WEB [${SUBNET}.16.6.1]: " WEB_IP
+    WEB_IP=${WEB_IP:-"${SUBNET}.16.6.1"}
+    
+    read -p "Домен [au-team.irpo]: " DOMAIN_NAME
+    DOMAIN_NAME=${DOMAIN_NAME:-"au-team.irpo"}
+    
+    echo ""
+    log_info "Forwarders:"
+    echo "1) Яндекс (77.88.8.8, 77.88.8.1)"
+    echo "2) Google (8.8.8.8, 8.8.4.4)"
+    echo "3) Cloudflare (1.1.1.1, 1.0.0.1)"
+    read -p "Выбор [1]: " fwd_choice
+    case $fwd_choice in
+        2) FWD1="8.8.8.8"; FWD2="8.8.4.4" ;;
+        3) FWD1="1.1.1.1"; FWD2="1.0.0.1" ;;
         *) FWD1="77.88.8.8"; FWD2="77.88.8.1" ;;
     esac
 fi
 
 # ============================================================================
-# Сводка конфигурации
+# СВОДКА
 # ============================================================================
-log_header "Сводка конфигурации"
-
-echo "Домен:              $DOMAIN_NAME"
-echo "HQ-RTR:             $HQ_RTR_IP"
-echo "HQ-SRV:             $HQ_SRV_IP"
-echo "BR-RTR:             $BR_RTR_IP"
-echo "BR-SRV:             $BR_SRV_IP"
-echo "Docker:             $DOCKER_IP"
-echo "WEB:                $WEB_IP"
-echo "Reverse Zone:       $REV_ZONE.in-addr.arpa"
-echo "Forwarders:         $FWD1, $FWD2"
+log_header "Конфигурация"
+echo "Домен:         $DOMAIN_NAME"
+echo "HQ-RTR:        $HQ_RTR_IP"
+echo "HQ-SRV:        $HQ_SRV_IP"
+echo "BR-RTR:        $BR_RTR_IP"
+echo "BR-SRV:        $BR_SRV_IP"
+echo "Docker:        $DOCKER_IP"
+echo "WEB:           $WEB_IP"
+echo "Reverse Zone:  ${REV_ZONE}.in-addr.arpa"
+echo "Forwarders:    $FWD1, $FWD2"
 echo ""
 
-read -p "Всё верно? Продолжить? [y/N]: " confirm
+read -p "Продолжить? [y/N]: " confirm
 if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-    log_error "Отменено пользователем"
+    log_error "Отменено"
     exit 1
 fi
 
 # ============================================================================
-# Создание структуры директорий в chroot
+# СОЗДАНИЕ ДИРЕКТОРИЙ
 # ============================================================================
-log_step "Создание структуры директорий в chroot-окружении..."
+log_step "Создание структуры директорий..."
 
 mkdir -p ${CHROOT_ETC}
-mkdir -p ${CHROOT_VAR}
-mkdir -p ${CHROOT_VAR}/master
-mkdir -p ${CHROOT_VAR}/data
-mkdir -p ${CHROOT_VAR}/dynamic
-mkdir -p ${CHROOT_VAR}/slaves
+mkdir -p ${CHROOT_VAR}/{master,data,dynamic,slaves}
 
 chown -R named:named ${CHROOT_DIR}
 chmod 750 ${CHROOT_VAR}
@@ -214,10 +211,10 @@ chmod 750 ${CHROOT_VAR}/master
 chmod 750 ${CHROOT_VAR}/data
 chmod 750 ${CHROOT_VAR}/dynamic
 
-log_info "Директории в chroot созданы"
+log_info "Директории созданы"
 
 # ============================================================================
-# Генерация rndc ключа
+# RNDC KEY
 # ============================================================================
 log_step "Генерация rndc ключа..."
 
@@ -228,7 +225,6 @@ fi
 if [ -f /etc/rndc.key ]; then
     chown root:named /etc/rndc.key
     chmod 640 /etc/rndc.key
-    # Копируем в chroot
     cp /etc/rndc.key ${CHROOT_ETC}/rndc.key
     chown named:named ${CHROOT_ETC}/rndc.key
     chmod 640 ${CHROOT_ETC}/rndc.key
@@ -236,15 +232,14 @@ if [ -f /etc/rndc.key ]; then
 fi
 
 # ============================================================================
-# Создание named.conf в chroot
+# NAMED.CONF
 # ============================================================================
-log_step "Создание ${CHROOT_ETC}/named.conf..."
+log_step "Создание named.conf..."
 
-log_info "Используем обратную зону: $REV_ZONE.in-addr.arpa"
+log_info "Обратная зона: ${REV_ZONE}.in-addr.arpa"
 
 cat > ${CHROOT_ETC}/named.conf << EOF
 // DNS Configuration for $DOMAIN_NAME
-// Generated by setup script for chroot environment
 
 options {
     listen-on port 53 { 127.0.0.1; $HQ_SRV_IP; };
@@ -273,21 +268,18 @@ controls {
     inet 127.0.0.1 allow { localhost; } keys { "rndc-key"; };
 };
 
-// Прямая зона
 zone "$DOMAIN_NAME" IN {
     type master;
     file "master/$DOMAIN_NAME.db";
     allow-update { none; };
 };
 
-// Обратная зона
-zone "$REV_ZONE.in-addr.arpa" IN {
+zone "${REV_ZONE}.in-addr.arpa" IN {
     type master;
     file "master/${DOMAIN_NAME}_rev.db";
     allow-update { none; };
 };
 
-// Стандартные зоны
 zone "localhost" IN {
     type master;
     file "named.localhost";
@@ -302,22 +294,21 @@ zone "." IN {
     type hint;
     file "named.root";
 };
-
 EOF
 
 chown root:named ${CHROOT_ETC}/named.conf
 chmod 640 ${CHROOT_ETC}/named.conf
 
-# Создаем симлинк для systemd
+# Симлинки для systemd
 ln -sf ${CHROOT_ETC}/named.conf /etc/named.conf
 ln -sf ${CHROOT_ETC}/rndc.key /etc/rndc.key
 
-log_info "named.conf создан в chroot"
+log_info "named.conf создан"
 
 # ============================================================================
-# Создание файла прямой зоны
+# ПРЯМАЯ ЗОНА
 # ============================================================================
-log_step "Создание прямой зоны в chroot..."
+log_step "Создание прямой зоны..."
 
 SERIAL=$(date +%Y%m%d01)
 
@@ -331,33 +322,31 @@ cat > ${CHROOT_VAR}/master/$DOMAIN_NAME.db << EOF
     86400 ; Minimum TTL
 )
 
-; NS запись
 @ IN NS hq-srv.$DOMAIN_NAME.
 
-; A записи
 hq-rtr IN A $HQ_RTR_IP
 br-rtr IN A $BR_RTR_IP
 hq-srv IN A $HQ_SRV_IP
 br-srv IN A $BR_SRV_IP
 docker IN A $DOCKER_IP
 web IN A $WEB_IP
-
 EOF
 
 chown root:named ${CHROOT_VAR}/master/$DOMAIN_NAME.db
 chmod 0640 ${CHROOT_VAR}/master/$DOMAIN_NAME.db
 
-log_info "Файл прямой зоны создан: ${CHROOT_VAR}/master/$DOMAIN_NAME.db"
+log_info "Прямая зона создана"
 
 # ============================================================================
-# Создание файла обратной зоны
+# ОБРАТНАЯ ЗОНА
 # ============================================================================
-log_step "Создание обратной зоны в chroot..."
+log_step "Создание обратной зоны..."
 
+# Извлекаем последние октеты для PTR записей
 HQ_RTR_PTR=$(echo "$HQ_RTR_IP" | cut -d'.' -f4)
 HQ_SRV_PTR=$(echo "$HQ_SRV_IP" | cut -d'.' -f4)
 
-log_info "Создание PTR записей: $HQ_RTR_PTR -> hq-rtr, $HQ_SRV_PTR -> hq-srv"
+log_info "PTR записи: $HQ_RTR_PTR -> hq-rtr, $HQ_SRV_PTR -> hq-srv"
 
 cat > ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db << EOF
 \$TTL 86400
@@ -369,24 +358,21 @@ cat > ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db << EOF
     86400 ; Minimum TTL
 )
 
-; NS запись
 @ IN NS hq-srv.$DOMAIN_NAME.
 
-; PTR записи
 $HQ_RTR_PTR IN PTR hq-rtr.$DOMAIN_NAME.
 $HQ_SRV_PTR IN PTR hq-srv.$DOMAIN_NAME.
-
 EOF
 
 chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
 chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
 
-log_info "Файл обратной зоны создан: ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db"
+log_info "Обратная зона создана"
 
 # ============================================================================
-# Создание стандартных зон
+# СТАНДАРТНЫЕ ЗОНЫ
 # ============================================================================
-log_step "Создание стандартных зон в chroot..."
+log_step "Создание стандартных зон..."
 
 if [ ! -f ${CHROOT_VAR}/named.localhost ]; then
     cat > ${CHROOT_VAR}/named.localhost << 'EOF'
@@ -439,12 +425,12 @@ chown named:named ${CHROOT_VAR}/named.localhost
 chown named:named ${CHROOT_VAR}/named.loopback
 chown named:named ${CHROOT_VAR}/named.root
 
-log_info "Стандартные зоны созданы в chroot"
+log_info "Стандартные зоны созданы"
 
 # ============================================================================
-# Финальные права доступа
+# ПРАВА ДОСТУПА
 # ============================================================================
-log_step "Установка финальных прав в chroot..."
+log_step "Установка прав доступа..."
 
 chown named:named ${CHROOT_VAR}/data
 chown named:named ${CHROOT_VAR}/dynamic
@@ -454,23 +440,23 @@ chmod 750 ${CHROOT_VAR}/dynamic
 touch ${CHROOT_VAR}/data/named.run 2>/dev/null || true
 chown named:named ${CHROOT_VAR}/data/named.run 2>/dev/null || true
 
-log_info "Права в chroot установлены"
+log_info "Права установлены"
 
 # ============================================================================
-# Обновление chroot
+# ОБНОВЛЕНИЕ CHROOT
 # ============================================================================
-log_step "Обновление chroot-окружения..."
+log_step "Обновление chroot..."
 update_chrooted named || true
-log_info "Chroot-окружение обновлено"
+log_info "Chroot обновлен"
 
 # ============================================================================
-# ПРОВЕРКА КОНФИГУРАЦИИ
+# ПРОВЕРКА
 # ============================================================================
 log_step "Проверка конфигурации..."
 echo ""
 
-log_info "Проверка переменной REV_ZONE: $REV_ZONE"
-log_info "Полное имя обратной зоны: $REV_ZONE.in-addr.arpa"
+log_info "REV_ZONE: $REV_ZONE"
+log_info "Полное имя: ${REV_ZONE}.in-addr.arpa"
 
 echo ""
 echo "=== named-checkconf ==="
@@ -483,15 +469,15 @@ else
 fi
 
 echo ""
-echo "=== named-checkzone (прямая зона) ==="
+echo "=== named-checkzone (прямая) ==="
 named-checkzone -t ${CHROOT_DIR} $DOMAIN_NAME /var/named/master/$DOMAIN_NAME.db
 
 echo ""
-echo "=== named-checkzone (обратная зона) ==="
-named-checkzone -t ${CHROOT_DIR} $REV_ZONE.in-addr.arpa /var/named/master/${DOMAIN_NAME}_rev.db
+echo "=== named-checkzone (обратная) ==="
+named-checkzone -t ${CHROOT_DIR} ${REV_ZONE}.in-addr.arpa /var/named/master/${DOMAIN_NAME}_rev.db
 
 # ============================================================================
-# Настройка firewall
+# FIREWALL
 # ============================================================================
 log_step "Настройка firewall..."
 
@@ -509,7 +495,7 @@ iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || \
 log_info "Firewall настроен"
 
 # ============================================================================
-# Настройка resolv.conf
+# RESOLV.CONF
 # ============================================================================
 log_step "Настройка /etc/resolv.conf..."
 
@@ -524,7 +510,7 @@ EOF
 log_info "resolv.conf настроен"
 
 # ============================================================================
-# Запуск BIND
+# ЗАПУСК BIND
 # ============================================================================
 log_step "Запуск BIND..."
 
@@ -536,7 +522,7 @@ else
     SERVICE="named"
 fi
 
-log_info "Используем сервис: $SERVICE"
+log_info "Сервис: $SERVICE"
 
 systemctl enable $SERVICE
 systemctl restart $SERVICE
@@ -544,7 +530,7 @@ sleep 3
 
 echo ""
 if systemctl is-active --quiet $SERVICE; then
-    log_info "✓ BIND запущен успешно!"
+    log_info "✓ BIND запущен!"
 else
     log_error "✗ BIND не запустился!"
     systemctl status $SERVICE
@@ -553,7 +539,7 @@ else
 fi
 
 # ============================================================================
-# Тестирование DNS
+# ТЕСТИРОВАНИЕ
 # ============================================================================
 log_step "Тестирование DNS..."
 echo ""
@@ -580,32 +566,30 @@ for ip in $HQ_RTR_IP $HQ_SRV_IP; do
 done
 
 # ============================================================================
-# ИТОГОВАЯ СВОДКА
+# ИТОГИ
 # ============================================================================
-log_header "НАСТРОЙКА DNS ЗАВЕРШЕНА!"
+log_header "НАСТРОЙКА ЗАВЕРШЕНА!"
 
-echo "✅ DNS сервер успешно настроен и запущен!"
+echo "✅ DNS сервер настроен и работает!"
 echo ""
 echo "📋 КОНФИГУРАЦИЯ:"
-echo "   Домен:              $DOMAIN_NAME"
-echo "   Обратная зона:      $REV_ZONE.in-addr.arpa"
-echo "   DNS сервер:         $HQ_SRV_IP"
-echo "   Forwarders:         $FWD1, $FWD2"
+echo "   Домен:           $DOMAIN_NAME"
+echo "   Обратная зона:   ${REV_ZONE}.in-addr.arpa"
+echo "   DNS сервер:      $HQ_SRV_IP"
+echo "   Forwarders:      $FWD1, $FWD2"
 echo ""
 echo "📁 ФАЙЛЫ:"
-echo "   Главный конфиг:     /var/lib/bind/etc/named.conf"
-echo "   Прямая зона:        /var/lib/bind/var/named/master/$DOMAIN_NAME.db"
-echo "   Обратная зона:      /var/lib/bind/var/named/master/${DOMAIN_NAME}_rev.db"
+echo "   Главный конфиг:  /var/lib/bind/etc/named.conf"
+echo "   Прямая зона:     /var/lib/bind/var/named/master/$DOMAIN_NAME.db"
+echo "   Обратная зона:   /var/lib/bind/var/named/master/${DOMAIN_NAME}_rev.db"
 echo ""
-echo "🔧 ПОЛЕЗНЫЕ КОМАНДЫ:"
+echo "🔧 КОМАНДЫ:"
 echo "   systemctl status $SERVICE"
 echo "   systemctl restart $SERVICE"
 echo "   dig @localhost hq-srv.$DOMAIN_NAME +short"
 echo "   dig @localhost -x $HQ_SRV_IP +short"
-echo "   named-checkconf -t /var/lib/bind /etc/named.conf"
-echo "   rndc status"
 echo ""
-echo " ЗАПИСИ В DNS:"
+echo "📝 DNS ЗАПИСИ:"
 echo "   hq-rtr.$DOMAIN_NAME -> $HQ_RTR_IP"
 echo "   hq-srv.$DOMAIN_NAME -> $HQ_SRV_IP"
 echo "   br-rtr.$DOMAIN_NAME -> $BR_RTR_IP"
