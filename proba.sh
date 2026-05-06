@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# FRR OSPF/GRE - FINAL EXAM READY (CORRECTED)
-# Исправлена генерация конфига FRR (! на отдельных строках)
+# FRR OSPF/GRE - FINAL CORRECTED VERSION
+# Исправлена генерация конфига (! на отдельных строках)
 #===============================================================================
 
 RED='\033[0;31m'
@@ -24,7 +24,7 @@ print_ok() { echo -e "${GREEN}[✓]${NC} $1"; }
 print_err() { echo -e "${RED}[✗]${NC} $1"; }
 
 full_cleanup() {
-   print_msg "Полная очистка настроек..."
+   print_msg "Очистка настроек..."
    ip link set gre1 down 2>/dev/null
    sleep 1
    ip tunnel del gre1 2>/dev/null
@@ -39,16 +39,14 @@ line vty
 !
 EOF
    systemctl restart frr 2>/dev/null || true
-   print_ok "Очистка завершена"
+   print_ok "Очищено"
 }
 
 setup_frr() {
-   # 1. Очистка
    echo -e "\n${YELLOW}Очистить старые настройки? [Y/n]:${NC} "
    read -r cleanup_ans
    [[ ! "$cleanup_ans" =~ ^[Nn]$ ]] && full_cleanup && sleep 1
 
-   # 2. Проверка FRR
    if ! command -v vtysh &>/dev/null; then
       print_msg "Установка FRR..."
       apt-get update >/dev/null 2>&1
@@ -56,7 +54,6 @@ setup_frr() {
       print_ok "FRR установлен"
    fi
 
-   # 3. Роль
    HOST=$(hostname | tr '[:upper:]' '[:lower:]')
    if [[ "$HOST" =~ "hq" ]]; then
       ROLE="HQ"; RID="1.1.1.1"
@@ -67,7 +64,6 @@ setup_frr() {
    fi
    print_ok "Роль: $ROLE, Router ID: $RID"
 
-   # 4. Интерфейсы
    echo -e "\n${YELLOW}=== ИНТЕРФЕЙСЫ ===${NC}"
    i=1
    declare -a IFACES
@@ -88,19 +84,16 @@ setup_frr() {
       fi
    done
 
-   # 5. Выбор внешнего
    echo ""
    read -p "${YELLOW}Номер внешнего интерфейса:${NC} " ext_idx
    EXT_IFACE="${IFACES[$((ext_idx-1))]}"
    EXT_IP="${IPS_ONLY[$((ext_idx-1))]}"
    print_ok "Выбран: $EXT_IFACE ($EXT_IP)"
 
-   # 6. IP соседа
    echo ""
    read -p "${YELLOW}IP удаленного роутера (внешний):${NC} " REMOTE_IP
    print_ok "Удаленный IP: $REMOTE_IP"
 
-   # 7. IP туннеля
    if [[ "$ROLE" == "HQ" ]]; then
       DEFAULT_TUNNEL="192.168.100.1"
    else
@@ -114,7 +107,6 @@ setup_frr() {
 
    if [[ "$ROLE" == "HQ" ]]; then REMOTE_TUNNEL="192.168.100.2"; else REMOTE_TUNNEL="192.168.100.1"; fi
 
-   # 8. Создание туннеля
    print_msg "Создание GRE туннеля..."
    ip link set gre1 down 2>/dev/null
    sleep 1
@@ -122,7 +114,7 @@ setup_frr() {
    sleep 1
 
    if ! ip tunnel add gre1 mode gre local "$EXT_IP" remote "$REMOTE_IP" ttl 64; then
-      print_err "Ошибка создания туннеля! Проверьте IP."
+      print_err "Ошибка создания туннеля!"
       exit 1
    fi
    ip addr add "$LOCAL_TUNNEL/30" dev gre1
@@ -132,10 +124,9 @@ setup_frr() {
    if ping -c 2 "$REMOTE_TUNNEL" &>/dev/null; then
       print_ok "✓ Туннель работает"
    else
-      print_err "⚠ Туннель создан, но пинг не идет (проверьте фаервол)"
+      print_err "⚠ Туннель создан, но пинг не идет"
    fi
 
-   # 9. Автозагрузка туннеля
    if [[ ! -f "$RC_LOCAL" ]]; then touch "$RC_LOCAL"; chmod +x "$RC_LOCAL"; fi
    sed -i '/# GRE tunnel/,/ip link set gre1 up/d' "$RC_LOCAL" 2>/dev/null || true
    cat >> "$RC_LOCAL" << EOF
@@ -148,22 +139,18 @@ ip link set gre1 up
 sleep 2
 EOF
 
-   # 10. IP Forwarding
    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
    grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-   # 11. СЕТИ OSPF - ИНТЕРАКТИВНЫЙ ВЫБОР
    echo -e "\n${YELLOW}=== СЕТИ ДЛЯ OSPF ===${NC}"
    echo "Найдены локальные сети:"
    
    declare -a LOCAL_NETS
    
-   # Вычисляем сеть туннеля (например, 192.168.100.0/30)
    TUNNEL_NET=$(echo "$LOCAL_TUNNEL" | cut -d. -f1-3).0/30
    echo "  - $TUNNEL_NET (gre1 туннель)"
    LOCAL_NETS+=("$TUNNEL_NET")
    
-   # Добавляем остальные интерфейсы
    for idx in "${!IFACES[@]}"; do
       if [[ "${IFACES[$idx]}" != "$EXT_IFACE" && "${IFACES[$idx]}" != "lo" ]]; then
          echo "  - ${IPS_FULL[$idx]} (${IFACES[$idx]})"
@@ -182,7 +169,6 @@ EOF
    declare -a OSPF_NETS
    
    if [[ "$net_choice" == "2" ]]; then
-      # Ручной ввод
       echo ""
       echo "Введите сети в формате IP/CIDR (например, 192.168.10.0/24)"
       echo "Пустая строка - завершить ввод"
@@ -196,63 +182,57 @@ EOF
             OSPF_NETS+=("$net")
             print_ok "Добавлена: $net"
          else
-            print_err "Неверный формат! Используйте IP/CIDR"
+            print_err "Неверный формат!"
          fi
       done
       
-      # Если ничего не ввели - добавляем туннель
       if [[ ${#OSPF_NETS[@]} -eq 0 ]]; then
          OSPF_NETS=("$TUNNEL_NET")
          print_msg "Добавлена сеть туннеля: $TUNNEL_NET"
       fi
    else
-      # Автоматически
       OSPF_NETS=("${LOCAL_NETS[@]}")
       print_ok "Добавлены все найденные сети"
    fi
 
-   # Пароль
    echo ""
    read -p "${YELLOW}Пароль OSPF [ospf123]:${NC} " ospf_pass
    ospf_pass="${ospf_pass:-ospf123}"
 
-   # 12. ГЕНЕРАЦИЯ КОНФИГА FRR (ИСПРАВЛЕНО!)
    print_msg "Запись конфигурации FRR..."
    
-   # Создаем строки network
-   NETWORK_LINES=""
-   for net in "${OSPF_NETS[@]}"; do
-      NETWORK_LINES+=" network $net area 0\n"
-   done
-   
-   # Записываем конфиг ПРАВИЛЬНО с ! на отдельных строках
-   cat > "$FRR_CONF" << EOF
-frr version 9.0
-frr defaults traditional
-hostname $(hostname)
-log syslog informational
-!
-router ospf
- ospf router-id $RID
- passive-interface default
- no passive-interface gre1
- area 0 authentication message-digest
-$(echo -e "$NETWORK_LINES")!
-interface gre1
- ip ospf authentication message-digest
- ip ospf message-digest-key 1 md5 $ospf_pass
-!
-line vty
-!
-EOF
+   # ИСПРАВЛЕНИЕ: Правильная генерация конфига
+   {
+      echo "frr version 9.0"
+      echo "frr defaults traditional"
+      echo "hostname $(hostname)"
+      echo "log syslog informational"
+      echo "!"
+      echo "router ospf"
+      echo " ospf router-id $RID"
+      echo " passive-interface default"
+      echo " no passive-interface gre1"
+      echo " area 0 authentication message-digest"
+      
+      # Добавляем сети ПРАВИЛЬНО (без ! в конце)
+      for net in "${OSPF_NETS[@]}"; do
+         echo " network $net area 0"
+      done
+      
+      echo "!"
+      echo "interface gre1"
+      echo " ip ospf authentication message-digest"
+      echo " ip ospf message-digest-key 1 md5 $ospf_pass"
+      echo "!"
+      echo "line vty"
+      echo "!"
+   } > "$FRR_CONF"
 
-   print_ok "Конфиг записан"
+   print_ok "Конфигурация записана"
    
-   # Показываем конфиг
    echo -e "\n${YELLOW}=== КОНФИГУРАЦИЯ ===${NC}"
    cat "$FRR_CONF"
    
-   # Перезапуск
    systemctl enable frr >/dev/null 2>&1
    systemctl restart frr
    sleep 5
@@ -269,7 +249,6 @@ EOF
    echo ""
 }
 
-# Меню
 clear
 echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║ FRR OSPF/GRE - FINAL VERSION                     ║${NC}"
@@ -288,12 +267,12 @@ case $choice in
    echo -e "\n${WHITE}=== GRE ===${NC}"
    ip link show gre1 2>/dev/null || echo "Нет туннеля"
    echo -e "\n${WHITE}=== FRR CONFIG ===${NC}"
-   cat "$FRR_CONF" 2>/dev/null || echo "Файл конфига пуст"
+   cat "$FRR_CONF" 2>/dev/null || echo "Файл пуст"
    echo -e "\n${WHITE}=== OSPF STATUS ===${NC}"
    vtysh -c "show ip ospf" 2>/dev/null || echo "FRR не работает"
    echo -e "\n${WHITE}=== NEIGHBORS ===${NC}"
    vtysh -c "show ip ospf neighbor" 2>/dev/null
-   echo -e "\n${WHITE}=== ROUTES (Kernel) ===${NC}"
+   echo -e "\n${WHITE}=== ROUTES ===${NC}"
    ip route show | grep -E "ospf|gre1|192.168"
    ;;
  4) exit 0 ;;
