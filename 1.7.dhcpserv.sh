@@ -387,11 +387,10 @@ for vid in $(echo "${!SELECTED_VLANS[@]}" | tr ' ' '\n' | sort -n); do
         DHCP_IFACE_LIST="${LAN_IFACE}.${vid}"
     fi
 
-    # Собираем блок subnet для DHCP
+    # Собираем блок subnet для DHCP (interface НЕ указываем — ISC DHCP не поддерживает)
     DHCP_CONF_SUBNETS="${DHCP_CONF_SUBNETS}
 # VLAN $vid - $V_NET_NAME (${LAN_IFACE}.${vid})
 subnet $V_NETWORK netmask $V_NETMASK {
-    interface ${LAN_IFACE}.${vid};
     range $V_RANGE_START $V_RANGE_END;
     option routers $V_GATEWAY;
     option subnet-mask $V_NETMASK;
@@ -475,6 +474,27 @@ DHCPDARGS="$DHCP_IFACE_LIST"
 EOF
 
 echo -e "${GREEN}/etc/sysconfig/dhcpd: DHCPDARGS=\"$DHCP_IFACE_LIST\"${NC}"
+
+# Создаём leases-файл если отсутствует
+LEASE_FILE="/var/lib/dhcp/dhcpd.leases"
+LEASE_DIR=$(dirname "$LEASE_FILE")
+if [ ! -d "$LEASE_DIR" ]; then
+    mkdir -p "$LEASE_DIR"
+fi
+if [ ! -f "$LEASE_FILE" ]; then
+    touch "$LEASE_FILE"
+    echo -e "${GREEN}Создан leases-файл: $LEASE_FILE${NC}"
+fi
+
+# Проверяем конфиг перед запуском
+echo -e "${WHITE}[AUTO] Проверка конфигурации DHCP...${NC}"
+dhcpd -t -cf /etc/dhcp/dhcpd.conf 2>&1
+if [ $? -ne 0 ]; then
+    echo -e "${RED}Ошибка в dhcpd.conf! Смотрите выше.${NC}"
+    echo -e "${YELLOW}Файл конфигурации: /etc/dhcp/dhcpd.conf${NC}"
+else
+    echo -e "${GREEN}Конфигурация DHCP валидна${NC}"
+fi
 
 # ============================================================
 # IP FORWARDING
