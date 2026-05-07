@@ -1,86 +1,111 @@
 #!/bin/bash
-#
-# Скрипт настройки DHCP сервера (ИСПРАВЛЕННЫЙ)
-# Исходник: https://github.com/12Geo12/demka/blob/main/1.7.dhcpserv.sh
+# 1.7.dhcpserv.sh (Улучшенная версия с полной очисткой)
 # 
-# ИЗМЕНЕНИЯ:
-# 1. Удален блок "ОЧИСТКА VLAN", чтобы не удалять существующие интерфейсы.
-# 2. Настройка DHCP переведена на VLAN-интерфейс (ens37.10).
+# Логика:
+# 1. Полностью удаляет все VLAN на интерфейсе (Hard Reset).
+# 2. Создает нужный VLAN (ens37.10) заново с нуля (гарантия правильности).
+# 3. Настраивает DHCP на этом VLAN.
 
-# === ПЕРЕМЕННЫЕ ===
-LAN_IFACE="ens37"
-VLAN_IFACE="ens37.10"
-DOMAIN="au-team.irpo"
-# Сеть SRV-Net (настроенная в скрипте VLAN)
+# === КОНФИГУРАЦИЯ ===
+LAN_IFACE="ens37"          # Физический интерфейс
+VLAN_ID=10                 # ID VLAN
+VLAN_IFACE="${LAN_IFACE}.${VLAN_ID}"
+
+# Параметры сети (создаются заново после очистки)
+IP_ADDR="192.168.10.1/26"  # IP Шлюза (на роутере)
 NETWORK="192.168.10.0"
-NETMASK="255.255.255.192" # /26
-BROADCAST="192.168.10.63"
-GATEWAY="192.168.10.1"
+NETMASK="255.255.255.192"
 DNS_SRV="192.168.10.10"
 
 DHCP_CONF="/etc/dhcp/dhcpd.conf"
-SYSdhcpd="/etc/sysconfig/dhcpd"
+DHCPD_ARGS="/etc/sysconfig/dhcpd"
+IFACES_DIR="/etc/net/ifaces"
 
 echo "------------------------------------------------"
-echo "Настройка DHCP-сервера для сети SRV-Net (VLAN 10)"
+echo "Запуск скрипта с ПОЛНОЙ ОЧИСТКОЙ VLAN"
 echo "------------------------------------------------"
 
-# 1. Установка DHCP-сервера
+# === ШАГ 1: ПОЛНАЯ ОЧИСТКА (HARD RESET) ===
+echo "[1/4] Полная очистка старых VLAN на $LAN_IFACE..."
+# Удаляем файлы конфигурации ifaces
+for vlan_dir in $IFACES_DIR/${LAN_IFACE}.*; do
+    if [ -d "$vlan_dir" ]; then
+        echo "   Удаляю конфиг: $vlan_dir"
+        rm -rf "$vlan_dir"
+    fi
+done
+
+# Удаляем интерфейсы из ядра
+for vlan_name in $(ip link show | grep -o "${LAN_IFACE}\.[0-9]*"); do
+    echo "   Удаляю интерфейс: $vlan_name"
+    ip link set "$vlan_name" down 2>/dev/null
+    ip link del "$vlan_name" 2>/dev/null
+done
+
+echo "   Очистка завершена."
+
+# === ШАГ 2: СОЗДАНИЕ VLAN ЗАНОВО ===
+# Так как мы всё удалили, нужно создать чистую конфигурацию для нашего VLAN
+echo "[2/4] Создание VLAN $VLAN_IFACE с нуля..."
+
+# Создаем папку интерфейса
+mkdir -p "$IFACES_DIR/${VLAN_IFACE}"
+
+# Пишем options
+cat > "$IFACES_DIR/${VLAN_IFACE}/options" << EOF
+BOOTPROTO=static
+TYPE=vlan
+ONBOOT=yes
+HOST=$LAN_IFACE
+VID=$VLAN_ID
+CONFIG_IPV4=yes
+EOF
+
+# Пишем IP адрес
+echo "$IP_ADDR" > "$IFACES_DIR/${VLAN_IFACE}/ipv4address"
+
+# Поднятие интерфейса через network (или вручную для быстродействия)
+ifup "$VLAN_IFACE" 2>/dev/null || (ip link add link "$LAN_IFACE" name "$VLAN_IFACE" type vlan id "$VLAN_ID" && ip addr add "$IP_ADDR" dev "$VLAN_IFACE" && ip link set "$VLAN_IFACE" up)
+
+echo "   VLAN $VLAN_IFACE поднят с IP $IP_ADDR"
+
+# === ШАГ 3: НАСТРОЙКА DHCP ===
+echo "[3/4] Настройка DHCP-сервера..."
 apt-get update -qq
 apt-get install -y dhcp-server
 
-# 2. ПРОВЕРКА НАЛИЧИЯ VLAN
-# Мы не создаем VLAN здесь, мы проверяем, есть ли он (от 1.3.vlans.sh)
-if ! ip link show "$VLAN_IFACE" &>/dev/null; then
-    echo "ВНИМАНИЕ: Интерфейс $VLAN_IFACE не найден."
-    echo "Проверьте, выполнен ли скрипт 1.3.vlans.sh."
-    echo "Продолжаем настройку конфига..."
-fi
-
-# 3. Формирование конфигурационного файла DHCP
-# Резервная копия старого конфига
-[ -f "$DHCP_CONF" ] && cp "$DHCP_CONF" "${DHCP_CONF}.bak"
-
+# Генерация конфига
 cat > "$DHCP_CONF" << EOF
-# DHCP Configuration
 default-lease-time 600;
 max-lease-time 7200;
 authoritative;
 ddns-update-style none;
 
-# Сеть для серверов (SRV-Net)
 subnet $NETWORK netmask $NETMASK {
     range 192.168.10.10 192.168.10.60;
-    option routers $GATEWAY;
+    option routers 192.168.10.1;
     option subnet-mask $NETMASK;
-    option broadcast-address $BROADCAST;
-    option domain-name "$DOMAIN";
+    option broadcast-address 192.168.10.63;
+    option domain-name "au-team.irpo";
     option domain-name-servers $DNS_SRV;
 }
 EOF
 
-# 4. Настройка интерфейса запуска (DHCPDARGS)
-# В оригинале здесь скрипт удалял VLAN и прописывал физический интерфейс.
-# Мы же указываем слушать на VLAN-подынтерфейсе.
-
-if [ -f "$SYSdhcpd" ]; then
-    # Удаляем старые параметры если есть
-    sed -i '/^DHCPDARGS/d' "$SYSdhcpd"
+# Настройка прослушивания
+if [ -f "$DHCPD_ARGS" ]; then
+    sed -i '/^DHCPDARGS/d' "$DHCPD_ARGS"
 fi
-echo "DHCPDARGS=\"$VLAN_IFACE\"" >> "$SYSdhcpd"
+echo "DHCPDARGS=\"$VLAN_IFACE\"" >> "$DHCPD_ARGS"
 
-echo "------------------------------------------------"
-echo "Готово. Конфигурация применена:"
-echo "  - Интерфейс: $VLAN_IFACE"
-echo "  - Сеть: $NETWORK/$NETMASK"
-echo "------------------------------------------------"
-
-# 5. Перезапуск службы
+# === ШАГ 4: ЗАПУСК ===
+echo "[4/4] Перезапуск DHCP..."
 systemctl enable dhcpd
 systemctl restart dhcpd
 
 if systemctl is-active --quiet dhcpd; then
-    echo "DHCP-сервер запущен успешно."
+    echo "------------------------------------------------"
+    echo "УСПЕХ: Система сброшена, VLAN пересоздан, DHCP работает на $VLAN_IFACE"
+    echo "------------------------------------------------"
 else
-    echo "ОШИБКА: DHCP-сервер не запустился. Проверьте логи (journalctl -u dhcpd)."
+    echo "ОШИБКА запуска DHCP. Проверьте логи."
 fi
