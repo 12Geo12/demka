@@ -1,9 +1,10 @@
 #!/bin/bash
 # ==============================================================================
-# DHCP SETUP - VLAN EDITION (DHCP раздаётся по VLAN)
+# DHCP SETUP - VLAN + NATIVE EDITION
 # ==============================================================================
-# Топология: HQ-RTR (ens37) ──── VLAN ──── HQ-SRV (ens33)
-# Автоматическое определение интерфейсов
+# Топология: HQ-RTR (ens37) ──── прямое соединение ──── HQ-SRV (ens33)
+# Одна сеть (native) раздаётся на основном интерфейсе — SRV получает IP напрямую
+# Остальные сети идут через VLAN субинтерфейсы
 # ==============================================================================
 
 # Цвета
@@ -24,7 +25,7 @@ fi
 clear
 echo -e "${CYAN}"
 echo "========================================================================"
-echo "       DHCP SETUP - VLAN EDITION (DHCP по VLAN)"
+echo "       DHCP SETUP - VLAN + NATIVE (SRV получает IP напрямую)"
 echo "========================================================================"
 echo -e "${NC}"
 
@@ -118,7 +119,7 @@ fi
 # АВТОВЫБОР LAN ИНТЕРФЕЙСА
 # ============================================================
 echo ""
-echo -e "${WHITE}[AUTO] Выбор LAN интерфейса (parent для VLAN)...${NC}"
+echo -e "${WHITE}[AUTO] Выбор LAN интерфейса (parent)...${NC}"
 echo "------------------------------------------------------------------------"
 
 LAN_IFACE=""
@@ -169,7 +170,7 @@ if [ -z "$LAN_IFACE" ]; then
     read -p "Введите имя интерфейса вручную: " LAN_IFACE
 fi
 
-echo -e "${GREEN}Выбран LAN интерфейс (parent): $LAN_IFACE${NC}"
+echo -e "${GREEN}Выбран LAN интерфейс: $LAN_IFACE${NC}"
 
 # ============================================================
 # АВТОВЫБОР WAN ИНТЕРФЕЙСА
@@ -194,32 +195,45 @@ if [ -n "$WAN_IFACE" ]; then
 fi
 
 # ============================================================
-# ВЫБОР СЕТЕЙ / VLAN (несколько одновременно)
+# ВЫБОР СЕТЕЙ
 # ============================================================
 echo ""
-echo -e "${WHITE}Выберите сети для VLAN (можно несколько, через пробел):${NC}"
+echo -e "${WHITE}Выберите сети (можно несколько, через пробел):${NC}"
+echo "  Первая выбранная сеть = NATIVE (раздаётся на основном интерфейсе)"
+echo "  Остальные сети = VLAN (раздаются через субинтерфейсы)"
+echo ""
 echo "  10) SRV-Net  (192.168.10.0/26) - для серверов"
 echo "  20) CLI-Net  (192.168.20.0/28) - для клиентов"
 echo "  99) Mgmt     (192.168.99.0/29) - для управления"
 echo ""
-echo -e "${YELLOW}Пример: 10 20 99${NC}"
-echo -e "${YELLOW}Пример: 10 20${NC}"
+echo -e "${YELLOW}Пример: 10 20 99  (VLAN 10 = native, 20 и 99 = tagged VLAN)${NC}"
 echo ""
 read -p "Ввод [10 20]: " VLAN_INPUT
 VLAN_INPUT=${VLAN_INPUT:-"10 20"}
 
 # Парсим выбранные VLAN
+declare -a VLAN_ORDER=()
 declare -A SELECTED_VLANS
+
 for v in $VLAN_INPUT; do
     case "$v" in
         10)
-            SELECTED_VLANS[10]="SRV-Net"
+            if [ -z "${SELECTED_VLANS[10]+x}" ]; then
+                VLAN_ORDER+=("10")
+                SELECTED_VLANS[10]="SRV-Net"
+            fi
             ;;
         20)
-            SELECTED_VLANS[20]="CLI-Net"
+            if [ -z "${SELECTED_VLANS[20]+x}" ]; then
+                VLAN_ORDER+=("20")
+                SELECTED_VLANS[20]="CLI-Net"
+            fi
             ;;
         99)
-            SELECTED_VLANS[99]="Mgmt"
+            if [ -z "${SELECTED_VLANS[99]+x}" ]; then
+                VLAN_ORDER+=("99")
+                SELECTED_VLANS[99]="Mgmt"
+            fi
             ;;
         *)
             echo -e "${YELLOW}Внимание: VLAN $v неизвестен, пропускается${NC}"
@@ -227,20 +241,29 @@ for v in $VLAN_INPUT; do
     esac
 done
 
-if [ ${#SELECTED_VLANS[@]} -eq 0 ]; then
-    echo -e "${RED}Не выбрано ни одной сети. Использую VLAN 10 и 20${NC}"
+if [ ${#VLAN_ORDER[@]} -eq 0 ]; then
+    echo -e "${RED}Не выбрано ни одной сети. Использую 10 и 20${NC}"
+    VLAN_ORDER=("10" "20")
     SELECTED_VLANS[10]="SRV-Net"
     SELECTED_VLANS[20]="CLI-Net"
 fi
 
+# Первая выбранная VLAN = NATIVE (untagged, на parent интерфейсе)
+NATIVE_VID="${VLAN_ORDER[0]}"
+NATIVE_NAME="${SELECTED_VLANS[$NATIVE_VID]}"
+
 echo ""
-echo -e "${GREEN}Выбраны VLAN:${NC}"
-for vid in $(echo "${!SELECTED_VLANS[@]}" | tr ' ' '\n' | sort -n); do
-    echo "    VLAN $vid  ->  ${SELECTED_VLANS[$vid]}"
+echo -e "${GREEN}Выбраны сети:${NC}"
+echo -e "  ${MAGENTA}>>> NATIVE (untagged) VLAN $NATIVE_VID -> ${NATIVE_NAME}${MAGENTA}"
+echo -e "     (вешается на $LAN_IFACE, SRV получит IP напрямую)${NC}"
+for i in "${!VLAN_ORDER[@]}"; do
+    vid="${VLAN_ORDER[$i]}"
+    if [ "$i" -eq 0 ]; then continue; fi
+    echo -e "      VLAN $vid -> ${SELECTED_VLANS[$vid]} (tagged, ${LAN_IFACE}.${vid})"
 done
 
 # ============================================================
-# VLAN НЕ УДАЛЯЮТСЯ — только показываем существующие
+# VLAN НЕ УДАЛЯЮТСЯ — только показываем
 # ============================================================
 echo ""
 echo -e "${WHITE}[AUTO] Проверка существующих VLAN на $LAN_IFACE (без удаления)...${NC}"
@@ -250,92 +273,22 @@ VLAN_EXISTING=0
 for vlan_dir in /etc/net/ifaces/${LAN_IFACE}.*; do
     if [ -d "$vlan_dir" ]; then
         vlan_name=$(basename "$vlan_dir")
-        echo -e "  ${GREEN}Обнаружен существующий VLAN: $vlan_name (оставляем)${NC}"
+        echo -e "  ${GREEN}Обнаружен VLAN: $vlan_name (оставляем)${NC}"
         VLAN_EXISTING=$((VLAN_EXISTING + 1))
     fi
 done
 
-# Также проверяем VLAN в ядре
 for vlan_link in $(ip link show | grep -oP "${LAN_IFACE}\.\d+"); do
     if [ ! -d "/etc/net/ifaces/$vlan_link" ]; then
-        echo -e "  ${YELLOW}VLAN $vlan_link найден в ядре, но нет конфига (оставляем)${NC}"
+        echo -e "  ${YELLOW}VLAN $vlan_link в ядре без конфига (оставляем)${NC}"
     fi
 done
 
 if [ $VLAN_EXISTING -eq 0 ]; then
-    echo -e "  ${YELLOW}Существующих VLAN не обнаружено — создадим новые${NC}"
+    echo -e "  ${YELLOW}Существующих VLAN не обнаружено${NC}"
 else
     echo -e "  ${GREEN}Найдено VLAN: $VLAN_EXISTING (сохранены)${NC}"
 fi
-
-# ============================================================
-# ФУНКЦИЯ: создание/проверка VLAN субинтерфейса
-# ============================================================
-create_vlan_interface() {
-    local VID=$1
-    local VLAN_NAME=$2
-    local NETWORK=$3
-    local NETMASK=$4
-    local CIDR=$5
-    local GATEWAY=$6
-    local RANGE_START=$7
-    local RANGE_END=$8
-    local BROADCAST=$9
-
-    local VIF="${LAN_IFACE}.${VID}"
-    local VIF_DIR="/etc/net/ifaces/$VIF"
-
-    echo ""
-    echo -e "${WHITE}[VLAN $VID] Настройка $VIF -> ${VLAN_NAME}${NC}"
-    echo "------------------------------------------------------------------------"
-
-    # Проверяем, существует ли уже VLAN
-    if [ -d "$VIF_DIR" ]; then
-        echo -e "  ${YELLOW}Конфиг $VIF уже существует — пропускаем создание (не удаляем)${NC}"
-    else
-        # Создаём конфигурационную директорию
-        mkdir -p "$VIF_DIR"
-
-        # options
-        cat > "$VIF_DIR/options" << EOF
-BOOTPROTO=static
-TYPE=eth
-ONBOOT=yes
-DISABLED=no
-EOF
-
-        echo -e "  ${GREEN}Конфиг $VIF_DIR/options создан${NC}"
-    fi
-
-    # Пишем IP-адрес (перезаписываем для актуальности)
-    echo "$GATEWAY/$CIDR" > "$VIF_DIR/ipv4address"
-
-    # Удаляем маршруты если есть
-    rm -f "$VIF_DIR/ipv4route"
-
-    # Создаём VLAN линк в ядре (если ещё нет)
-    if ! ip link show "$VIF" &>/dev/null; then
-        echo -e "  ${WHITE}Создание VLAN-интерфейса $VIF (802.1Q, vid $VID)...${NC}"
-        ip link add link "$LAN_IFACE" name "$VIF" type vlan id "$VID"
-        ip link set "$VIF" up
-    else
-        echo -e "  ${GREEN}VLAN-интерфейс $VIF уже существует в ядре${NC}"
-    fi
-
-    # Применяем IP немедленно
-    ip addr flush dev "$VIF" 2>/dev/null
-    ip addr add "$GATEWAY/$CIDR" dev "$VIF" 2>/dev/null
-    ip link set "$VIF" up
-
-    # Проверка
-    if ip addr show "$VIF" | grep -q "$GATEWAY"; then
-        echo -e "  ${GREEN}IP настроен на $VIF: $GATEWAY/$CIDR${NC}"
-    else
-        echo -e "  ${RED}Ошибка настройки IP на $VIF${NC}"
-    fi
-
-    echo -e "  ${GREEN}VLAN $VID (${VLAN_NAME}) -> $GATEWAY/$CIDR${NC}"
-}
 
 # ============================================================
 # ФУНКЦИЯ: параметры сети по VLAN ID
@@ -356,16 +309,117 @@ get_vlan_params() {
 }
 
 # ============================================================
-# СОЗДАНИЕ VLAN СУБИНТЕРФЕЙСОВ
+# НАСТРОЙКА NATIVE СЕТИ НА PARENT ИНТЕРФЕЙСЕ
 # ============================================================
+NATIVE_PARAMS=$(get_vlan_params "$NATIVE_VID")
+NATIVE_NET_NAME=$(echo "$NATIVE_PARAMS" | awk '{print $1}')
+NATIVE_NETWORK=$(echo "$NATIVE_PARAMS" | awk '{print $2}')
+NATIVE_NETMASK=$(echo "$NATIVE_PARAMS" | awk '{print $3}')
+NATIVE_CIDR=$(echo "$NATIVE_PARAMS" | awk '{print $4}')
+NATIVE_GATEWAY=$(echo "$NATIVE_PARAMS" | awk '{print $5}')
+NATIVE_RANGE_START=$(echo "$NATIVE_PARAMS" | awk '{print $6}')
+NATIVE_RANGE_END=$(echo "$NATIVE_PARAMS" | awk '{print $7}')
+NATIVE_BROADCAST=$(echo "$NATIVE_PARAMS" | awk '{print $8}')
+
 echo ""
-echo -e "${WHITE}[AUTO] Создание/проверка VLAN субинтерфейсов...${NC}"
+echo -e "${WHITE}[AUTO] Настройка $LAN_IFACE -> NATIVE VLAN $NATIVE_VID (${NATIVE_NAME})${NC}"
 echo "------------------------------------------------------------------------"
 
-DHCP_IFACE_LIST=""    # список интерфейсов для DHCPDARGS
-DHCP_CONF_SUBNETS=""  # блоки subnet для dhcpd.conf
+IFACE_DIR="/etc/net/ifaces/$LAN_IFACE"
+mkdir -p "$IFACE_DIR"
 
-for vid in $(echo "${!SELECTED_VLANS[@]}" | tr ' ' '\n' | sort -n); do
+# Parent интерфейс — с IP от native VLAN
+cat > "$IFACE_DIR/options" << EOF
+BOOTPROTO=static
+TYPE=eth
+ONBOOT=yes
+DISABLED=no
+EOF
+
+echo "$NATIVE_GATEWAY/$NATIVE_CIDR" > "$IFACE_DIR/ipv4address"
+rm -f "$IFACE_DIR/ipv4route"
+
+# Применяем немедленно
+ip addr flush dev "$LAN_IFACE" 2>/dev/null
+ip addr add "$NATIVE_GATEWAY/$NATIVE_CIDR" dev "$LAN_IFACE" 2>/dev/null
+ip link set "$LAN_IFACE" up
+
+if ip addr show "$LAN_IFACE" | grep -q "$NATIVE_GATEWAY"; then
+    echo -e "${GREEN}$LAN_IFACE настроен: $NATIVE_GATEWAY/$NATIVE_CIDR (NATIVE: ${NATIVE_NAME})${NC}"
+else
+    echo -e "${RED}Ошибка настройки IP на $LAN_IFACE${NC}"
+fi
+
+# ============================================================
+# ФУНКЦИЯ: создание VLAN субинтерфейса
+# ============================================================
+create_vlan_interface() {
+    local VID=$1
+    local VLAN_NAME=$2
+    local NETWORK=$3
+    local NETMASK=$4
+    local CIDR=$5
+    local GATEWAY=$6
+    local RANGE_START=$7
+    local RANGE_END=$8
+    local BROADCAST=$9
+
+    local VIF="${LAN_IFACE}.${VID}"
+    local VIF_DIR="/etc/net/ifaces/$VIF"
+
+    echo ""
+    echo -e "${WHITE}[VLAN $VID] Настройка $VIF -> ${VLAN_NAME}${NC}"
+    echo "------------------------------------------------------------------------"
+
+    if [ -d "$VIF_DIR" ]; then
+        echo -e "  ${YELLOW}Конфиг $VIF уже существует — пропускаем (не удаляем)${NC}"
+    else
+        mkdir -p "$VIF_DIR"
+        cat > "$VIF_DIR/options" << EOF
+BOOTPROTO=static
+TYPE=eth
+ONBOOT=yes
+DISABLED=no
+EOF
+        echo -e "  ${GREEN}Конфиг $VIF_DIR/options создан${NC}"
+    fi
+
+    echo "$GATEWAY/$CIDR" > "$VIF_DIR/ipv4address"
+    rm -f "$VIF_DIR/ipv4route"
+
+    if ! ip link show "$VIF" &>/dev/null; then
+        echo -e "  ${WHITE}Создание VLAN $VIF (802.1Q, vid $VID)...${NC}"
+        ip link add link "$LAN_IFACE" name "$VIF" type vlan id "$VID"
+        ip link set "$VIF" up
+    else
+        echo -e "  ${GREEN}VLAN $VIF уже существует${NC}"
+    fi
+
+    ip addr flush dev "$VIF" 2>/dev/null
+    ip addr add "$GATEWAY/$CIDR" dev "$VIF" 2>/dev/null
+    ip link set "$VIF" up
+
+    if ip addr show "$VIF" | grep -q "$GATEWAY"; then
+        echo -e "  ${GREEN}IP на $VIF: $GATEWAY/$CIDR${NC}"
+    else
+        echo -e "  ${RED}Ошибка настройки IP на $VIF${NC}"
+    fi
+}
+
+# ============================================================
+# СОЗДАНИЕ VLAN СУБИНТЕРФЕЙСОВ (для НЕ-native VLAN)
+# ============================================================
+DHCP_IFACE_LIST="$LAN_IFACE"
+DHCP_CONF_SUBNETS=""
+
+for i in "${!VLAN_ORDER[@]}"; do
+    vid="${VLAN_ORDER[$i]}"
+
+    # Пропускаем native VLAN — она уже на parent
+    if [ "$i" -eq 0 ]; then
+        continue
+    fi
+
     VNAME="${SELECTED_VLANS[$vid]}"
     PARAMS=$(get_vlan_params "$vid")
 
@@ -380,14 +434,8 @@ for vid in $(echo "${!SELECTED_VLANS[@]}" | tr ' ' '\n' | sort -n); do
 
     create_vlan_interface "$vid" "$V_NET_NAME" "$V_NETWORK" "$V_NETMASK" "$V_CIDR" "$V_GATEWAY" "$V_RANGE_START" "$V_RANGE_END" "$V_BROADCAST"
 
-    # Собираем список интерфейсов для DHCP
-    if [ -n "$DHCP_IFACE_LIST" ]; then
-        DHCP_IFACE_LIST="$DHCP_IFACE_LIST ${LAN_IFACE}.${vid}"
-    else
-        DHCP_IFACE_LIST="${LAN_IFACE}.${vid}"
-    fi
+    DHCP_IFACE_LIST="$DHCP_IFACE_LIST ${LAN_IFACE}.${vid}"
 
-    # Собираем блок subnet для DHCP (interface НЕ указываем — ISC DHCP не поддерживает)
     DHCP_CONF_SUBNETS="${DHCP_CONF_SUBNETS}
 # VLAN $vid - $V_NET_NAME (${LAN_IFACE}.${vid})
 subnet $V_NETWORK netmask $V_NETMASK {
@@ -402,34 +450,6 @@ subnet $V_NETWORK netmask $V_NETMASK {
 }
 "
 done
-
-# ============================================================
-# НАСТРОЙКА PARENT ИНТЕРФЕЙСА (без IP — только L2 trunk)
-# ============================================================
-echo ""
-echo -e "${WHITE}[AUTO] Настройка parent интерфейса $LAN_IFACE (trunk)...${NC}"
-echo "------------------------------------------------------------------------"
-
-IFACE_DIR="/etc/net/ifaces/$LAN_IFACE"
-mkdir -p "$IFACE_DIR"
-
-# Parent интерфейс — без IP, работает как trunk
-cat > "$IFACE_DIR/options" << EOF
-BOOTPROTO=static
-TYPE=eth
-ONBOOT=yes
-DISABLED=no
-EOF
-
-# Убираем IP с parent (он будет только на субинтерфейсах)
-rm -f "$IFACE_DIR/ipv4address"
-> "$IFACE_DIR/ipv4address" 2>/dev/null || true
-
-# Поднять parent
-ip addr flush dev "$LAN_IFACE" 2>/dev/null
-ip link set "$LAN_IFACE" up
-
-echo -e "${GREEN}Parent $LAN_IFACE поднят (trunk, без IP)${NC}"
 
 # ============================================================
 # УСТАНОВКА DHCP
@@ -447,28 +467,41 @@ else
 fi
 
 # ============================================================
-# КОНФИГУРАЦИЯ DHCP (по VLAN)
+# КОНФИГУРАЦИЯ DHCP
 # ============================================================
 echo ""
-echo -e "${WHITE}[AUTO] Создание конфигурации DHCP (по VLAN)...${NC}"
+echo -e "${WHITE}[AUTO] Создание конфигурации DHCP...${NC}"
 echo "------------------------------------------------------------------------"
 
+# NATIVE subnet ПЕРВЫМ (чтобы приоритет на parent интерфейсе)
 cat > /etc/dhcp/dhcpd.conf << EOF
 # DHCP Configuration for Demo2026 Exam
-# VLAN EDITION - DHCP раздаётся по VLAN
-# Parent интерфейс: $LAN_IFACE
-# VLAN: $VLAN_INPUT
+# Native + VLAN Edition
+# Parent: $LAN_IFACE -> NATIVE VLAN $NATIVE_VID (${NATIVE_NAME})
 
 default-lease-time 600;
 max-lease-time 7200;
 authoritative;
 ddns-update-style none;
+
+# NATIVE (untagged) - VLAN $NATIVE_VID - ${NATIVE_NAME}
+# Раздаётся на $LAN_IFACE — SRV получает IP напрямую
+subnet $NATIVE_NETWORK netmask $NATIVE_NETMASK {
+    range $NATIVE_RANGE_START $NATIVE_RANGE_END;
+    option routers $NATIVE_GATEWAY;
+    option subnet-mask $NATIVE_NETMASK;
+    option broadcast-address $NATIVE_BROADCAST;
+    option domain-name "au-team.irpo";
+    option domain-name-servers 8.8.8.8, 8.8.4.4;
+    default-lease-time 600;
+    max-lease-time 7200;
+}
 $DHCP_CONF_SUBNETS
 EOF
 
-echo -e "${GREEN}/etc/dhcp/dhcpd.conf создан (с subnet для каждого VLAN)${NC}"
+echo -e "${GREEN}/etc/dhcp/dhcpd.conf создан${NC}"
 
-# Интерфейсы — слушаем все VLAN субинтерфейсы
+# Слушаем на parent + все VLAN субинтерфейсы
 cat > /etc/sysconfig/dhcpd << EOF
 DHCPDARGS="$DHCP_IFACE_LIST"
 EOF
@@ -491,7 +524,6 @@ echo -e "${WHITE}[AUTO] Проверка конфигурации DHCP...${NC}"
 dhcpd -t -cf /etc/dhcp/dhcpd.conf 2>&1
 if [ $? -ne 0 ]; then
     echo -e "${RED}Ошибка в dhcpd.conf! Смотрите выше.${NC}"
-    echo -e "${YELLOW}Файл конфигурации: /etc/dhcp/dhcpd.conf${NC}"
 else
     echo -e "${GREEN}Конфигурация DHCP валидна${NC}"
 fi
@@ -516,26 +548,34 @@ sysctl -p > /dev/null 2>&1
 echo -e "${GREEN}IP forwarding включён${NC}"
 
 # ============================================================
-# NAT для каждого VLAN (если есть WAN)
+# NAT (для всех сетей, если есть WAN)
 # ============================================================
 if [ -n "$WAN_IFACE" ] && [ "$WAN_IFACE" != "$LAN_IFACE" ]; then
     echo ""
-    echo -e "${WHITE}[AUTO] Настройка NAT для каждого VLAN ($WAN_IFACE)...${NC}"
+    echo -e "${WHITE}[AUTO] Настройка NAT ($WAN_IFACE)...${NC}"
     echo "------------------------------------------------------------------------"
 
-    for vid in $(echo "${!SELECTED_VLANS[@]}" | tr ' ' '\n' | sort -n); do
+    # NAT для native сети (на parent интерфейсе)
+    iptables -t nat -D POSTROUTING -s "$NATIVE_NETWORK/$NATIVE_CIDR" -o "$WAN_IFACE" -j MASQUERADE 2>/dev/null
+    iptables -t nat -A POSTROUTING -s "$NATIVE_NETWORK/$NATIVE_CIDR" -o "$WAN_IFACE" -j MASQUERADE
+    iptables -D FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT 2>/dev/null
+    iptables -A FORWARD -i "$LAN_IFACE" -o "$WAN_IFACE" -j ACCEPT
+    iptables -D FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+    iptables -A FORWARD -i "$WAN_IFACE" -o "$LAN_IFACE" -m state --state ESTABLISHED,RELATED -j ACCEPT
+    echo -e "  ${GREEN}NAT: $LAN_IFACE ($NATIVE_NETWORK/$NATIVE_CIDR) -> $WAN_IFACE${NC}"
+
+    # NAT для VLAN субинтерфейсов
+    for i in "${!VLAN_ORDER[@]}"; do
+        vid="${VLAN_ORDER[$i]}"
+        [ "$i" -eq 0 ] && continue
+
         PARAMS=$(get_vlan_params "$vid")
         V_NETWORK=$(echo "$PARAMS" | awk '{print $2}')
         V_CIDR=$(echo "$PARAMS" | awk '{print $4}')
         VIF="${LAN_IFACE}.${vid}"
 
-        # Очищаем старые правила
         iptables -t nat -D POSTROUTING -s "$V_NETWORK/$V_CIDR" -o "$WAN_IFACE" -j MASQUERADE 2>/dev/null
-
-        # Добавляем новое правило
         iptables -t nat -A POSTROUTING -s "$V_NETWORK/$V_CIDR" -o "$WAN_IFACE" -j MASQUERADE
-
-        # Forward
         iptables -D FORWARD -i "$VIF" -o "$WAN_IFACE" -j ACCEPT 2>/dev/null
         iptables -A FORWARD -i "$VIF" -o "$WAN_IFACE" -j ACCEPT
         iptables -D FORWARD -i "$WAN_IFACE" -o "$VIF" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
@@ -544,7 +584,6 @@ if [ -n "$WAN_IFACE" ] && [ "$WAN_IFACE" != "$LAN_IFACE" ]; then
         echo -e "  ${GREEN}NAT: $VIF ($V_NETWORK/$V_CIDR) -> $WAN_IFACE${NC}"
     done
 
-    # Сохраняем
     if [ -d /etc/sysconfig ]; then
         iptables-save > /etc/sysconfig/iptables 2>/dev/null
     fi
@@ -567,14 +606,12 @@ sleep 2
 # ============================================================
 echo ""
 echo -e "${CYAN}========================================================================${NC}"
-echo -e "${WHITE}                      РЕЗУЛЬТАТ (VLAN EDITION)${NC}"
+echo -e "${WHITE}                      РЕЗУЛЬТАТ (NATIVE + VLAN)${NC}"
 echo -e "${CYAN}========================================================================${NC}"
 
 echo ""
-echo -e "${WHITE}VLAN интерфейсы:${NC}"
-for vid in $(echo "${!SELECTED_VLANS[@]}" | tr ' ' '\n' | sort -n); do
-    ip -brief addr show "${LAN_IFACE}.${vid}" 2>/dev/null
-done
+echo -e "${WHITE}Интерфейсы:${NC}"
+ip -brief addr show | grep -E "($LAN_IFACE\b|$LAN_IFACE\.[0-9]+|$WAN_IFACE)"
 
 echo ""
 echo -e "${WHITE}DHCP сервер:${NC}"
@@ -588,9 +625,16 @@ else
 fi
 
 echo ""
-echo -e "${WHITE}Конфигурация VLAN:${NC}"
-echo "  Parent интерфейс: $LAN_IFACE (trunk, без IP)"
-for vid in $(echo "${!SELECTED_VLANS[@]}" | tr ' ' '\n' | sort -n); do
+echo -e "${WHITE}Конфигурация:${NC}"
+echo -e "  ${MAGENTA}NATIVE (untagged):${NC}"
+echo "    $LAN_IFACE -> VLAN $NATIVE_VID (${NATIVE_NAME})"
+echo "    IP: $NATIVE_GATEWAY/$NATIVE_CIDR  |  DHCP: $NATIVE_RANGE_START - $NATIVE_RANGE_END"
+echo -e "    ${YELLOW}HQ-SRV получит IP по DHCP напрямую на ens33${NC}"
+
+# Показываем VLAN субинтерфейсы
+for i in "${!VLAN_ORDER[@]}"; do
+    vid="${VLAN_ORDER[$i]}"
+    [ "$i" -eq 0 ] && continue
     PARAMS=$(get_vlan_params "$vid")
     V_NET_NAME=$(echo "$PARAMS" | awk '{print $1}')
     V_NETWORK=$(echo "$PARAMS" | awk '{print $2}')
@@ -598,34 +642,26 @@ for vid in $(echo "${!SELECTED_VLANS[@]}" | tr ' ' '\n' | sort -n); do
     V_GATEWAY=$(echo "$PARAMS" | awk '{print $5}')
     V_RANGE_START=$(echo "$PARAMS" | awk '{print $6}')
     V_RANGE_END=$(echo "$PARAMS" | awk '{print $7}')
-    echo "  VLAN $vid  ${LAN_IFACE}.${vid}  ->  ${V_NET_NAME} ($V_NETWORK/$V_CIDR)"
-    echo "    IP: $V_GATEWAY  |  DHCP: $V_RANGE_START - $V_RANGE_END"
+    echo -e "  ${CYAN}VLAN $vid (tagged):${NC}"
+    echo "    ${LAN_IFACE}.${vid} -> ${V_NET_NAME}"
+    echo "    IP: $V_GATEWAY/$V_CIDR  |  DHCP: $V_RANGE_START - $V_RANGE_END"
 done
 
 echo "  Домен: au-team.irpo"
-[ -n "$WAN_IFACE" ] && echo "  NAT: все VLAN -> $WAN_IFACE"
-
-echo ""
-echo -e "${YELLOW}ВНИМАНИЕ: VLAN не удаляются. При повторном запуске существующие VLAN будут пропущены.${NC}"
+[ -n "$WAN_IFACE" ] && echo "  NAT: все сети -> $WAN_IFACE"
 
 echo ""
 echo -e "${CYAN}========================================================================${NC}"
 echo -e "${WHITE}                         ГОТОВО!${NC}"
 echo -e "${CYAN}========================================================================${NC}"
 echo ""
-echo "На HQ-SRV для получения IP по DHCP (пример для VLAN 10):"
+echo "На HQ-SRV для получения IP (только основной интерфейс ens33):"
 echo ""
-echo "  # Установите пакет vlan если нужно:"
-echo "  apt-get install -y vlan"
-echo ""
-echo "  # Создайте VLAN интерфейс:"
-echo "  ip link add link ens33 name ens33.10 type vlan id 10"
-echo "  ip link set ens33.10 up"
-echo ""
-echo "  # Получите IP по DHCP:"
-echo "  mkdir -p /etc/net/ifaces/ens33.10"
-echo "  echo 'BOOTPROTO=dhcp' > /etc/net/ifaces/ens33.10/options"
-echo "  echo 'TYPE=eth' >> /etc/net/ifaces/ens33.10/options"
-echo "  echo 'ONBOOT=yes' >> /etc/net/ifaces/ens33.10/options"
+echo "  mkdir -p /etc/net/ifaces/ens33"
+echo "  echo 'BOOTPROTO=dhcp' > /etc/net/ifaces/ens33/options"
+echo "  echo 'TYPE=eth' >> /etc/net/ifaces/ens33/options"
+echo "  echo 'ONBOOT=yes' >> /etc/net/ifaces/ens33/options"
 echo "  systemctl restart network"
+echo ""
+echo -e "${GREEN}HQ-SRV получит IP из ${NATIVE_NAME} ($NATIVE_RANGE_START - $NATIVE_RANGE_END)${NC}"
 echo ""
