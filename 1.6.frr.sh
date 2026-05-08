@@ -1,14 +1,16 @@
 #!/bin/bash
 #===============================================================================
 # ИДЕАЛЬНЫЙ СКРИПТ НАСТРОЙКИ FRR (OSPF + GRE) ДЛЯ ALT LINUX
-# Версия 3.0 - ИСПРАВЛЕНО: полная персистентность после перезагрузки
+# Версия 3.2 - ИСПРАВЛЕНО: полная персистентность + ручной ввод сетей
 #
-# КЛЮЧЕВЫЕ ИСПРАВЛЕНИЯ v3.0:
+# КЛЮЧЕВЫЕ ИСПРАВЛЕНИЯ v3.2:
 #   1) ospfd=yes в /etc/frr/daemons — OSPF демон стартует после ребута
 #   2) DISABLE=no + BOOTPROTO=static в /etc/net/ifaces/gre1/options —
 #      etcnet поднимает GRE туннель при загрузке
 #   3) systemctl enable net — сетевая служба включена автозапуском
 #   4) Корректный формат ipv4address для etcnet
+#   5) ИСПРАВЛЕНО: меню выбора сетей видно на экране (stderr)
+#   6) ТОЛЬКО ручной ввод сетей — никакого автоопределения
 #===============================================================================
 
 # Цвета
@@ -90,20 +92,6 @@ full_cleanup() {
  echo -e "${GREEN}Все настройки удалены!${NC}"
 }
 
-# Функция определения сети
-get_network_from_iface() {
- local iface=$1
- local ip_mask=$(ip -4 addr show dev "$iface" | grep -oP 'inet \K[\d./]+')
- if [[ -z "$ip_mask" ]]; then return; fi
- local ip=$(echo "$ip_mask" | cut -d'/' -f1)
- local cidr=$(echo "$ip_mask" | cut -d'/' -f2)
- local IFS='.'; read -r i1 i2 i3 i4 <<< "$ip"
- local mask=$(( (0xFFFFFFFF << (32 - cidr)) & 0xFFFFFFFF ))
- local ip_int=$(( (i1 << 24) | (i2 << 16) | (i3 << 8) | i4 ))
- local net_int=$(( ip_int & mask ))
- echo "$(( (net_int >> 24) & 0xFF )).$(( (net_int >> 16) & 0xFF )).$(( (net_int >> 8) & 0xFF )).$(( net_int & 0xFF ))/$cidr"
-}
-
 # Функция извлечения IP без маски
 extract_ip_only() {
  echo "$1" | cut -d'/' -f1
@@ -128,96 +116,39 @@ print_err() { echo -e "${RED}[X]${NC} $1"; }
 # ФУНКЦИЯ ДОБАВЛЕНИЯ СЕТЕЙ
 #===============================================================================
 
-add_networks_interactive() {
+add_networks_manual() {
  local networks=""
 
- echo -e "\n${YELLOW}=== Добавление сетей для OSPF ===${NC}"
- echo ""
- echo "Доступные интерфейсы и их сети:"
- echo "--------------------------------"
+ # Все информационные выводы направляем в stderr (>&2),
+ # чтобы они не перехватывались подстановкой $(...)
+ # В stdout — ТОЛЬКО финальный список сетей
 
- for iface in $(ls /sys/class/net/ | grep -v lo); do
-  net=$(get_network_from_iface "$iface")
-  if [[ -n "$net" ]]; then
-   printf "  %-10s -> %s\n" "$iface" "$net"
+ echo -e "\n${YELLOW}=== Добавление сетей для OSPF ===${NC}" >&2
+ echo "" >&2
+ echo "Вводите сети для OSPF в формате: IP/CIDR" >&2
+ echo "Пример: 192.168.10.0/24" >&2
+ echo "Для завершения введите пустую строку" >&2
+ echo "-----------------------------------" >&2
+
+ while true; do
+  read -p "Сеть (Enter = готово): " net
+  if [[ -z "$net" ]]; then
+   break
+  fi
+
+  if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+   networks+=" network $net area 0\n"
+   print_ok "Добавлена: $net" >&2
+  else
+   print_warn "Неверный формат! Используйте IP/CIDR (например, 192.168.10.0/24)" >&2
   fi
  done
 
- echo ""
- echo "Выберите способ добавления сетей:"
- echo " 1) Автоматически (все интерфейсы кроме внешнего)"
- echo " 2) Выбрать из списка"
- echo " 3) Ввести сети вручную"
- echo " 4) Пропустить"
- read -p "Ваш выбор [1]: " add_method
-
- case $add_method in
-  2)
-   echo ""
-   echo "Отметьте сети для добавления (y/n):"
-   echo "-----------------------------------"
-   for iface in $(ls /sys/class/net/ | grep -v lo); do
-    if [[ "$iface" == "$EXT_IFACE" ]] || [[ "$iface" == "gre1" ]]; then
-     continue
-    fi
-    net=$(get_network_from_iface "$iface")
-    if [[ -n "$net" ]]; then
-     read -p "  $iface ($net)? [y]: " ans
-     if [[ "$ans" != "n" ]]; then
-      networks+=" network $net area 0\n"
-     fi
-    fi
-   done
-   ;;
-
-  3)
-   echo ""
-   echo "Вводите сети в формате: IP/CIDR (например, 192.168.10.0/24)"
-   echo "Для завершения введите пустую строку"
-   echo "-----------------------------------"
-
-   while true; do
-    read -p "Сеть (или Enter для завершения): " net
-    if [[ -z "$net" ]]; then
-     break
-    fi
-
-    if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-     networks+=" network $net area 0\n"
-     print_ok "Добавлена сеть: $net"
-    else
-     print_warn "Неверный формат! Используйте IP/CIDR"
-    fi
-   done
-   ;;
-
-  4)
-   print_warn "Сети не добавлены"
-   ;;
-
-  *)
-   print_msg "Автоматический выбор всех сетей..."
-   for iface in $(ls /sys/class/net/ | grep -v lo); do
-    if [[ "$iface" == "$EXT_IFACE" ]] || [[ "$iface" == "gre1" ]]; then
-     continue
-    fi
-    net=$(get_network_from_iface "$iface")
-    if [[ -n "$net" ]]; then
-     networks+=" network $net area 0\n"
-     print_ok "Добавлена: $net ($iface)"
-    fi
-   done
-   ;;
- esac
-
- if [[ -n "$GRE_IP" ]]; then
-  GRE_NET_BASE=$(echo "$GRE_IP" | cut -d'.' -f1-3)
-  GRE_NET_CIDR=$(echo "$GRE_IP" | grep -oP '/\K\d+$' || echo "30")
-  GRE_NET="${GRE_NET_BASE}.0/${GRE_NET_CIDR}"
-  networks+=" network $GRE_NET area 0\n"
-  print_ok "Добавлена сеть туннеля: $GRE_NET"
+ if [[ -z "$networks" ]]; then
+  print_warn "Сети не добавлены" >&2
  fi
 
+ # Только это идёт в stdout (перехватывается $())
  echo -e "$networks"
 }
 
@@ -424,7 +355,7 @@ EOF
  read -p "Пароль для OSPF [P@ssw0rd]: " PASS
  PASS="${PASS:-P@ssw0rd}"
 
- NETWORKS_CONFIG=$(add_networks_interactive)
+ NETWORKS_CONFIG=$(add_networks_manual)
 
  #---------------------------------------------------------------
  # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ #1: Включаем ospfd в /etc/frr/daemons
@@ -533,7 +464,7 @@ EOF
 
 clear
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║ FRR OSPF/GRE Setup v3.0 (персистентный)               ║${NC}"
+echo -e "${CYAN}║ FRR OSPF/GRE Setup v3.2 (персистентный)               ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 
 echo ""
