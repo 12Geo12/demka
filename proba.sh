@@ -1,6 +1,6 @@
 #!/bin/bash
 #===============================================================================
-# Настройка GRE туннеля + OSPF с ручным вводом всех параметров
+# Настройка GRE туннеля + OSPF с возможностью очистки старой конфигурации
 #===============================================================================
 
 RED='\033[0;31m'
@@ -17,7 +17,85 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Функция создания systemd service для GRE
+#===============================================================================
+# ФУНКЦИЯ ОЧИСТКИ КОНФИГУРАЦИИ
+#===============================================================================
+cleanup_config() {
+    echo -e "${YELLOW}=== ОЧИСТКА ПРЕДЫДУЩЕЙ КОНФИГУРАЦИИ ===${NC}"
+    echo ""
+    
+    # Удаление GRE туннеля
+    echo "[1/6] Удаление GRE туннеля..."
+    if ip link show gre1 &>/dev/null; then
+        ip link set gre1 down 2>/dev/null
+        ip tunnel del gre1 2>/dev/null
+        echo "  ✓ GRE туннель удален"
+    else
+        echo "  → GRE туннель не найден"
+    fi
+    
+    # Удаление systemd service
+    echo "[2/6] Удаление systemd service..."
+    if [[ -f /etc/systemd/system/gre-tunnel.service ]]; then
+        systemctl stop gre-tunnel.service 2>/dev/null
+        systemctl disable gre-tunnel.service 2>/dev/null
+        rm -f /etc/systemd/system/gre-tunnel.service
+        systemctl daemon-reload
+        echo "  ✓ systemd service удален"
+    else
+        echo "  → systemd service не найден"
+    fi
+    
+    # Очистка FRR конфигурации
+    echo "[3/6] Сброс конфигурации FRR..."
+    if [[ -f "$FRR_CONF" ]]; then
+        cat > "$FRR_CONF" << 'EOF'
+!
+frr version 9.0
+frr defaults traditional
+hostname $(hostname)
+log syslog informational
+!
+line vty
+!
+EOF
+        echo "  ✓ FRR конфигурация сброшена"
+    else
+        echo "  → FRR конфигурация не найдена"
+    fi
+    
+    # Отключение OSPF демона
+    echo "[4/6] Отключение OSPF демона..."
+    if [[ -f "$FRR_DAEMONS" ]]; then
+        sed -i 's/^ospfd=.*/ospfd=no/' "$FRR_DAEMONS"
+        echo "  ✓ OSPF демон отключен"
+    else
+        echo "  → Файл демонов не найден"
+    fi
+    
+    # Очистка iptables NAT правил
+    echo "[5/6] Очистка NAT правил..."
+    nat_rules=$(iptables -t nat -L POSTROUTING -n | grep -c "gre1" 2>/dev/null || echo "0")
+    if [[ "$nat_rules" -gt 0 ]]; then
+        iptables -t nat -F POSTROUTING 2>/dev/null
+        echo "  ✓ NAT правила очищены"
+    else
+        echo "  → NAT правил не найдено"
+    fi
+    
+    # Перезапуск FRR
+    echo "[6/6] Перезапуск служб..."
+    systemctl restart frr 2>/dev/null
+    echo "  ✓ Службы перезапущены"
+    
+    echo ""
+    echo -e "${GREEN}✓ Очистка завершена!${NC}"
+    echo ""
+}
+
+#===============================================================================
+# ФУНКЦИЯ СОЗДАНИЯ SYSTEMD SERVICE
+#===============================================================================
 create_gre_systemd() {
     local local_ip="$1"
     local remote_ip="$2"
@@ -47,7 +125,9 @@ EOF
     systemctl enable gre-tunnel.service
 }
 
-# Включение OSPF демона
+#===============================================================================
+# ФУНКЦИЯ ВКЛЮЧЕНИЯ OSPF ДЕМОНА
+#===============================================================================
 enable_ospf_daemon() {
     if [[ ! -f "$FRR_DAEMONS" ]]; then
         cat > "$FRR_DAEMONS" << 'EOF'
@@ -63,11 +143,50 @@ EOF
     fi
 }
 
-# Основная настройка
-echo -e "${CYAN}=== Настройка GRE туннеля и OSPF ===${NC}"
+#===============================================================================
+# ОСНОВНОЕ МЕНЮ
+#===============================================================================
+echo -e "${CYAN}========================================${NC}"
+echo -e "${CYAN}  Настройка GRE туннеля и OSPF${NC}"
+echo -e "${CYAN}========================================${NC}"
 echo ""
+echo "1) Настроить GRE + OSPF (с очисткой старой конфигурации)"
+echo "2) Настроить GRE + OSPF (без очистки)"
+echo "3) Только очистить конфигурацию"
+echo "4) Выход"
+echo ""
+read -p "Выбор [1]: " menu_choice
+
+case $menu_choice in
+    2)
+        CLEANUP="no"
+        ;;
+    3)
+        cleanup_config
+        exit 0
+        ;;
+    4)
+        echo "Выход..."
+        exit 0
+        ;;
+    *)
+        CLEANUP="yes"
+        ;;
+esac
+
+# Очистка если выбрана
+if [[ "$CLEANUP" == "yes" ]]; then
+    cleanup_config
+    echo -e "${CYAN}=== НАЧАЛО НАСТРОЙКИ ===${NC}"
+    echo ""
+fi
+
+#===============================================================================
+# СБОР ПАРАМЕТРОВ КОНФИГУРАЦИИ
+#===============================================================================
 
 # Выбор роли
+echo "=== Выбор роли роутера ==="
 echo "1) HQ-RTR (Router ID: 1.1.1.1)"
 echo "2) BR-RTR (Router ID: 2.2.2.2)"
 read -p "Выберите роль [1]: " role_choice
@@ -125,6 +244,10 @@ echo ""
 read -p "Пароль OSPF [123]: " pass
 pass="${pass:-123}"
 
+#===============================================================================
+# ПРИМЕНЕНИЕ КОНФИГУРАЦИИ
+#===============================================================================
+
 # Создаем systemd service для GRE
 echo ""
 echo -e "${CYAN}Создание GRE туннеля...${NC}"
@@ -173,7 +296,7 @@ sysctl -w net.ipv4.ip_forward=1
 echo -e "${CYAN}Настройка NAT...${NC}"
 for network in $OSPF_NETWORKS_INPUT; do
     iptables -t nat -A POSTROUTING -s $network -o gre1 -j MASQUERADE 2>/dev/null || true
-    echo "  Добавлен NAT для: $network"
+    echo "  ✓ Добавлен NAT для: $network"
 done
 
 # Включаем службы
@@ -206,3 +329,4 @@ cat "$FRR_CONF"
 echo ""
 echo -e "${GREEN}✓ После перезагрузки туннель поднимется автоматически!${NC}"
 echo -e "${YELLOW}Для проверки: systemctl status gre-tunnel${NC}"
+echo -e "${YELLOW}Для очистки: запустите скрипт и выберите пункт 3${NC}"
