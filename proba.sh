@@ -1,6 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# Настройка GRE туннеля + OSPF с возможностью очистки старой конфигурации
+# Настройка GRE туннеля + OSPF (Alt Linux / FRRouting)
+# Версия: 2.1 - Улучшен ввод нескольких сетей с валидацией
 #===============================================================================
 
 RED='\033[0;31m'
@@ -24,32 +25,18 @@ cleanup_config() {
     echo -e "${YELLOW}=== ОЧИСТКА ПРЕДЫДУЩЕЙ КОНФИГУРАЦИИ ===${NC}"
     echo ""
     
-    # Удаление GRE туннеля
     echo "[1/6] Удаление GRE туннеля..."
-    if ip link show gre1 &>/dev/null; then
-        ip link set gre1 down 2>/dev/null
-        ip tunnel del gre1 2>/dev/null
-        echo "  ✓ GRE туннель удален"
-    else
-        echo "  → GRE туннель не найден"
-    fi
+    ip link set gre1 down 2>/dev/null && ip tunnel del gre1 2>/dev/null && echo "  ✓ Удалён" || echo "  → Не найден"
     
-    # Удаление systemd service
     echo "[2/6] Удаление systemd service..."
-    if [[ -f /etc/systemd/system/gre-tunnel.service ]]; then
-        systemctl stop gre-tunnel.service 2>/dev/null
-        systemctl disable gre-tunnel.service 2>/dev/null
-        rm -f /etc/systemd/system/gre-tunnel.service
-        systemctl daemon-reload
-        echo "  ✓ systemd service удален"
-    else
-        echo "  → systemd service не найден"
-    fi
+    systemctl stop gre-tunnel.service 2>/dev/null
+    systemctl disable gre-tunnel.service 2>/dev/null
+    rm -f /etc/systemd/system/gre-tunnel.service
+    systemctl daemon-reload
+    echo "  ✓ Готово"
     
-    # Очистка FRR конфигурации
-    echo "[3/6] Сброс конфигурации FRR..."
-    if [[ -f "$FRR_CONF" ]]; then
-        cat > "$FRR_CONF" << 'EOF'
+    echo "[3/6] Сброс FRR конфигурации..."
+    cat > "$FRR_CONF" << EOF
 !
 frr version 9.0
 frr defaults traditional
@@ -59,38 +46,22 @@ log syslog informational
 line vty
 !
 EOF
-        echo "  ✓ FRR конфигурация сброшена"
-    else
-        echo "  → FRR конфигурация не найдена"
-    fi
+    echo "  ✓ Готово"
     
-    # Отключение OSPF демона
     echo "[4/6] Отключение OSPF демона..."
-    if [[ -f "$FRR_DAEMONS" ]]; then
-        sed -i 's/^ospfd=.*/ospfd=no/' "$FRR_DAEMONS"
-        echo "  ✓ OSPF демон отключен"
-    else
-        echo "  → Файл демонов не найден"
-    fi
+    sed -i 's/^ospfd=.*/ospfd=no/' "$FRR_DAEMONS" 2>/dev/null
+    echo "  ✓ Готово"
     
-    # Очистка iptables NAT правил
     echo "[5/6] Очистка NAT правил..."
-    nat_rules=$(iptables -t nat -L POSTROUTING -n | grep -c "gre1" 2>/dev/null || echo "0")
-    if [[ "$nat_rules" -gt 0 ]]; then
-        iptables -t nat -F POSTROUTING 2>/dev/null
-        echo "  ✓ NAT правила очищены"
-    else
-        echo "  → NAT правил не найдено"
-    fi
+    iptables -t nat -F POSTROUTING 2>/dev/null
+    echo "  ✓ Готово"
     
-    # Перезапуск FRR
     echo "[6/6] Перезапуск служб..."
     systemctl restart frr 2>/dev/null
-    echo "  ✓ Службы перезапущены"
+    echo "  ✓ Готово"
     
     echo ""
-    echo -e "${GREEN}✓ Очистка завершена!${NC}"
-    echo ""
+    echo -e "${GREEN}✓ Очистка завершена!${NC}\n"
 }
 
 #===============================================================================
@@ -158,107 +129,99 @@ echo ""
 read -p "Выбор [1]: " menu_choice
 
 case $menu_choice in
-    2)
-        CLEANUP="no"
-        ;;
-    3)
-        cleanup_config
-        exit 0
-        ;;
-    4)
-        echo "Выход..."
-        exit 0
-        ;;
-    *)
-        CLEANUP="yes"
-        ;;
+    2) CLEANUP="no" ;;
+    3) cleanup_config; exit 0 ;;
+    4) echo "Выход..."; exit 0 ;;
+    *) CLEANUP="yes" ;;
 esac
 
-# Очистка если выбрана
-if [[ "$CLEANUP" == "yes" ]]; then
-    cleanup_config
-    echo -e "${CYAN}=== НАЧАЛО НАСТРОЙКИ ===${NC}"
-    echo ""
-fi
+[[ "$CLEANUP" == "yes" ]] && cleanup_config
 
 #===============================================================================
-# СБОР ПАРАМЕТРОВ КОНФИГУРАЦИИ
+# СБОР ПАРАМЕТРОВ
 #===============================================================================
-
-# Выбор роли
 echo "=== Выбор роли роутера ==="
 echo "1) HQ-RTR (Router ID: 1.1.1.1)"
 echo "2) BR-RTR (Router ID: 2.2.2.2)"
 read -p "Выберите роль [1]: " role_choice
 
 case $role_choice in
-    2) 
-        ROLE="BR-RTR"
-        RID="2.2.2.2"
-        GRE_IP="172.16.1.2"
-        ;;
-    *) 
-        ROLE="HQ-RTR"
-        RID="1.1.1.1"
-        GRE_IP="172.16.1.1"
-        ;;
+    2) ROLE="BR-RTR"; RID="2.2.2.2"; GRE_IP="172.16.1.2" ;;
+    *) ROLE="HQ-RTR"; RID="1.1.1.1"; GRE_IP="172.16.1.1" ;;
 esac
-
 echo -e "${YELLOW}Роль: $ROLE${NC}"
 
-# Внешний интерфейс
 EXT_IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
 EXT_IP=$(ip -4 addr show "$EXT_IFACE" | grep -oP 'inet \K[\d.]+' | head -1)
 
 echo ""
 echo "=== Параметры GRE туннеля ==="
-echo "Внешний интерфейс: $EXT_IFACE"
-echo "Ваш внешний IP: $EXT_IP"
+echo "Внешний интерфейс: $EXT_IFACE | Ваш IP: $EXT_IP"
 read -p "IP удаленного роутера: " REMOTE_IP
 read -p "Локальный IP туннеля [$GRE_IP]: " user_gre
 GRE_IP="${user_gre:-$GRE_IP}"
 read -p "Маска туннеля [24]: " gre_mask
-gre_mask="${gre_mask:-24}"
-GRE_FULL_IP="${GRE_IP}/${gre_mask}"
+GRE_FULL_IP="${GRE_IP}/${gre_mask:-24}"
 
-# Ввод сетей для OSPF
+#===============================================================================
+# ВВОД НЕСКОЛЬКИХ СЕТЕЙ С ВАЛИДАЦИЕЙ
+#===============================================================================
 echo ""
 echo "=== Сети для OSPF ==="
-echo "Введите сети которые нужно анонсировать в OSPF (через пробел):"
-echo "Пример: 192.168.6.0/28 192.168.10.0/26 10.0.0.0/24"
+echo "Введите сети через пробел или запятую:"
+echo "Пример: 192.168.6.0/28 192.168.10.0/26, 10.0.0.0/24"
 echo ""
-read -p "Сети OSPF: " OSPF_NETWORKS_INPUT
 
-# Проверка ввода
-if [[ -z "$OSPF_NETWORKS_INPUT" ]]; then
-    echo -e "${RED}Ошибка: Не введены сети OSPF!${NC}"
-    exit 1
-fi
+while true; do
+    read -p "> " RAW_INPUT
+    # Заменяем запятые на пробелы, убираем лишние пробелы
+    CLEANED_INPUT=$(echo "$RAW_INPUT" | tr ',' ' ' | xargs)
+    
+    declare -a OSPF_NETWORKS=()
+    valid_count=0
+    
+    for net in $CLEANED_INPUT; do
+        # Проверка формата IPv4/CIDR
+        if [[ $net =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+            mask=${net##*/}
+            if (( mask >= 1 && mask <= 32 )); then
+                OSPF_NETWORKS+=("$net")
+                ((valid_count++))
+            else
+                echo -e "${YELLOW}⚠ Некорректная маска: $net${NC}"
+            fi
+        else
+            echo -e "${YELLOW}⚠ Пропущено: $net${NC}"
+        fi
+    done
+    
+    if (( valid_count > 0 )); then
+        echo ""
+        echo -e "${GREEN}✓ Распознано сетей: $valid_count${NC}"
+        for n in "${OSPF_NETWORKS[@]}"; do echo "   • $n"; done
+        echo ""
+        read -p "Подтвердить сети? [Y/n]: " confirm
+        confirm=${confirm:-y}
+        [[ $confirm =~ ^[Yy]$ ]] && break
+    else
+        echo -e "${RED}✗ Нет корректных сетей. Попробуйте снова.${NC}"
+    fi
+done
 
-# Area ID
-read -p "Area ID [0]: " area_id
+read -p "Area ID для всех сетей [0]: " area_id
 area_id="${area_id:-0}"
-
-# Пароль OSPF
-echo ""
 read -p "Пароль OSPF [123]: " pass
 pass="${pass:-123}"
 
 #===============================================================================
 # ПРИМЕНЕНИЕ КОНФИГУРАЦИИ
 #===============================================================================
-
-# Создаем systemd service для GRE
 echo ""
-echo -e "${CYAN}Создание GRE туннеля...${NC}"
+echo -e "${CYAN}Применение конфигурации...${NC}"
 create_gre_systemd "$EXT_IP" "$REMOTE_IP" "$GRE_FULL_IP"
-
-# Включаем OSPF
 enable_ospf_daemon
 
-# Настраиваем FRR с введенными сетями
-echo -e "${CYAN}Настройка OSPF...${NC}"
-
+# Генерация FRR конфига
 cat > "$FRR_CONF" << EOF
 !
 frr version 9.0
@@ -274,12 +237,9 @@ router ospf
  ip ospf authentication-key $pass
 EOF
 
-# Добавляем сети в OSPF
-for network in $OSPF_NETWORKS_INPUT; do
-    echo " network $network area $area_id" >> "$FRR_CONF"
+for net in "${OSPF_NETWORKS[@]}"; do
+    echo " network $net area $area_id" >> "$FRR_CONF"
 done
-
-# Добавляем туннельную сеть
 echo " network 172.16.1.0/24 area $area_id" >> "$FRR_CONF"
 
 cat >> "$FRR_CONF" << EOF
@@ -288,45 +248,44 @@ line vty
 !
 EOF
 
-# Включаем IP forwarding
+# Системные настройки
 echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-# NAT для туннеля (для всех введенных сетей)
-echo -e "${CYAN}Настройка NAT...${NC}"
-for network in $OSPF_NETWORKS_INPUT; do
-    iptables -t nat -A POSTROUTING -s $network -o gre1 -j MASQUERADE 2>/dev/null || true
-    echo "  ✓ Добавлен NAT для: $network"
+# NAT для всех указанных сетей
+iptables -t nat -F POSTROUTING 2>/dev/null
+for net in "${OSPF_NETWORKS[@]}"; do
+    iptables -t nat -A POSTROUTING -s $net -o gre1 -j MASQUERADE 2>/dev/null
+    echo -e "  ${GREEN}✓${NC} NAT: $net -> gre1"
 done
 
-# Включаем службы
-systemctl enable frr
-systemctl enable gre-tunnel
-
-# Запускаем
-echo ""
-echo -e "${CYAN}Запуск служб...${NC}"
+systemctl enable frr gre-tunnel >/dev/null 2>&1
 systemctl start gre-tunnel
 systemctl restart frr
 
-# Проверяем
+#===============================================================================
+# ПРОВЕРКА И ВЫВОД
+#===============================================================================
 sleep 3
 echo ""
 echo -e "${GREEN}=== НАСТРОЙКА ЗАВЕРШЕНА ===${NC}"
 echo ""
-echo "GRE туннель:"
-ip link show gre1
-ip addr show gre1
+echo "📡 GRE туннель:"
+ip -brief link show gre1 2>/dev/null || echo "  Не поднят"
+ip -brief addr show gre1 2>/dev/null
+
 echo ""
-echo "OSPF соседи:"
-vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "Подождите 10 секунд и проверьте снова"
+echo "🤝 OSPF соседи:"
+vtysh -c "show ip ospf neighbor" 2>/dev/null | grep -E "(Neighbor|State)" || echo "  Ожидание соседства..."
+
 echo ""
-echo "Маршруты OSPF:"
-vtysh -c "show ip route ospf" 2>/dev/null | head -20
+echo " Маршруты:"
+ip route | grep -E "(gre1|ospf)" | head -5 || echo "  Маршрутов нет"
+
 echo ""
-echo -e "${YELLOW}Конфигурация FRR:${NC}"
-cat "$FRR_CONF"
+echo -e "${YELLOW}💡 Полезные команды:${NC}"
+echo "  systemctl status gre-tunnel   # Статус туннеля"
+echo "  vtysh -c 'show ip ospf neighbor' # Соседи OSPF"
+echo "  ./$0                          # Повторный запуск скрипта"
 echo ""
-echo -e "${GREEN}✓ После перезагрузки туннель поднимется автоматически!${NC}"
-echo -e "${YELLOW}Для проверки: systemctl status gre-tunnel${NC}"
-echo -e "${YELLOW}Для очистки: запустите скрипт и выберите пункт 3${NC}"
+echo -e "${GREEN}✅ Конфигурация сохранится после перезагрузки!${NC}"
