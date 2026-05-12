@@ -527,7 +527,7 @@ $TTL 1D
 1   IN PTR localhost.
 EOF
 
-cat > ${CHROOT_VAR}/named.root << 'EOF'
+cat >${CHROOT_VAR}/named.root << 'EOF'
 . 3600000 NS a.root-servers.net.
 a.root-servers.net. 3600000 A 198.41.0.4
 . 3600000 NS b.root-servers.net.
@@ -540,6 +540,20 @@ d.root-servers.net. 3600000 A 199.7.91.13
 e.root-servers.net. 3600000 A 192.203.230.10
 . 3600000 NS f.root-servers.net.
 f.root-servers.net. 3600000 A 192.5.5.241
+. 3600000 NS g.root-servers.net.
+g.root-servers.net. 3600000 A 192.112.36.4
+. 3600000 NS h.root-servers.net.
+h.root-servers.net. 3600000 A 198.97.190.53
+. 3600000 NS i.root-servers.net.
+i.root-servers.net. 3600000 A 192.36.148.17
+. 3600000 NS j.root-servers.net.
+j.root-servers.net. 3600000 A 192.58.128.30
+. 3600000 NS k.root-servers.net.
+k.root-servers.net. 3600000 A 193.0.14.129
+. 3600000 NS l.root-servers.net.
+l.root-servers.net. 3600000 A 199.7.83.42
+. 3600000 NS m.root-servers.net.
+m.root-servers.net. 3600000 A 202.12.27.33
 EOF
 
 chown named:named ${CHROOT_VAR}/named.localhost
