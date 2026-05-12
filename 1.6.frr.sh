@@ -2,7 +2,7 @@
 
 #===============================================================================
 # ИДЕАЛЬНЫЙ СКРИПТ НАСТРОЙКИ FRR (OSPF + GRE) ДЛЯ ALT LINUX
-# Версия 3.4 - Исправлен синтаксис для совместимости
+# Версия 3.5 - Исправлен автозапуск и применение конфигурации
 #===============================================================================
 
 set -e
@@ -51,11 +51,13 @@ save_frr_config() {
     # Метод 2: Копируем frr.conf в vtysh.conf
     if [[ -f "$FRR_CONF" ]]; then
         cp "$FRR_CONF" /etc/frr/vtysh.conf 2>/dev/null || true
+        chmod 644 /etc/frr/vtysh.conf 2>/dev/null || true
         print_ok "Конфигурация скопирована в vtysh.conf"
     fi
     
     # Метод 3: Перезапускаем FRR
-    systemctl restart frr 2>/dev/null || true
+    systemctl restart frr 2>/dev/null || service frr restart 2>/dev/null || true
+    sleep 2
     print_ok "FRR перезапущен"
 }
 
@@ -95,7 +97,7 @@ EOF
         sed -i 's/^ospf6d=.*/ospf6d=no/' "$FRR_DAEMONS"
     fi
     
-    systemctl restart frr 2>/dev/null || true
+    systemctl restart frr 2>/dev/null || service frr restart 2>/dev/null || true
     print_ok "FRR сброшен"
 }
 
@@ -182,7 +184,48 @@ EOF
             echo "zebra=yes" >> "$FRR_DAEMONS"
         fi
     fi
+    chmod 644 "$FRR_DAEMONS"
     print_ok "ospfd=yes установлен"
+}
+
+#===============================================================================
+# НАСТРОЙКА AUTOЗАПУСКА
+#===============================================================================
+enable_autostart() {
+    print_msg "Включение автозапуска служб..."
+    
+    # FRR
+    if command -v systemctl &>/dev/null; then
+        systemctl enable frr 2>/dev/null || true
+        print_ok "frr включен в автозапуск (systemd)"
+    else
+        chkconfig frr on 2>/dev/null || true
+        print_ok "frr включен в автозапуск (sysv)"
+    fi
+    
+    # etcnet - ИСПРАВЛЕНО!
+    if command -v systemctl &>/dev/null; then
+        # Проверяем есть ли systemd unit для net
+        if systemctl list-unit-files | grep -q 'net.service'; then
+            systemctl enable net 2>/dev/null || true
+            print_ok "net включен в автозапуск (systemd)"
+        else
+            print_warn "net.service не найден, пропускаем"
+        fi
+    else
+        chkconfig net on 2>/dev/null || true
+        print_ok "net включен в автозапуск (sysv)"
+    fi
+    
+    # Для etcnet создаем скрипт в rc.local если нужно
+    if [[ -f /etc/rc.d/rc.local ]]; then
+        if ! grep -q 'ifup gre1' /etc/rc.d/rc.local 2>/dev/null; then
+            echo "# Auto-start GRE tunnel" >> /etc/rc.d/rc.local
+            echo "ifup gre1" >> /etc/rc.d/rc.local
+            chmod +x /etc/rc.d/rc.local
+            print_ok "Добавлен ifup gre1 в rc.local"
+        fi
+    fi
 }
 
 #===============================================================================
@@ -202,7 +245,7 @@ setup_frr() {
     if ! command -v vtysh &>/dev/null; then
         print_msg "Установка FRR..."
         apt-get update >/dev/null 2>&1 || true
-        apt-get install -y frr >/dev/null 2>&1
+        apt-get install -y frr frr-pythontools >/dev/null 2>&1
         print_ok "FRR установлен"
     else
         print_ok "FRR уже установлен"
@@ -233,7 +276,7 @@ setup_frr() {
     # === GRE ТУННЕЛЬ ===
     echo -e "\n${YELLOW}=== Шаг 2: Настройка GRE ===${NC}"
     
-    # Выбор внешнего интерфейса - ИСПРАВЛЕНО!
+    # Выбор внешнего интерфейса
     print_msg "Доступные интерфейсы:"
     i=1
     > /tmp/interfaces.txt
@@ -326,15 +369,36 @@ line vty
 !
 EOF
     
+    chmod 644 "$FRR_CONF"
+    print_ok "frr.conf создан"
+    
+    # Показываем конфиг
+    echo -e "\n${CYAN}=== OSPF Конфигурация ===${NC}"
+    cat "$FRR_CONF"
+    echo ""
+    
     # === СОХРАНЕНИЕ КОНФИГА ===
     save_frr_config
     
     # === АВТОЗАПУСК ===
-    print_msg "Включение автозапуска..."
-    systemctl enable frr 2>/dev/null || true
-    systemctl enable net 2>/dev/null || true
-    systemctl restart frr
+    enable_autostart
+    
+    # === ПРОВЕРКА И ПРИМЕНЕНИЕ ===
+    print_msg "Применение конфигурации..."
+    
+    # Перезапускаем FRR
+    systemctl restart frr 2>/dev/null || service frr restart 2>/dev/null || true
     sleep 3
+    
+    # Проверяем статус
+    echo -e "\n${CYAN}=== Статус FRR ===${NC}"
+    if systemctl is-active frr &>/dev/null; then
+        print_ok "FRR работает"
+    else
+        print_warn "FRR не активен, пробуем запустить..."
+        systemctl start frr 2>/dev/null || service frr start 2>/dev/null || true
+        sleep 2
+    fi
     
     # === ИТОГИ ===
     clear
@@ -347,16 +411,16 @@ EOF
     echo "Туннель: $GRE_IP"
     
     echo -e "\n${WHITE}ПРОВЕРКА ПЕРСИСТЕНТНОСТИ:${NC}"
-    if systemctl is-enabled frr &>/dev/null; then
+    if systemctl is-enabled frr &>/dev/null 2>&1; then
         echo -e "${GREEN}[OK]${NC} frr автозапуск"
     else
         echo -e "${RED}[!!]${NC} frr автозапуск"
     fi
     
-    if systemctl is-enabled net &>/dev/null; then
+    if systemctl is-enabled net &>/dev/null 2>&1; then
         echo -e "${GREEN}[OK]${NC} net автозапуск"
     else
-        echo -e "${RED}[!!]${NC} net автозапуск"
+        echo -e "${YELLOW}[!!]${NC} net автозапуск (не критично)"
     fi
     
     if grep -q '^ospfd=yes' "$FRR_DAEMONS" 2>/dev/null; then
@@ -371,15 +435,23 @@ EOF
         echo -e "${RED}[!!]${NC} gre1"
     fi
     
-    echo -e "\n${MAGENTA}ПРОВЕРКА:${NC}"
+    if [[ -f /etc/frr/vtysh.conf ]]; then
+        echo -e "${GREEN}[OK]${NC} vtysh.conf существует"
+    else
+        echo -e "${YELLOW}[!]${NC} vtysh.conf"
+    fi
+    
+    echo -e "\n${MAGENTA}ПРОВЕРКА РАБОТЫ:${NC}"
     echo " vtysh -c 'show ip ospf neighbor'"
     echo " vtysh -c 'show ip route ospf'"
     echo " ip link show gre1"
+    echo " systemctl status frr"
     
-    echo -e "\n${CYAN}ПОСЛЕ ПЕРЕЗАГРУЗКИ проверьте:${NC}"
+    echo -e "\n${CYAN}ПОСЛЕ ПЕРЕЗАГРУЗКИ:${NC}"
     echo " systemctl status frr"
     echo " ip link show gre1"
     echo " vtysh -c 'show ip ospf neighbor'"
+    echo " vtysh -c 'show ip route ospf'"
 }
 
 #===============================================================================
@@ -387,14 +459,15 @@ EOF
 #===============================================================================
 clear
 echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║ FRR OSPF/GRE Setup v3.4                    ║${NC}"
+echo -e "${CYAN}║ FRR OSPF/GRE Setup v3.5                    ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
 echo ""
 echo "1) Настроить FRR (OSPF + GRE)"
 echo "2) Удалить все настройки"
 echo "3) Показать конфигурацию"
 echo "4) Проверить персистентность"
-echo "5) Выход"
+echo "5) Проверить работу OSPF"
+echo "6) Выход"
 read -p "Выбор [1]: " choice
 
 case $choice in
@@ -411,16 +484,16 @@ case $choice in
         ;;
     4)
         echo -e "\n${WHITE}=== ПРОВЕРКА ПЕРСИСТЕНТНОСТИ ===${NC}"
-        if systemctl is-enabled frr &>/dev/null; then
+        if systemctl is-enabled frr &>/dev/null 2>&1; then
             echo -e "${GREEN}[OK]${NC} frr"
         else
             echo -e "${RED}[!!]${NC} frr"
         fi
         
-        if systemctl is-enabled net &>/dev/null; then
+        if systemctl is-enabled net &>/dev/null 2>&1; then
             echo -e "${GREEN}[OK]${NC} net"
         else
-            echo -e "${RED}[!!]${NC} net"
+            echo -e "${YELLOW}[!!]${NC} net (не критично)"
         fi
         
         if grep -q '^ospfd=yes' "$FRR_DAEMONS" 2>/dev/null; then
@@ -441,7 +514,24 @@ case $choice in
             echo -e "${YELLOW}[!]${NC} vtysh.conf"
         fi
         ;;
-    5) exit 0 ;;
+    5)
+        echo -e "\n${WHITE}=== ПРОВЕРКА РАБОТЫ OSPF ===${NC}"
+        echo -e "\n${CYAN}Статус FRR:${NC}"
+        systemctl status frr --no-pager 2>/dev/null | head -5 || service frr status 2>/dev/null | head -5
+        
+        echo -e "\n${CYAN}Интерфейс gre1:${NC}"
+        ip link show gre1 2>/dev/null || echo "gre1 не найден"
+        
+        echo -e "\n${CYAN}Соседи OSPF:${NC}"
+        vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "OSPF не активен"
+        
+        echo -e "\n${CYAN}Маршруты OSPF:${NC}"
+        vtysh -c "show ip route ospf" 2>/dev/null || echo "Маршрутов OSPF нет"
+        
+        echo -e "\n${CYAN}Конфиг OSPF:${NC}"
+        vtysh -c "show running-config ospfd" 2>/dev/null || echo "OSPF конфиг не найден"
+        ;;
+    6) exit 0 ;;
     *) setup_frr ;;
 esac
 
