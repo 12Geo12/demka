@@ -2,12 +2,12 @@
 
 #===============================================================================
 # ИДЕАЛЬНЫЙ СКРИПТ НАСТРОЙКИ FRR (OSPF + GRE) ДЛЯ ALT LINUX
-# Версия 3.3 - ИСПРАВЛЕНО: полная персистентность + write memory
+# Версия 3.4 - Исправлен синтаксис для совместимости
 #===============================================================================
 
 set -e
 
-# Цвета - ИСПРАВЛЕНО!
+# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -28,39 +28,39 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Функции логирования - ИСПРАВЛЕНО!
+# Функции логирования
 print_msg() { echo -e "${CYAN}[i]${NC} $1"; }
 print_ok() { echo -e "${GREEN}[OK]${NC} $1"; }
 print_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_err() { echo -e "${RED}[X]${NC} $1"; }
 
 #===============================================================================
-# ФУНКЦИЯ СОХРАНЕНИЯ КОНФИГУРАЦИИ FRR (КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ!)
+# ФУНКЦИЯ СОХРАНЕНИЯ КОНФИГУРАЦИИ FRR
 #===============================================================================
 save_frr_config() {
-    print_msg "Сохранение конфигурации FRR для персистентности..."
+    print_msg "Сохранение конфигурации FRR..."
     
-    # Метод 1: Используем vtysh write memory (рекомендуется)
+    # Метод 1: vtysh write memory
     if command -v vtysh &>/dev/null; then
-        vtysh -c "write memory" 2>/dev/null && {
+        if vtysh -c "write memory" 2>/dev/null; then
             print_ok "Конфигурация сохранена через 'write memory'"
             return 0
-        }
+        fi
     fi
     
-    # Метод 2: Копируем frr.conf в vtysh.conf (альтернатива)
+    # Метод 2: Копируем frr.conf в vtysh.conf
     if [[ -f "$FRR_CONF" ]]; then
         cp "$FRR_CONF" /etc/frr/vtysh.conf 2>/dev/null || true
         print_ok "Конфигурация скопирована в vtysh.conf"
     fi
     
-    # Метод 3: Перезапускаем FRR для применения конфига
+    # Метод 3: Перезапускаем FRR
     systemctl restart frr 2>/dev/null || true
-    print_ok "FRR перезапущен для применения настроек"
+    print_ok "FRR перезапущен"
 }
 
 #===============================================================================
-# ФУНКЦИЯ ОЧИСТКИ GRE ТУННЕЛЯ
+# ФУНКЦИЯ ОЧИСТКИ
 #===============================================================================
 cleanup_gre() {
     print_msg "Очистка старых настроек GRE..."
@@ -72,30 +72,24 @@ cleanup_gre() {
     print_ok "GRE туннель очищен"
 }
 
-#===============================================================================
-# ФУНКЦИЯ ОЧИСТКИ FRR
-#===============================================================================
 cleanup_frr() {
     print_msg "Сброс конфигурации FRR..."
     
-    # Бэкап
     if [[ -f "$FRR_CONF" ]]; then
         mkdir -p "$BACKUP_DIR"
         cp "$FRR_CONF" "$BACKUP_DIR/frr.conf.$(date +%Y%m%d_%H%M%S)"
     fi
     
-    # Сброс к дефолту
     cat > "$FRR_CONF" << 'EOF'
 frr version 9.0
 frr defaults traditional
-hostname $(hostname)
+hostname FRR
 log syslog informational
 !
 line vty
 !
 EOF
     
-    # Отключаем ospfd
     if [[ -f "$FRR_DAEMONS" ]]; then
         sed -i 's/^ospfd=.*/ospfd=no/' "$FRR_DAEMONS"
         sed -i 's/^ospf6d=.*/ospf6d=no/' "$FRR_DAEMONS"
@@ -129,25 +123,25 @@ extract_cidr() {
 #===============================================================================
 add_networks_manual() {
     local networks=""
-    echo -e "\n${YELLOW}=== Добавление сетей для OSPF ===${NC}" >&2
-    echo "" >&2
-    echo "Вводите сети в формате: 192.168.10.0/24" >&2
-    echo "Пустая строка = завершить" >&2
-    echo "--------------------------------" >&2
+    echo -e "\n${YELLOW}=== Добавление сетей для OSPF ===${NC}"
+    echo ""
+    echo "Вводите сети в формате: 192.168.10.0/24"
+    echo "Пустая строка = завершить"
+    echo "--------------------------------"
     
     while true; do
         read -p "Сеть (Enter = готово): " net
         [[ -z "$net" ]] && break
         if [[ "$net" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
             networks+=" network $net area 0\n"
-            print_ok "Добавлена: $net" >&2
+            print_ok "Добавлена: $net"
         else
-            print_warn "Неверный формат!" >&2
+            print_warn "Неверный формат!"
         fi
     done
     
-    [[ -z "$networks" ]] && print_warn "Сети не добавлены" >&2
-    echo -e "$networks"  # Только это в stdout
+    [[ -z "$networks" ]] && print_warn "Сети не добавлены"
+    echo -e "$networks"
 }
 
 #===============================================================================
@@ -157,7 +151,7 @@ enable_ospf_daemon() {
     print_msg "Настройка /etc/frr/daemons..."
     
     if [[ ! -f "$FRR_DAEMONS" ]]; then
-        cat > "$FRR_DAEMONS" << 'DAEMONSEOF'
+        cat > "$FRR_DAEMONS" << 'EOF'
 # FRR daemons configuration
 zebra=yes
 bgpd=no
@@ -175,14 +169,18 @@ sharpd=no
 pbrd=no
 bfdd=no
 fabricd=no
-DAEMONSEOF
+EOF
     else
-        grep -q '^ospfd=' "$FRR_DAEMONS" && \
-            sed -i 's/^ospfd=.*/ospfd=yes/' "$FRR_DAEMONS" || \
+        if grep -q '^ospfd=' "$FRR_DAEMONS"; then
+            sed -i 's/^ospfd=.*/ospfd=yes/' "$FRR_DAEMONS"
+        else
             echo "ospfd=yes" >> "$FRR_DAEMONS"
-        grep -q '^zebra=' "$FRR_DAEMONS" && \
-            sed -i 's/^zebra=.*/zebra=yes/' "$FRR_DAEMONS" || \
+        fi
+        if grep -q '^zebra=' "$FRR_DAEMONS"; then
+            sed -i 's/^zebra=.*/zebra=yes/' "$FRR_DAEMONS"
+        else
             echo "zebra=yes" >> "$FRR_DAEMONS"
+        fi
     fi
     print_ok "ospfd=yes установлен"
 }
@@ -194,7 +192,10 @@ setup_frr() {
     # === ОЧИСТКА ===
     echo -e "\n${YELLOW}=== Очистка старых настроек ===${NC}"
     read -p "Удалить предыдущие настройки? [y/N]: " cleanup_ans
-    [[ "$cleanup_ans" =~ ^[Yy]$ ]] && full_cleanup && sleep 2
+    if [[ "$cleanup_ans" =~ ^[Yy]$ ]]; then
+        full_cleanup
+        sleep 2
+    fi
     
     # === УСТАНОВКА ===
     print_msg "Проверка FRR..."
@@ -232,32 +233,39 @@ setup_frr() {
     # === GRE ТУННЕЛЬ ===
     echo -e "\n${YELLOW}=== Шаг 2: Настройка GRE ===${NC}"
     
-    # Выбор внешнего интерфейса
-    mapfile -t IFACES < <(ls /sys/class/net/ | grep -v lo | grep -v gre)
-    echo "Доступные интерфейсы:"
-    for i in "${!IFACES[@]}"; do
-        ip_info=$(ip -4 addr show "${IFACES[$i]}" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
-        printf " %2d) %-10s %s\n" $((i+1)) "${IFACES[$i]}" "$ip_info"
+    # Выбор внешнего интерфейса - ИСПРАВЛЕНО!
+    print_msg "Доступные интерфейсы:"
+    i=1
+    > /tmp/interfaces.txt
+    for iface in $(ls /sys/class/net/ | grep -v lo | grep -v gre); do
+        ip_info=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
+        printf "%2d) %-10s %s\n" $i "$iface" "$ip_info"
+        echo "$iface" >> /tmp/interfaces.txt
+        i=$((i+1))
     done
     
-    read -p "Внешний интерфейс: " ext_idx
-    EXT_IFACE="${IFACES[$((ext_idx-1))]}"
+    read -p "Внешний интерфейс (номер): " ext_idx
+    EXT_IFACE=$(sed -n "${ext_idx}p" /tmp/interfaces.txt)
     EXT_IP=$(ip -4 addr show "$EXT_IFACE" | grep -oP 'inet \K[\d.]+' | head -1)
     print_ok "Выбран: $EXT_IFACE ($EXT_IP)"
     
     read -p "IP удаленного роутера: " REMOTE_IP
     
     # IP туннеля
-    [[ "$ROLE" == "HQ-RTR" ]] && DEF_GRE="172.16.100.1/29" || DEF_GRE="172.16.100.2/29"
+    if [[ "$ROLE" == "HQ-RTR" ]]; then
+        DEF_GRE="172.16.100.1/29"
+    else
+        DEF_GRE="172.16.100.2/29"
+    fi
     read -p "IP туннеля [$DEF_GRE]: " GRE_INPUT
     GRE_INPUT="${GRE_INPUT:-$DEF_GRE}"
     GRE_IP="$GRE_INPUT"
     
-    # === etcnet конфиг для GRE (ПЕРСИСТЕНТНОСТЬ) ===
+    # === etcnet конфиг для GRE ===
     print_msg "Создание /etc/net/ifaces/gre1..."
     mkdir -p "$IFACES_DIR/gre1"
     
-    cat > "$IFACES_DIR/gre1/options" <<EOF
+    cat > "$IFACES_DIR/gre1/options" << EOF
 TYPE=gre
 DISABLE=no
 BOOTPROTO=static
@@ -267,8 +275,7 @@ TTL=64
 EOF
     
     echo "$GRE_IP" > "$IFACES_DIR/gre1/ipv4address"
-    # ВАЖНО: Добавляем маршрут по умолчанию через туннель (если нужно)
-    echo "" > "$IFACES_DIR/gre1/ipv4routes" 2>/dev/null || true
+    touch "$IFACES_DIR/gre1/ipv4routes"
     
     print_ok "Конфиг etcnet создан"
     
@@ -283,7 +290,12 @@ EOF
     ip link set gre1 up
     sleep 2
     
-    ip link show gre1 &>/dev/null && print_ok "Туннель активен" || { print_err "Ошибка туннеля!"; exit 1; }
+    if ip link show gre1 &>/dev/null; then
+        print_ok "Туннель активен"
+    else
+        print_err "Ошибка туннеля!"
+        exit 1
+    fi
     
     # === OSPF ===
     echo -e "\n${YELLOW}=== Шаг 3: Настройка OSPF ===${NC}"
@@ -296,7 +308,7 @@ EOF
     
     # Генерация frr.conf
     print_msg "Генерация $FRR_CONF..."
-    cat > "$FRR_CONF" <<EOF
+    cat > "$FRR_CONF" << EOF
 frr version 9.0
 frr defaults traditional
 hostname $(hostname)
@@ -314,10 +326,10 @@ line vty
 !
 EOF
     
-    # === КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: СОХРАНЕНИЕ КОНФИГА ===
+    # === СОХРАНЕНИЕ КОНФИГА ===
     save_frr_config
     
-    # === АВТОЗАПУСК СЛУЖБ ===
+    # === АВТОЗАПУСК ===
     print_msg "Включение автозапуска..."
     systemctl enable frr 2>/dev/null || true
     systemctl enable net 2>/dev/null || true
@@ -327,7 +339,7 @@ EOF
     # === ИТОГИ ===
     clear
     echo -e "${GREEN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║ НАСТРОЙКА ЗАВЕРШЕНА ║${NC}"
+    echo -e "${GREEN}║ НАСТРОЙКА ЗАВЕРШЕНА                        ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════════╝${NC}"
     echo -e "\n${WHITE}ПАРАМЕТРЫ:${NC}"
     echo "Роль: $ROLE"
@@ -335,10 +347,29 @@ EOF
     echo "Туннель: $GRE_IP"
     
     echo -e "\n${WHITE}ПРОВЕРКА ПЕРСИСТЕНТНОСТИ:${NC}"
-    systemctl is-enabled frr &>/dev/null && echo -e "${GREEN}[OK]${NC} frr автозапуск" || echo -e "${RED}[!!]${NC} frr автозапуск"
-    systemctl is-enabled net &>/dev/null && echo -e "${GREEN}[OK]${NC} net автозапуск" || echo -e "${RED}[!!]${NC} net автозапуск"
-    grep -q '^ospfd=yes' "$FRR_DAEMONS" 2>/dev/null && echo -e "${GREEN}[OK]${NC} ospfd=yes" || echo -e "${RED}[!!]${NC} ospfd"
-    grep -q 'DISABLE=no' "$IFACES_DIR/gre1/options" 2>/dev/null && echo -e "${GREEN}[OK]${NC} gre1: DISABLE=no" || echo -e "${RED}[!!]${NC} gre1"
+    if systemctl is-enabled frr &>/dev/null; then
+        echo -e "${GREEN}[OK]${NC} frr автозапуск"
+    else
+        echo -e "${RED}[!!]${NC} frr автозапуск"
+    fi
+    
+    if systemctl is-enabled net &>/dev/null; then
+        echo -e "${GREEN}[OK]${NC} net автозапуск"
+    else
+        echo -e "${RED}[!!]${NC} net автозапуск"
+    fi
+    
+    if grep -q '^ospfd=yes' "$FRR_DAEMONS" 2>/dev/null; then
+        echo -e "${GREEN}[OK]${NC} ospfd=yes"
+    else
+        echo -e "${RED}[!!]${NC} ospfd"
+    fi
+    
+    if grep -q 'DISABLE=no' "$IFACES_DIR/gre1/options" 2>/dev/null; then
+        echo -e "${GREEN}[OK]${NC} gre1: DISABLE=no"
+    else
+        echo -e "${RED}[!!]${NC} gre1"
+    fi
     
     echo -e "\n${MAGENTA}ПРОВЕРКА:${NC}"
     echo " vtysh -c 'show ip ospf neighbor'"
@@ -356,7 +387,7 @@ EOF
 #===============================================================================
 clear
 echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║ FRR OSPF/GRE Setup v3.3 (персистентный) ║${NC}"
+echo -e "${CYAN}║ FRR OSPF/GRE Setup v3.4                    ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
 echo ""
 echo "1) Настроить FRR (OSPF + GRE)"
@@ -370,17 +401,45 @@ case $choice in
     2) full_cleanup ;;
     3)
         echo -e "\n${WHITE}=== OSPF конфиг ===${NC}"
-        [[ -f "$FRR_CONF" ]] && grep -A20 "router ospf" "$FRR_CONF" 2>/dev/null || echo "Не настроен"
+        if [[ -f "$FRR_CONF" ]]; then
+            grep -A20 "router ospf" "$FRR_CONF" 2>/dev/null || echo "Не настроен"
+        else
+            echo "Не настроен"
+        fi
         echo -e "\n${WHITE}=== Соседи OSPF ===${NC}"
         vtysh -c "show ip ospf neighbor" 2>/dev/null || echo "OSPF не активен"
         ;;
     4)
         echo -e "\n${WHITE}=== ПРОВЕРКА ПЕРСИСТЕНТНОСТИ ===${NC}"
-        systemctl is-enabled frr &>/dev/null && echo -e "${GREEN}[OK]${NC} frr" || echo -e "${RED}[!!]${NC} frr"
-        systemctl is-enabled net &>/dev/null && echo -e "${GREEN}[OK]${NC} net" || echo -e "${RED}[!!]${NC} net"
-        grep -q '^ospfd=yes' "$FRR_DAEMONS" 2>/dev/null && echo -e "${GREEN}[OK]${NC} ospfd=yes" || echo -e "${RED}[!!]${NC} ospfd"
-        grep -q 'DISABLE=no' "$IFACES_DIR/gre1/options" 2>/dev/null && echo -e "${GREEN}[OK]${NC} gre1: DISABLE=no" || echo -e "${RED}[!!]${NC} gre1"
-        [[ -f /etc/frr/vtysh.conf ]] && echo -e "${GREEN}[OK]${NC} vtysh.conf существует" || echo -e "${YELLOW}[!]${NC} vtysh.conf"
+        if systemctl is-enabled frr &>/dev/null; then
+            echo -e "${GREEN}[OK]${NC} frr"
+        else
+            echo -e "${RED}[!!]${NC} frr"
+        fi
+        
+        if systemctl is-enabled net &>/dev/null; then
+            echo -e "${GREEN}[OK]${NC} net"
+        else
+            echo -e "${RED}[!!]${NC} net"
+        fi
+        
+        if grep -q '^ospfd=yes' "$FRR_DAEMONS" 2>/dev/null; then
+            echo -e "${GREEN}[OK]${NC} ospfd=yes"
+        else
+            echo -e "${RED}[!!]${NC} ospfd"
+        fi
+        
+        if grep -q 'DISABLE=no' "$IFACES_DIR/gre1/options" 2>/dev/null; then
+            echo -e "${GREEN}[OK]${NC} gre1: DISABLE=no"
+        else
+            echo -e "${RED}[!!]${NC} gre1"
+        fi
+        
+        if [[ -f /etc/frr/vtysh.conf ]]; then
+            echo -e "${GREEN}[OK]${NC} vtysh.conf существует"
+        else
+            echo -e "${YELLOW}[!]${NC} vtysh.conf"
+        fi
         ;;
     5) exit 0 ;;
     *) setup_frr ;;
