@@ -1,7 +1,8 @@
 #!/bin/bash
 #===============================================================================
-# DHCP SERVER SETUP - Версия 2.0
+# DHCP SERVER SETUP - Версия 3.0
 # Полностью автоматическое определение VLAN и сетей
+# Добавлено: резервирование IP для клиентов по MAC-адресу
 #===============================================================================
 
 RED='\033[0;31m'
@@ -10,6 +11,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 MAGENTA='\033[0;35m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 LOG_FILE="/var/log/dhcp-setup-$(date +%Y%m%d-%H%M%S).log"
@@ -36,16 +38,24 @@ fi
 WAN_IFACE=""
 LAN_IFACE=""
 VLAN_PARENT=""
-declare -a VLAN_LIST
-declare -a NETWORKS
+NATIVE_EXISTS=0
+NATIVE_NETWORK=""
+NATIVE_MASK=""
+NATIVE_CIDR=""
+NATIVE_GW=""
+NATIVE_RANGE_START=""
+NATIVE_RANGE_END=""
+NATIVE_BCAST=""
 
 # Временные файлы
 IFACE_DATA="/tmp/dhcp_ifaces_$$"
 VLAN_DATA="/tmp/dhcp_vlans_$$"
 NETWORK_DATA="/tmp/dhcp_networks_$$"
+HOSTS_DATA="/tmp/dhcp_hosts_$$"
 > "$IFACE_DATA"
 > "$VLAN_DATA"
 > "$NETWORK_DATA"
+> "$HOSTS_DATA"
 
 #===============================================================================
 # ФУНКЦИЯ АВТООПРЕДЕЛЕНИЯ ВСЕХ ПАРАМЕТРОВ
@@ -123,16 +133,13 @@ auto_detect_all() {
     sep
     log ""
     
-    # WAN = интерфейс с default route
     if [ -n "$DEF_ROUTE_IFACE" ]; then
         WAN_IFACE="$DEF_ROUTE_IFACE"
         WAN_IP=$(ip -4 addr show dev "$WAN_IFACE" 2>/dev/null | awk '/inet /{print $2}')
         ok "WAN определён: ${WHITE}$WAN_IFACE${NC} (${WAN_IP:-нет IP})"
     else
-        # Ищем интерфейс с публичным IP или первый с IP
         while IFS='|' read -r iface type ip status; do
             if [ "$type" = "PHYSICAL" ] && [ -n "$ip" ] && [ "$ip" != "---" ]; then
-                # Проверяем, не является ли IP частным (LAN)
                 if ! echo "$ip" | grep -qE "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)"; then
                     WAN_IFACE="$iface"
                     WAN_IP="$ip"
@@ -142,7 +149,6 @@ auto_detect_all() {
             fi
         done < "$IFACE_DATA"
         
-        # Если не нашли - берём любой физический с IP
         if [ -z "$WAN_IFACE" ]; then
             while IFS='|' read -r iface type ip status; do
                 if [ "$type" = "PHYSICAL" ] && [ -n "$ip" ] && [ "$ip" != "---" ]; then
@@ -163,7 +169,6 @@ auto_detect_all() {
     sep
     log ""
     
-    # LAN = физические интерфейсы без default route
     LAN_IFACES=""
     while IFS='|' read -r iface type ip status; do
         if [ "$type" = "PHYSICAL" ] && [ "$iface" != "$WAN_IFACE" ]; then
@@ -176,9 +181,7 @@ auto_detect_all() {
         fi
     done < "$IFACE_DATA"
     
-    # Определяем parent для VLAN
     if [ -n "$LAN_IFACES" ]; then
-        # Ищем интерфейс с VLAN субинтерфейсами
         for lan in $LAN_IFACES; do
             VLAN_COUNT=$(grep -c "^${lan}\." "$IFACE_DATA" 2>/dev/null || echo "0")
             if [ "$VLAN_COUNT" -gt 0 ]; then
@@ -188,7 +191,6 @@ auto_detect_all() {
             fi
         done
         
-        # Если не нашли по VLAN, берём первый LAN
         if [ -z "$VLAN_PARENT" ]; then
             VLAN_PARENT=$(echo "$LAN_IFACES" | awk '{print $1}')
             ok "Parent выбран: ${WHITE}$VLAN_PARENT${NC}"
@@ -205,7 +207,6 @@ auto_detect_all() {
     sep
     log ""
     
-    # Функция конвертации IP/mask в параметры сети
     get_network_params() {
         local ip_mask="$1"
         local ip=$(echo "$ip_mask" | cut -d'/' -f1)
@@ -215,7 +216,6 @@ auto_detect_all() {
             return
         fi
         
-        # Вычисляем маску
         local mask=""
         case "$cidr" in
             29) mask="255.255.255.248" ;;
@@ -227,14 +227,12 @@ auto_detect_all() {
             *) mask="255.255.255.0" ;;
         esac
         
-        # Вычисляем сеть
         local o1=$(echo "$ip" | cut -d'.' -f1)
         local o2=$(echo "$ip" | cut -d'.' -f2)
         local o3=$(echo "$ip" | cut -d'.' -f3)
         local o4=$(echo "$ip" | cut -d'.' -f4)
         local network="${o1}.${o2}.${o3}.0"
         
-        # Вычисляем broadcast
         local bcast=""
         case "$cidr" in
             29) bcast="${o1}.${o2}.${o3}.7" ;;
@@ -246,48 +244,53 @@ auto_detect_all() {
             *) bcast="${o1}.${o2}.${o3}.255" ;;
         esac
         
-        # Диапазон DHCP (исключаем gateway и последние адреса)
         local range_start=""
         local range_end=""
+        local last_host=""
         case "$cidr" in
             29)
                 range_start="${o1}.${o2}.${o3}.$((o4 + 1))"
                 range_end="${o1}.${o2}.${o3}.$((o4 + 4))"
+                last_host="${o1}.${o2}.${o3}.6"
                 ;;
             28)
                 range_start="${o1}.${o2}.${o3}.$((o4 + 1))"
                 range_end="${o1}.${o2}.${o3}.14"
+                last_host="${o1}.${o2}.${o3}.14"
                 ;;
             27)
                 range_start="${o1}.${o2}.${o3}.$((o4 + 1))"
                 range_end="${o1}.${o2}.${o3}.30"
+                last_host="${o1}.${o2}.${o3}.30"
                 ;;
             26)
                 range_start="${o1}.${o2}.${o3}.$((o4 + 1))"
                 range_end="${o1}.${o2}.${o3}.62"
+                last_host="${o1}.${o2}.${o3}.62"
                 ;;
             25)
                 range_start="${o1}.${o2}.${o3}.$((o4 + 1))"
                 range_end="${o1}.${o2}.${o3}.126"
+                last_host="${o1}.${o2}.${o3}.126"
                 ;;
             24)
                 range_start="${o1}.${o2}.${o3}.$((o4 + 1))"
                 range_end="${o1}.${o2}.${o3}.254"
+                last_host="${o1}.${o2}.${o3}.254"
                 ;;
             *)
                 range_start="${o1}.${o2}.${o3}.$((o4 + 1))"
                 range_end="${o1}.${o2}.${o3}.254"
+                last_host="${o1}.${o2}.${o3}.254"
                 ;;
         esac
         
-        echo "$network|$mask|$cidr|$ip|$range_start|$range_end|$bcast"
+        echo "$network|$mask|$cidr|$ip|$range_start|$range_end|$bcast|$last_host"
     }
     
-    # Обрабатываем VLAN интерфейсы
     VLAN_FOUND=0
     while IFS='|' read -r iface type ip status; do
         if [ "$type" = "VLAN" ] && [ -n "$ip" ] && [ "$ip" != "---" ]; then
-            # Проверяем что VLAN принадлежит нашему LAN интерфейсу
             parent=$(echo "$iface" | cut -d'.' -f1)
             vid=$(echo "$iface" | cut -d'.' -f2)
             
@@ -303,9 +306,10 @@ auto_detect_all() {
                     range_start=$(echo "$params" | cut -d'|' -f5)
                     range_end=$(echo "$params" | cut -d'|' -f6)
                     bcast=$(echo "$params" | cut -d'|' -f7)
+                    last_host=$(echo "$params" | cut -d'|' -f8)
                     
-                    echo "$iface|$vid|$network|$mask|$cidr|$gateway|$range_start|$range_end|$bcast" >> "$VLAN_DATA"
-                    echo "$network/$cidr" >> "$NETWORK_DATA"
+                    echo "$iface|$vid|$network|$mask|$cidr|$gateway|$range_start|$range_end|$bcast|$last_host" >> "$VLAN_DATA"
+                    echo "$network/$cidr|$iface|$vid" >> "$NETWORK_DATA"
                     
                     log "  ${CYAN}VLAN $vid${NC}: $iface"
                     log "    Сеть: $network/$cidr"
@@ -317,7 +321,7 @@ auto_detect_all() {
     done < "$IFACE_DATA"
     
     #===========================================================================
-    # 5. Определение Native сети (на parent интерфейсе)
+    # 5. Определение Native сети
     #===========================================================================
     sep
     log "${WHITE}=== 5. Определение Native сети ===${NC}"
@@ -336,6 +340,7 @@ auto_detect_all() {
             NATIVE_RANGE_START=$(echo "$params" | cut -d'|' -f5)
             NATIVE_RANGE_END=$(echo "$params" | cut -d'|' -f6)
             NATIVE_BCAST=$(echo "$params" | cut -d'|' -f7)
+            NATIVE_LAST_HOST=$(echo "$params" | cut -d'|' -f8)
             
             ok "Native сеть на $VLAN_PARENT:"
             log "  Сеть: $NATIVE_NETWORK/$NATIVE_CIDR"
@@ -343,48 +348,258 @@ auto_detect_all() {
             log "  DHCP: $NATIVE_RANGE_START - $NATIVE_RANGE_END"
             
             NATIVE_EXISTS=1
+            echo "$NATIVE_NETWORK/$NATIVE_CIDR|$VLAN_PARENT|native" >> "$NETWORK_DATA"
         else
-            warn "Не удалось определить параметры native сети"
             NATIVE_EXISTS=0
         fi
     else
-        warn "IP на $VLAN_PARENT не найден"
         NATIVE_EXISTS=0
     fi
     
     #===========================================================================
-    # 6. Итоговая сводка
+    # 6. Итог
     #===========================================================================
     sep
-    log "${WHITE}=== ИТОГО АВТООПРЕДЕЛЕНО ===${NC}"
+    log "${WHITE}=== ИТОГО ===${NC}"
     sep
     log ""
     
     log "${CYAN}WAN:${NC} ${WHITE}${WAN_IFACE:-не определён}${NC}"
     log "${CYAN}LAN Parent:${NC} ${WHITE}${VLAN_PARENT:-не определён}${NC}"
-    log ""
     
     if [ "$NATIVE_EXISTS" = "1" ]; then
-        log "${MAGENTA}Native (untagged):${NC}"
-        log "  $VLAN_PARENT -> $NATIVE_NETWORK/$NATIVE_CIDR"
-        log "  DHCP: $NATIVE_RANGE_START - $NATIVE_RANGE_END"
-        log ""
+        log "${MAGENTA}Native:${NC} $VLAN_PARENT -> $NATIVE_NETWORK/$NATIVE_CIDR"
     fi
     
     if [ -s "$VLAN_DATA" ]; then
-        log "${CYAN}Tagged VLAN:${NC}"
-        while IFS='|' read -r iface vid network mask cidr gw range_start range_end bcast; do
-            log "  $iface (VLAN $vid) -> $network/$cidr"
+        while IFS='|' read -r iface vid network mask cidr gw range_start range_end bcast last_host; do
+            log "${CYAN}VLAN $vid:${NC} $iface -> $network/$cidr"
         done < "$VLAN_DATA"
-        log ""
     fi
     
-    if [ ! -s "$VLAN_DATA" ] && [ "$NATIVE_EXISTS" != "1" ]; then
-        err "Не определено ни одной сети для DHCP!"
+    log ""
+    return 0
+}
+
+#===============================================================================
+# ФУНКЦИЯ ПОКАЗАТЬ ДОСТУПНЫЕ СЕТИ
+#===============================================================================
+
+show_available_networks() {
+    log ""
+    log "${CYAN}=== Доступные сети для DHCP ===${NC}"
+    log ""
+    
+    idx=0
+    
+    if [ "$NATIVE_EXISTS" = "1" ]; then
+        idx=$((idx + 1))
+        log "  ${GREEN}$idx)${NC} ${MAGENTA}Native${NC} ($VLAN_PARENT) -> $NATIVE_NETWORK/$NATIVE_CIDR"
+        log "      Шлюз: $NATIVE_GW | DHCP: $NATIVE_RANGE_START - $NATIVE_RANGE_END"
+    fi
+    
+    if [ -s "$VLAN_DATA" ]; then
+        while IFS='|' read -r iface vid network mask cidr gw range_start range_end bcast last_host; do
+            idx=$((idx + 1))
+            log "  ${GREEN}$idx)${NC} ${CYAN}VLAN $vid${NC} ($iface) -> $network/$cidr"
+            log "      Шлюз: $gw | DHCP: $range_start - $range_end"
+        done < "$VLAN_DATA"
+    fi
+    
+    echo "$idx" > /tmp/dhcp_net_count_$$
+    log ""
+}
+
+#===============================================================================
+# ФУНКЦИЯ ДОБАВЛЕНИЯ СТАТИЧЕСКОГО IP КЛИЕНТУ
+#===============================================================================
+
+add_static_host() {
+    log ""
+    log "${CYAN}╔════════════════════════════════════════════════════════╗${NC}"
+    log "${CYAN}║${NC}        ${WHITE}РЕЗЕРВИРОВАНИЕ IP ДЛЯ КЛИЕНТА${NC}                 ${CYAN}║${NC}"
+    log "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
+    log ""
+    
+    # Показываем доступные сети
+    show_available_networks
+    
+    NET_COUNT=$(cat /tmp/dhcp_net_count_$$ 2>/dev/null || echo "0")
+    
+    if [ "$NET_COUNT" -eq 0 ]; then
+        err "Нет доступных сетей! Сначала выполните автоопределение."
         return 1
     fi
     
-    return 0
+    # Выбор сети
+    log "${YELLOW}Выберите сеть для клиента:${NC}"
+    read -p "Номер сети: " net_num
+    net_num=${net_num:-1}
+    
+    if [ "$net_num" -lt 1 ] || [ "$net_num" -gt "$NET_COUNT" ]; then
+        err "Неверный номер сети"
+        return 1
+    fi
+    
+    # Определяем выбранную сеть
+    SELECTED_NETWORK=""
+    SELECTED_GW=""
+    SELECTED_MASK=""
+    SELECTED_IFACE=""
+    SELECTED_VLAN=""
+    SELECTED_LAST_HOST=""
+    
+    current=0
+    
+    if [ "$NATIVE_EXISTS" = "1" ]; then
+        current=$((current + 1))
+        if [ "$current" -eq "$net_num" ]; then
+            SELECTED_NETWORK="$NATIVE_NETWORK"
+            SELECTED_GW="$NATIVE_GW"
+            SELECTED_MASK="$NATIVE_MASK"
+            SELECTED_IFACE="$VLAN_PARENT"
+            SELECTED_VLAN="native"
+            SELECTED_LAST_HOST="$NATIVE_LAST_HOST"
+        fi
+    fi
+    
+    if [ -z "$SELECTED_NETWORK" ] && [ -s "$VLAN_DATA" ]; then
+        while IFS='|' read -r iface vid network mask cidr gw range_start range_end bcast last_host; do
+            current=$((current + 1))
+            if [ "$current" -eq "$net_num" ]; then
+                SELECTED_NETWORK="$network"
+                SELECTED_GW="$gw"
+                SELECTED_MASK="$mask"
+                SELECTED_IFACE="$iface"
+                SELECTED_VLAN="$vid"
+                SELECTED_LAST_HOST="$last_host"
+                break
+            fi
+        done < "$VLAN_DATA"
+    fi
+    
+    ok "Выбрана сеть: ${WHITE}$SELECTED_NETWORK${NC} (${SELECTED_IFACE})"
+    log ""
+    
+    # Ввод имени клиента
+    log "${YELLOW}Введите имя клиента (без пробелов):${NC}"
+    read -p "Имя: " host_name
+    
+    if [ -z "$host_name" ]; then
+        err "Имя не указано"
+        return 1
+    fi
+    
+    # Ввод MAC-адреса
+    log ""
+    log "${YELLOW}Введите MAC-адрес клиента:${NC}"
+    log "  Формат: XX:XX:XX:XX:XX:XX (например: 00:11:22:33:44:55)"
+    read -p "MAC: " host_mac
+    
+    if [ -z "$host_mac" ]; then
+        err "MAC-адрес не указан"
+        return 1
+    fi
+    
+    # Проверка формата MAC
+    if ! echo "$host_mac" | grep -qE "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"; then
+        err "Неверный формат MAC-адреса"
+        return 1
+    fi
+    
+    # Ввод IP-адреса
+    log ""
+    log "${YELLOW}Введите IP-адрес для клиента:${NC}"
+    log "  Сеть: $SELECTED_NETWORK/$SELECTED_MASK"
+    log "  Шлюз: $SELECTED_GW"
+    log "  Доступные адреса (примерно): $SELECTED_GW + 1 до $SELECTED_LAST_HOST"
+    read -p "IP-адрес: " host_ip
+    
+    if [ -z "$host_ip" ]; then
+        err "IP-адрес не указан"
+        return 1
+    fi
+    
+    # Проверка на дубликат MAC
+    if [ -f "$HOSTS_DATA" ] && grep -qi "$host_mac" "$HOSTS_DATA" 2>/dev/null; then
+        warn "MAC $host_mac уже есть в списке!"
+        read -p "Перезаписать? (y/n): " overwrite
+        if [ "$overwrite" != "y" ] && [ "$overwrite" != "Y" ]; then
+            log "Отменено"
+            return
+        fi
+        grep -vi "$host_mac" "$HOSTS_DATA" > "${HOSTS_DATA}.tmp"
+        mv "${HOSTS_DATA}.tmp" "$HOSTS_DATA"
+    fi
+    
+    # Сохраняем данные
+    echo "$host_name|$host_mac|$host_ip|$SELECTED_IFACE|$SELECTED_VLAN|$SELECTED_NETWORK" >> "$HOSTS_DATA"
+    
+    ok "Клиент добавлен:"
+    log "  Имя: ${WHITE}$host_name${NC}"
+    log "  MAC: ${WHITE}$host_mac${NC}"
+    log "  IP: ${WHITE}$host_ip${NC}"
+    log "  Сеть: ${WHITE}$SELECTED_IFACE${NC} (VLAN ${SELECTED_VLAN:-native})"
+    log ""
+}
+
+#===============================================================================
+# ФУНКЦИЯ ПОКАЗАТЬ СПИСОК СТАТИЧЕСКИХ КЛИЕНТОВ
+#===============================================================================
+
+show_static_hosts() {
+    log ""
+    log "${CYAN}=== Зарезервированные адреса ===${NC}"
+    log ""
+    
+    if [ ! -s "$HOSTS_DATA" ]; then
+        warn "Нет зарезервированных адресов"
+        return
+    fi
+    
+    printf "  %-12s %-20s %-18s %-12s %s\n" "Имя" "MAC" "IP" "Интерфейс" "VLAN"
+    echo "  ----------------------------------------------------------------------"
+    
+    while IFS='|' read -r name mac ip iface vlan network; do
+        printf "  %-12s %-20s %-18s %-12s %s\n" "$name" "$mac" "$ip" "$iface" "${vlan:-native}"
+    done < "$HOSTS_DATA"
+    
+    log ""
+}
+
+#===============================================================================
+# ФУНКЦИЯ УДАЛЕНИЯ СТАТИЧЕСКОГО КЛИЕНТА
+#===============================================================================
+
+delete_static_host() {
+    log ""
+    log "${CYAN}=== Удаление клиента ===${NC}"
+    log ""
+    
+    if [ ! -s "$HOSTS_DATA" ]; then
+        warn "Нет зарезервированных адресов"
+        return
+    fi
+    
+    show_static_hosts
+    
+    log "${YELLOW}Введите имя клиента для удаления:${NC}"
+    read -p "Имя: " del_name
+    
+    if [ -z "$del_name" ]; then
+        err "Имя не указано"
+        return
+    fi
+    
+    if grep -qi "^${del_name}|" "$HOSTS_DATA" 2>/dev/null; then
+        grep -vi "^${del_name}|" "$HOSTS_DATA" > "${HOSTS_DATA}.tmp"
+        mv "${HOSTS_DATA}.tmp" "$HOSTS_DATA"
+        ok "Клиент '$del_name' удалён"
+    else
+        err "Клиент '$del_name' не найден"
+    fi
+    
+    log ""
 }
 
 #===============================================================================
@@ -398,14 +613,8 @@ setup_dhcp() {
     log "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
     log ""
     
-    # Автоопределение
     auto_detect_all
-    if [ $? -ne 0 ]; then
-        err "Автоопределение не удалось"
-        return 1
-    fi
     
-    # Подтверждение
     log ""
     read -p "Продолжить настройку DHCP? (y/n) [y]: " confirm
     confirm=${confirm:-y}
@@ -448,7 +657,6 @@ setup_dhcp() {
     DHCP_CONF="/etc/dhcp/dhcpd.conf"
     DHCP_ARGS="$VLAN_PARENT"
     
-    # Начинаем конфиг
     cat > "$DHCP_CONF" << 'DHCPHEAD'
 # DHCP Configuration - Auto-generated
 default-lease-time 600;
@@ -457,7 +665,24 @@ authoritative;
 ddns-update-style none;
 DHCPHEAD
     
-    # Добавляем native subnet
+    # Добавляем host declarations для статических клиентов
+    if [ -s "$HOSTS_DATA" ]; then
+        log "${CYAN}Добавление статических привязок...${NC}"
+        while IFS='|' read -r name mac ip iface vlan network; do
+            cat >> "$DHCP_CONF" << HOSTDECL
+
+# Static: $name ($iface)
+host $name {
+    hardware ethernet $mac;
+    fixed-address $ip;
+}
+HOSTDECL
+            ok "  $name -> $ip ($mac)"
+        done < "$HOSTS_DATA"
+        log ""
+    fi
+    
+    # Native subnet
     if [ "$NATIVE_EXISTS" = "1" ]; then
         cat >> "$DHCP_CONF" << NATIVE_SUBNET
 
@@ -471,12 +696,11 @@ subnet $NATIVE_NETWORK netmask $NATIVE_MASK {
     option domain-name-servers 8.8.8.8, 8.8.4.4;
 }
 NATIVE_SUBNET
-        
         ok "Native subnet: $NATIVE_NETWORK/$NATIVE_CIDR"
     fi
     
-    # Добавляем VLAN subnets
-    while IFS='|' read -r iface vid network mask cidr gw range_start range_end bcast; do
+    # VLAN subnets
+    while IFS='|' read -r iface vid network mask cidr gw range_start range_end bcast last_host; do
         cat >> "$DHCP_CONF" << VLAN_SUBNET
 
 # VLAN $vid on $iface
@@ -489,12 +713,11 @@ subnet $network netmask $mask {
     option domain-name-servers 8.8.8.8, 8.8.4.4;
 }
 VLAN_SUBNET
-        
         ok "VLAN $vid subnet: $network/$cidr"
         DHCP_ARGS="$DHCP_ARGS $iface"
     done < "$VLAN_DATA"
     
-    # Настройка интерфейсов для прослушивания
+    # Интерфейсы для прослушивания
     if [ -f "/etc/sysconfig/dhcpd" ]; then
         echo "DHCPDARGS=\"$DHCP_ARGS\"" > /etc/sysconfig/dhcpd
     elif [ -f "/etc/default/isc-dhcp-server" ]; then
@@ -503,7 +726,7 @@ VLAN_SUBNET
     
     ok "Интерфейсы DHCP: $DHCP_ARGS"
     
-    # Создаём leases файл
+    # Leases файл
     LEASE_FILE="/var/lib/dhcp/dhcpd.leases"
     LEASE_DIR=$(dirname "$LEASE_FILE")
     [ ! -d "$LEASE_DIR" ] && mkdir -p "$LEASE_DIR"
@@ -540,7 +763,7 @@ VLAN_SUBNET
     ok "IP forwarding включён"
     
     #===========================================================================
-    # NAT (если есть WAN)
+    # NAT
     #===========================================================================
     if [ -n "$WAN_IFACE" ] && [ "$WAN_IFACE" != "$VLAN_PARENT" ]; then
         sep
@@ -548,7 +771,6 @@ VLAN_SUBNET
         sep
         log ""
         
-        # NAT для native
         if [ "$NATIVE_EXISTS" = "1" ]; then
             iptables -t nat -A POSTROUTING -s "$NATIVE_NETWORK/$NATIVE_CIDR" -o "$WAN_IFACE" -j MASQUERADE 2>/dev/null
             iptables -A FORWARD -i "$VLAN_PARENT" -o "$WAN_IFACE" -j ACCEPT 2>/dev/null
@@ -556,15 +778,13 @@ VLAN_SUBNET
             ok "NAT: $NATIVE_NETWORK/$NATIVE_CIDR -> $WAN_IFACE"
         fi
         
-        # NAT для VLAN
-        while IFS='|' read -r iface vid network mask cidr gw range_start range_end bcast; do
+        while IFS='|' read -r iface vid network mask cidr gw range_start range_end bcast last_host; do
             iptables -t nat -A POSTROUTING -s "$network/$cidr" -o "$WAN_IFACE" -j MASQUERADE 2>/dev/null
             iptables -A FORWARD -i "$iface" -o "$WAN_IFACE" -j ACCEPT 2>/dev/null
             iptables -A FORWARD -i "$WAN_IFACE" -o "$iface" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
             ok "NAT: $network/$cidr -> $WAN_IFACE"
         done < "$VLAN_DATA"
         
-        # Сохраняем правила
         if command -v iptables-save >/dev/null 2>&1; then
             iptables-save > /etc/sysconfig/iptables 2>/dev/null || \
             iptables-save > /etc/iptables/rules.v4 2>/dev/null
@@ -601,30 +821,58 @@ VLAN_SUBNET
     log "${GREEN}╚════════════════════════════════════════════════════════╝${NC}"
     log ""
     
-    log "${CYAN}Параметры:${NC}"
-    log "  WAN: ${WHITE}${WAN_IFACE}${NC}"
-    log "  LAN: ${WHITE}${VLAN_PARENT}${NC}"
-    log ""
-    
-    if [ "$NATIVE_EXISTS" = "1" ]; then
-        log "${MAGENTA}Native (untagged):${NC}"
-        log "  $VLAN_PARENT -> $NATIVE_NETWORK/$NATIVE_CIDR"
-        log "  DHCP: $NATIVE_RANGE_START - $NATIVE_RANGE_END"
-        log ""
-    fi
-    
-    if [ -s "$VLAN_DATA" ]; then
-        log "${CYAN}Tagged VLAN:${NC}"
-        while IFS='|' read -r iface vid network mask cidr gw range_start range_end bcast; do
-            log "  $iface (VLAN $vid) -> $network/$cidr"
-            log "    DHCP: $range_start - $range_end"
-        done < "$VLAN_DATA"
-        log ""
-    fi
+    show_static_hosts
     
     log "${CYAN}Команды проверки:${NC}"
     log "  ${YELLOW}systemctl status dhcpd${NC}"
     log "  ${YELLOW}cat /var/lib/dhcp/dhcpd.leases${NC}"
+    log "  ${YELLOW}cat /etc/dhcp/dhcpd.conf${NC}"
+    log ""
+}
+
+#===============================================================================
+# ФУНКЦИЯ ПЕРЕЗАПУСКА DHCP С ПРИМЕНЕНИЕМ ИЗМЕНЕНИЙ
+#===============================================================================
+
+restart_dhcp() {
+    log ""
+    log "${YELLOW}Перезапуск DHCP с применением изменений...${NC}"
+    
+    # Пересоздаём конфиг с текущими hosts
+    if [ -s "$HOSTS_DATA" ]; then
+        DHCP_CONF="/etc/dhcp/dhcpd.conf"
+        
+        # Бэкап
+        cp "$DHCP_CONF" "${DHCP_CONF}.bak" 2>/dev/null
+        
+        # Удаляем старые host declarations
+        sed -i '/^# Static:/,/^}$/d' "$DHCP_CONF" 2>/dev/null
+        sed -i '/^host /,/^}$/d' "$DHCP_CONF" 2>/dev/null
+        
+        # Добавляем актуальные
+        while IFS='|' read -r name mac ip iface vlan network; do
+            cat >> "$DHCP_CONF" << HOSTDECL
+
+# Static: $name ($iface)
+host $name {
+    hardware ethernet $mac;
+    fixed-address $ip;
+}
+HOSTDECL
+        done < "$HOSTS_DATA"
+        
+        ok "Конфигурация обновлена"
+    fi
+    
+    systemctl restart dhcpd 2>/dev/null || systemctl restart isc-dhcp-server 2>/dev/null
+    sleep 2
+    
+    if systemctl is-active dhcpd >/dev/null 2>&1 || systemctl is-active isc-dhcp-server >/dev/null 2>&1; then
+        ok "DHCP сервер перезапущен"
+    else
+        err "Ошибка перезапуска DHCP"
+    fi
+    
     log ""
 }
 
@@ -639,7 +887,6 @@ check_dhcp() {
     log "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
     log ""
     
-    # Статус сервиса
     sep
     log "${WHITE}=== Статус сервиса ===${NC}"
     sep
@@ -650,14 +897,12 @@ check_dhcp() {
         err "DHCP сервер: ${RED}НЕ АКТИВЕН${NC}"
     fi
     
-    # Прослушиваемые интерфейсы
     sep
     log "${WHITE}=== Прослушиваемые порты ===${NC}"
     sep
     
     ss -ulnp | grep ":67" 2>/dev/null || warn "Нет прослушивания на порту 67"
     
-    # Leases
     sep
     log "${WHITE}=== Арендованные адреса ===${NC}"
     sep
@@ -666,10 +911,12 @@ check_dhcp() {
     if [ -f "$LEASE_FILE" ] && [ -s "$LEASE_FILE" ]; then
         LEASE_COUNT=$(grep -c "lease" "$LEASE_FILE" 2>/dev/null || echo "0")
         ok "Leases: $LEASE_COUNT записей"
-        tail -20 "$LEASE_FILE"
+        tail -30 "$LEASE_FILE"
     else
         warn "Нет арендованных адресов"
     fi
+    
+    show_static_hosts
     
     log ""
 }
@@ -688,6 +935,7 @@ clean_dhcp() {
     rm -f /etc/dhcp/dhcpd.conf 2>/dev/null
     rm -f /var/lib/dhcp/dhcpd.leases 2>/dev/null
     touch /var/lib/dhcp/dhcpd.leases 2>/dev/null
+    rm -f "$HOSTS_DATA" 2>/dev/null
     
     ok "Настройки DHCP очищены"
     log ""
@@ -700,12 +948,16 @@ clean_dhcp() {
 show_menu() {
     log ""
     log "${CYAN}╔════════════════════════════════════════════════════════╗${NC}"
-    log "${CYAN}║${NC}              ${WHITE}МЕНЮ DHCP SERVER v2.0${NC}                       ${CYAN}║${NC}"
+    log "${CYAN}║${NC}              ${WHITE}МЕНЮ DHCP SERVER v3.0${NC}                       ${CYAN}║${NC}"
     log "${CYAN}╠════════════════════════════════════════════════════════╣${NC}"
     log "${CYAN}║${NC}  ${GREEN}1.${NC} Автоопределение параметров                         ${CYAN}║${NC}"
     log "${CYAN}║${NC}  ${GREEN}2.${NC} Настроить DHCP сервер                              ${CYAN}║${NC}"
-    log "${CYAN}║${NC}  ${GREEN}3.${NC} Проверить DHCP сервер                              ${CYAN}║${NC}"
-    log "${CYAN}║${NC}  ${GREEN}4.${NC} Очистить настройки DHCP                            ${CYAN}║${NC}"
+    log "${CYAN}║${NC}  ${GREEN}3.${NC} Выдать IP клиенту по VLAN                           ${CYAN}║${NC}"
+    log "${CYAN}║${NC}  ${GREEN}4.${NC} Показать список клиентов                            ${CYAN}║${NC}"
+    log "${CYAN}║${NC}  ${GREEN}5.${NC} Удалить клиента                                     ${CYAN}║${NC}"
+    log "${CYAN}║${NC}  ${GREEN}6.${NC} Перезапустить DHCP (применить изменения)           ${CYAN}║${NC}"
+    log "${CYAN}║${NC}  ${GREEN}7.${NC} Проверить DHCP сервер                              ${CYAN}║${NC}"
+    log "${CYAN}║${NC}  ${GREEN}8.${NC} Очистить настройки DHCP                            ${CYAN}║${NC}"
     log "${CYAN}║${NC}  ${RED}0.${NC} Выход                                               ${CYAN}║${NC}"
     log "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
     log ""
@@ -724,14 +976,26 @@ while true; do
             setup_dhcp
             ;;
         3)
-            check_dhcp
+            add_static_host
             ;;
         4)
+            show_static_hosts
+            ;;
+        5)
+            delete_static_host
+            ;;
+        6)
+            restart_dhcp
+            ;;
+        7)
+            check_dhcp
+            ;;
+        8)
             clean_dhcp
             ;;
         0)
             ok "Выход"
-            rm -f "$IFACE_DATA" "$VLAN_DATA" "$NETWORK_DATA" 2>/dev/null
+            rm -f "$IFACE_DATA" "$VLAN_DATA" "$NETWORK_DATA" /tmp/dhcp_net_count_$$ 2>/dev/null
             exit 0
             ;;
         *)
