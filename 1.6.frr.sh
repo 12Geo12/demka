@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# Настройка FRRouting (OSPF + GRE) - Версия 6.0
-# Полностью совместима с sh и bash, ручной ввод GRE IP
+# Настройка FRRouting (OSPF + GRE) - Версия 7.0
+# Добавлено: удаление старых настроек FRR перед настройкой
 #===============================================================================
 
 RED='\033[0;31m'
@@ -32,6 +32,76 @@ log ""
 log "${CYAN}╔════════════════════════════════════════════════════════╗${NC}"
 log "${CYAN}║${NC}    ${WHITE}FRRouting OSPF + GRE - Автоматическая настройка${NC}     ${CYAN}║${NC}"
 log "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
+log ""
+
+#===============================================================================
+# ОЧИСТКА СТАРЫХ НАСТРОЕК FRR
+#===============================================================================
+
+sep
+log "${WHITE}=== Очистка старых настроек FRR ===${NC}"
+sep
+log ""
+
+log "${YELLOW}Остановка служб...${NC}"
+systemctl stop frr 2>/dev/null && ok "FRR остановлен" || warn "FRR не был запущен"
+
+log "${YELLOW}Удаление GRE туннелей...${NC}"
+# Удаляем все GRE туннели
+for gre_iface in $(ip link show 2>/dev/null | grep -oP 'gre\d+' | sort -u); do
+    ip link set "$gre_iface" down 2>/dev/null
+    ip tunnel del "$gre_iface" 2>/dev/null && ok "Удалён $gre_iface"
+done
+
+# Специфично для gre1
+ip link set gre1 down 2>/dev/null
+ip tunnel del gre1 2>/dev/null
+ip addr del 172.16.1.1/24 dev gre1 2>/dev/null
+ip addr del 172.16.1.2/24 dev gre1 2>/dev/null
+
+log "${YELLOW}Удаление конфигурационных файлов...${NC}"
+
+# Резервная копия старых конфигов
+BACKUP_DIR="/var/backups/frr-$(date +%Y%m%d-%H%M%S)"
+if [ -d "/etc/frr" ] || [ -d "/etc/net/ifaces/gre1" ] || [ -f "/etc/systemd/system/gre-tunnel.service" ]; then
+    mkdir -p "$BACKUP_DIR"
+    ok "Резервные копии: $BACKUP_DIR"
+fi
+
+# Бэкап и удаление /etc/frr
+if [ -d "/etc/frr" ]; then
+    cp -r /etc/frr "$BACKUP_DIR/" 2>/dev/null
+    rm -rf /etc/frr/frr.conf 2>/dev/null
+    rm -rf /etc/frr/daemons 2>/dev/null
+    rm -rf /etc/frr/zebra.conf 2>/dev/null
+    rm -rf /etc/frr/ospfd.conf 2>/dev/null
+    ok "Очищен /etc/frr/"
+fi
+
+# Бэкап и удаление GRE в etcnet
+if [ -d "/etc/net/ifaces/gre1" ]; then
+    cp -r /etc/net/ifaces/gre1 "$BACKUP_DIR/gre1-etcnet" 2>/dev/null
+    rm -rf /etc/net/ifaces/gre1 2>/dev/null
+    ok "Удалён /etc/net/ifaces/gre1"
+fi
+
+# Удаление systemd service для GRE
+if [ -f "/etc/systemd/system/gre-tunnel.service" ]; then
+    cp /etc/systemd/system/gre-tunnel.service "$BACKUP_DIR/" 2>/dev/null
+    rm -f /etc/systemd/system/gre-tunnel.service
+    systemctl daemon-reload
+    ok "Удалён gre-tunnel.service"
+fi
+
+# Отключаем FRR от автозагрузки (будет включён заново при настройке)
+systemctl disable frr 2>/dev/null
+
+# Очистка маршрутов OSPF
+log "${YELLOW}Очистка OSPF маршрутов...${NC}"
+ip route flush proto ospf 2>/dev/null && ok "OSPF маршруты очищены"
+
+log ""
+ok "${GREEN}Очистка завершена!${NC}"
 log ""
 
 #===============================================================================
@@ -496,17 +566,25 @@ log "${WHITE}=== Системные настройки ===${NC}"
 sep
 log ""
 
-grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || \
-    echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-ok "IP forwarding"
+# Удаляем дубликаты в sysctl.conf
+grep -v '^net.ipv4.ip_forward=' /etc/sysctl.conf > /tmp/sysctl_$$ 2>/dev/null
+mv /tmp/sysctl_$$ /etc/sysctl.conf 2>/dev/null
+grep -v '^net.ipv4.conf.all.rp_filter=' /etc/sysctl.conf > /tmp/sysctl_$$ 2>/dev/null
+mv /tmp/sysctl_$$ /etc/sysctl.conf 2>/dev/null
+grep -v '^net.ipv4.conf.default.rp_filter=' /etc/sysctl.conf > /tmp/sysctl_$$ 2>/dev/null
+mv /tmp/sysctl_$$ /etc/sysctl.conf 2>/dev/null
 
-grep -q 'rp_filter=2' /etc/sysctl.conf 2>/dev/null || cat >> /etc/sysctl.conf << 'SYSCTL'
+# Добавляем настройки
+cat >> /etc/sysctl.conf << 'SYSCTL'
+net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=2
 net.ipv4.conf.default.rp_filter=2
 SYSCTL
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1
-ok "rp_filter"
+sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1
+ok "sysctl настроен"
 
 #===============================================================================
 # ЗАПУСК
@@ -541,7 +619,7 @@ fi
 
 log ""
 log "${CYAN}OSPF соседи:${NC}"
-vtysh -c "show ip ospf neighbor" 2>/dev/null || warn "Нет соседей"
+vtysh -c "show ip ospf neighbor" 2>/dev/null || warn "Нет соседей (подождите 30 сек)"
 
 log ""
 log "${CYAN}OSPF маршруты:${NC}"
@@ -571,7 +649,10 @@ while read -r net; do
 done < "$NETWORKS_LIST"
 log "  ${GREEN}•${NC} $GRE_NET (GRE)"
 log ""
-log "${CYAN}Команды:${NC}"
+log "${CYAN}Резервные копии:${NC}"
+log "  ${YELLOW}$BACKUP_DIR${NC}"
+log ""
+log "${CYAN}Команды проверки:${NC}"
 log "  ${YELLOW}vtysh -c 'show ip ospf neighbor'${NC}"
 log "  ${YELLOW}ip route show | grep ospf${NC}"
 log "  ${YELLOW}ping ${GRE_IP%%/*}${NC}"
