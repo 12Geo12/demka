@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
-# DHCP Server Setup for ALT Linux with VLAN support
-# Версия: 2.0 - Простой, с автоопределением и поддержкой VLAN
+# DHCP Server Setup for ALT Linux - VLAN Support
+# Версия: 3.0 - Очистка старых данных, работа с существующими VLAN
 #===============================================================================
 set -e
 
@@ -12,6 +12,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 DHCP_CONF="/etc/dhcp/dhcpd.conf"
+DHCP_LEASES="/var/lib/dhcp/dhcpd.leases"
 DHCP_DEFAULTS="/etc/sysconfig/dhcpd"
 
 log() { echo -e "${CYAN}[✓]${NC} $1"; }
@@ -24,56 +25,84 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 #===============================================================================
-# АВТООПРЕДЕЛЕНИЕ ИНТЕРФЕЙСОВ
+# ОЧИСТКА СТАРОЙ КОНФИГУРАЦИИ
 #===============================================================================
-get_interfaces() {
-    echo "Доступные интерфейсы:"
-    local i=1
-    > /tmp/dhcp_ifaces
-    for iface in $(ls /sys/class/net/ | grep -v lo); do
-        local ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
-        printf " %2d) %-10s %s\n" $i "$iface" "${ip:-no IP}"
-        echo "$iface" >> /tmp/dhcp_ifaces
-        ((i++))
-    done
-}
-
-#===============================================================================
-# ГЕНЕРАЦИЯ КОНФИГА ДЛЯ ОДНОГО VLAN
-#===============================================================================
-generate_vlan_scope() {
-    local vlan_id=$1
-    local subnet=$2
-    local mask=$3
-    local range_start=$4
-    local range_end=$5
-    local gateway=$6
-    local dns=$7
-    local domain=$8
+cleanup_old_config() {
+    echo -e "${YELLOW}=== Очистка старой конфигурации DHCP ===${NC}"
     
-    cat << EOF
-# VLAN $vlan_id
-subnet $subnet netmask $mask {
-  range $range_start $range_end;
-  option routers $gateway;
-  option domain-name "$domain";
-  option domain-name-servers $dns;
-  option subnet-mask $mask;
-  option broadcast-address ${subnet%.*}.255;
-  default-lease-time 600;
-  max-lease-time 7200;
-}
-EOF
+    # Останавливаем службу
+    systemctl stop dhcpd 2>/dev/null || true
+    
+    # Удаляем старый конфиг
+    if [[ -f "$DHCP_CONF" ]]; then
+        mv "$DHCP_CONF" "${DHCP_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
+        log "Старый конфиг сохранен в backup"
+    fi
+    
+    # Очищаем файл lease (аренд)
+    if [[ -f "$DHCP_LEASES" ]]; then
+        > "$DHCP_LEASES"
+        log "Файл аренд DHCP очищен"
+    fi
+    
+    # Создаем пустой lease файл
+    touch "$DHCP_LEASES"
+    chmod 644 "$DHCP_LEASES"
+    
+    log "Очистка завершена"
 }
 
 #===============================================================================
-# ОСНОВНАЯ НАСТРОЙКА
+# ПОИСК СУЩЕСТВУЮЩИХ VLAN ИНТЕРФЕЙСОВ
+#===============================================================================
+find_vlan_interfaces() {
+    echo -e "\n${CYAN}=== Найденные VLAN интерфейсы ===${NC}"
+    
+    local i=1
+    > /tmp/vlan_ifaces
+    
+    # Ищем VLAN интерфейсы (eth0.10, eth0.20 и т.д.)
+    for iface in $(ls /sys/class/net/ | grep -E '\.[0-9]+$'); do
+        local ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
+        local vlan_id=$(echo "$iface" | grep -oP '\.\K[0-9]+$')
+        
+        if [[ -n "$ip" ]]; then
+            printf " %2d) %-12s VLAN %s | IP: %s\n" $i "$iface" "$vlan_id" "$ip"
+            echo "$iface|$vlan_id|$ip" >> /tmp/vlan_ifaces
+            ((i++))
+        fi
+    done
+    
+    # Если VLAN не найдены, показываем обычные интерфейсы
+    if [[ ! -s /tmp/vlan_ifaces ]]; then
+        warn "VLAN интерфейсы не найдены. Показываю все интерфейсы:"
+        for iface in $(ls /sys/class/net/ | grep -v lo); do
+            local ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
+            if [[ -n "$ip" ]]; then
+                printf " %2d) %-12s %s\n" $i "$iface" "$ip"
+                echo "$iface|0|$ip" >> /tmp/vlan_ifaces
+                ((i++))
+            fi
+        done
+    fi
+    
+    if [[ ! -s /tmp/vlan_ifaces ]]; then
+        err "Интерфейсы с IP адресами не найдены!"
+        exit 1
+    fi
+}
+
+#===============================================================================
+# НАСТРОЙКА DHCP
 #===============================================================================
 setup_dhcp() {
     clear
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  DHCP Server Setup v2.0 (VLAN)         ║${NC}"
+    echo -e "${CYAN}║  DHCP Server Setup v3.0 (VLAN)         ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
+    
+    # Очистка
+    cleanup_old_config
     
     # 1. Установка
     log "Проверка пакетов..."
@@ -86,81 +115,101 @@ setup_dhcp() {
         log "DHCP сервер уже установлен"
     fi
     
-    # 2. Выбор основного интерфейса
-    echo -e "\n${YELLOW}=== Шаг 1: Основной интерфейс ===${NC}"
-    get_interfaces
-    read -p "Выберите интерфейс (номер): " iface_num
-    MAIN_IFACE=$(sed -n "${iface_num}p" /tmp/dhcp_ifaces)
-    MAIN_IP=$(ip -4 addr show "$MAIN_IFACE" | grep -oP 'inet \K[\d.]+' | head -1)
-    MAIN_NET=$(echo "$MAIN_IP" | cut -d'.' -f1-3)
-    log "Выбран: $MAIN_IFACE ($MAIN_IP)"
-    
-    # 3. Глобальные настройки
-    echo -e "\n${YELLOW}=== Шаг 2: Глобальные параметры ===${NC}"
+    # 2. Глобальные настройки
+    echo -e "\n${YELLOW}=== Глобальные параметры ===${NC}"
     read -p "Домен [local.lan]: " DOMAIN
     DOMAIN="${DOMAIN:-local.lan}"
     read -p "DNS серверы [8.8.8.8, 77.88.8.8]: " DNS_SERVERS
     DNS_SERVERS="${DNS_SERVERS:-8.8.8.8, 77.88.8.8}"
     
-    # 4. Настройка VLAN
-    echo -e "\n${YELLOW}=== Шаг 3: Настройка VLAN ===${NC}"
-    echo "Сколько VLAN нужно настроить? (1-10)"
-    read -p "Количество VLAN: " vlan_count
-    vlan_count=${vlan_count:-1}
+    # 3. Показываем VLAN интерфейсы
+    find_vlan_interfaces
     
-    VLAN_CONFIG=""
-    DHCP_INTERFACES="$MAIN_IFACE"
+    echo -e "\n${YELLOW}=== Настройка DHCP для VLAN ===${NC}"
+    echo "Выберите интерфейсы для настройки DHCP (через запятую или пробел)"
+    echo "Пример: 1,2,3 или 1 2 3"
+    read -p "Номера интерфейсов: " selected_ifaces
     
-    for ((v=1; v<=vlan_count; v++)); do
-        echo -e "\n${CYAN}--- VLAN #$v ---${NC}"
-        
-        # VLAN ID
-        read -p "VLAN ID (10-4094) [$((10+v-1))]: " vlan_id
-        vlan_id=${vlan_id:-$((10+v-1))}
-        
-        # Подсеть
-        read -p "Подсеть [$MAIN_NET.0]: " subnet
-        subnet="${subnet:-$MAIN_NET.0}"
-        SUBNET_OCTETS=(${subnet//./ })
-        
-        # Маска
-        read -p "Маска [255.255.255.0]: " mask
-        mask="${mask:-255.255.255.0}"
-        
-        # Диапазон адресов
-        read -p "Начало диапазона [${SUBNET_OCTETS[0]}.${SUBNET_OCTETS[1]}.${SUBNET_OCTETS[2]}.100]: " range_start
-        range_start="${range_start:-${SUBNET_OCTETS[0]}.${SUBNET_OCTETS[1]}.${SUBNET_OCTETS[2]}.100}"
-        read -p "Конец диапазона [${SUBNET_OCTETS[0]}.${SUBNET_OCTETS[1]}.${SUBNET_OCTETS[2]}.200]: " range_end
-        range_end="${range_end:-${SUBNET_OCTETS[0]}.${SUBNET_OCTETS[1]}.${SUBNET_OCTETS[2]}.200}"
-        
-        # Шлюз
-        read -p "Шлюз (обычно .1) [${SUBNET_OCTETS[0]}.${SUBNET_OCTETS[1]}.${SUBNET_OCTETS[2]}.1]: " gateway
-        gateway="${gateway:-${SUBNET_OCTETS[0]}.${SUBNET_OCTETS[1]}.${SUBNET_OCTETS[2]}.1}"
-        
-        # Создаем подинтерфейс если нужно
-        VLAN_IFACE="${MAIN_IFACE}.${vlan_id}"
-        if ! ip link show "$VLAN_IFACE" &>/dev/null; then
-            log "Создание интерфейса $VLAN_IFACE..."
-            ip link add link "$MAIN_IFACE" name "$VLAN_IFACE" type vlan id "$vlan_id" 2>/dev/null || true
-            ip addr add "$gateway/24" dev "$VLAN_IFACE" 2>/dev/null || true
-            ip link set "$VLAN_IFACE" up 2>/dev/null || true
+    # Парсим выбор
+    IFS=', ' read -r -a IFACE_NUMS <<< "$selected_ifaces"
+    
+    DHCP_CONF_CONTENT=""
+    DHCP_INTERFACES=""
+    
+    # Для каждого выбранного интерфейса
+    for num in "${IFACE_NUMS[@]}"; do
+        line=$(sed -n "${num}p" /tmp/vlan_ifaces)
+        if [[ -z "$line" ]]; then
+            warn "Интерфейс #$num не найден, пропускаем"
+            continue
         fi
         
-        DHCP_INTERFACES="$DHCP_INTERFACES $VLAN_IFACE"
+        IFS='|' read -r IFACE VLAN_ID IFACE_IP <<< "$line"
+        
+        # Извлекаем подсеть из IP
+        IP_OCTETS=(${IFACE_IP//\// })
+        IP_PARTS=(${IP_OCTETS[0]//./ })
+        SUBNET="${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.0"
+        GATEWAY="${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.1"
+        MASK="255.255.255.0"
+        
+        echo -e "\n${CYAN}--- Настройка: $IFACE (VLAN $VLAN_ID) ---${NC}"
+        echo "Текущий IP: $IFACE_IP"
+        echo "Подсеть: $SUBNET"
+        
+        # Диапазон адресов
+        read -p "Начало диапазона [${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.100]: " range_start
+        range_start="${range_start:-${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.100}"
+        
+        read -p "Конец диапазона [${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.200]: " range_end
+        range_end="${range_end:-${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.200}"
+        
+        # Шлюз
+        read -p "Шлюз [$GATEWAY]: " gateway
+        gateway="${gateway:-$GATEWAY}"
+        
+        # Добавляем интерфейс в список
+        DHCP_INTERFACES="$DHCP_INTERFACES $IFACE"
         
         # Генерируем конфиг для этого VLAN
-        VLAN_CONFIG+=$(generate_vlan_scope "$vlan_id" "$subnet" "$mask" "$range_start" "$range_end" "$gateway" "$DNS_SERVERS" "$DOMAIN")
-        VLAN_CONFIG+=$'\n\n'
+        if [[ "$VLAN_ID" != "0" ]]; then
+            DHCP_CONF_CONTENT+="
+# VLAN $VLAN_ID - $IFACE
+shared-network vlan${VLAN_ID} {
+  subnet $SUBNET netmask $MASK {
+    range $range_start $range_end;
+    option routers $gateway;
+    option domain-name \"$DOMAIN\";
+    option domain-name-servers $DNS_SERVERS;
+    option subnet-mask $MASK;
+    default-lease-time 600;
+    max-lease-time 7200;
+  }
+}"
+        else
+            DHCP_CONF_CONTENT+="
+# $IFACE
+subnet $SUBNET netmask $MASK {
+  range $range_start $range_end;
+  option routers $gateway;
+  option domain-name \"$DOMAIN\";
+  option domain-name-servers $DNS_SERVERS;
+  option subnet-mask $MASK;
+  default-lease-time 600;
+  max-lease-time 7200;
+}"
+        fi
         
-        log "VLAN $vlan_id: $subnet | $range_start-$range_end | GW: $gateway"
+        log "$IFACE: $range_start - $range_end | GW: $gateway"
     done
     
-    # 5. Генерация основного конфига
-    echo -e "\n${YELLOW}=== Шаг 4: Генерация конфигурации ===${NC}"
+    # 4. Создаем основной конфиг
+    echo -e "\n${YELLOW}=== Генерация конфигурации ===${NC}"
     
     cat > "$DHCP_CONF" << EOF
-# DHCP Server Configuration for VLANs
+# DHCP Server Configuration
 # Generated: $(date)
+# Cleaned old config and leases
 
 authoritative;
 
@@ -174,19 +223,29 @@ option domain-name "$DOMAIN";
 option domain-name-servers $DNS_SERVERS;
 
 # VLAN Scopes
-$VLAN_CONFIG
+$DHCP_CONF_CONTENT
 EOF
     
     chmod 644 "$DHCP_CONF"
     log "Конфиг создан: $DHCP_CONF"
     
-    # 6. Настройка интерфейсов для dhcpd
-    echo -e "\n${YELLOW}=== Шаг 5: Настройка службы ===${NC}"
+    # 5. Настройка службы
+    echo -e "\n${YELLOW}=== Настройка службы ===${NC}"
     
     # Для ALT Linux
     if [[ -f /etc/sysconfig/dhcpd ]]; then
         echo "DHCPD_INTERFACE=\"$DHCP_INTERFACES\"" > /etc/sysconfig/dhcpd
         log "Настроен /etc/sysconfig/dhcpd"
+        log "Интерфейсы: $DHCP_INTERFACES"
+    fi
+    
+    # Проверяем конфиг
+    log "Проверка конфигурации..."
+    if dhcpd -t -cf "$DHCP_CONF" 2>&1 | grep -q "Configuration file tests succeed"; then
+        log "Конфигурация валидна"
+    else
+        warn "Возможны ошибки в конфиге:"
+        dhcpd -t -cf "$DHCP_CONF" 2>&1 | head -5 || true
     fi
     
     # Включаем и запускаем
@@ -194,24 +253,18 @@ EOF
     systemctl restart dhcpd
     sleep 2
     
-    if systemctl is-active dhcpd &>/dev/null; then
-        log "DHCP сервер запущен"
-    else
-        warn "DHCP сервер не запустился, проверяем конфиг..."
-        dhcpd -t -cf "$DHCP_CONF" 2>&1 | head -10 || true
-    fi
-    
-    # 7. Финальная проверка
+    # 6. Финальная проверка
     echo -e "\n${GREEN}=== ИТОГОВАЯ ПРОВЕРКА ===${NC}"
     
-    echo "Интерфейсы DHCP:"
-    echo "$DHCP_INTERFACES" | tr ' ' '\n' | grep -v '^$' | sed 's/^/  • /'
+    if systemctl is-active dhcpd &>/dev/null; then
+        echo -e "${GREEN}✓ DHCP сервер запущен${NC}"
+    else
+        echo -e "${RED}✗ DHCP сервер НЕ запущен${NC}"
+        warn "Проверьте логи: journalctl -u dhcpd -n 20"
+    fi
     
-    echo -e "\nКонфигурация:"
-    grep -E "^subnet|^  range|^  option routers" "$DHCP_CONF" | sed 's/^/  /'
-    
-    echo -e "\nСтатус службы:"
-    systemctl status dhcpd --no-pager -n 3 2>/dev/null | grep -E "Active|Loaded" | sed 's/^/  /'
+    echo -e "\nНастроенные подсети:"
+    grep -E "^  subnet|^    range" "$DHCP_CONF" | sed 's/^/  /'
     
     echo -e "\n${GREEN}════════════════════════════════════${NC}"
     echo -e "${GREEN}НАСТРОЙКА ЗАВЕРШЕНА!${NC}"
@@ -220,10 +273,7 @@ EOF
     echo "Полезные команды:"
     echo "  systemctl status dhcpd"
     echo "  journalctl -u dhcpd -f"
-    echo "  dhcpd -t -cf $DHCP_CONF  # проверка конфига"
-    echo "  tail -f /var/log/messages | grep dhcpd"
-    echo ""
-    echo "Клиенты получат адреса из указанных диапазонов по VLAN!"
+    echo "  cat /var/lib/dhcp/dhcpd.leases  # кто получил IP"
 }
 
 #===============================================================================
@@ -232,14 +282,15 @@ EOF
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  DHCP Server Setup v2.0                ║${NC}"
+    echo -e "${CYAN}║  DHCP Server Setup v3.0                ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
     echo ""
-    echo "1) Настроить DHCP сервер (VLAN)"
+    echo "1) Настроить DHCP (очистка + VLAN)"
     echo "2) Проверить конфигурацию"
     echo "3) Перезапустить DHCP"
     echo "4) Показать логи"
-    echo "5) Выход"
+    echo "5) Показать выданные аренды"
+    echo "6) Выход"
     echo ""
     
     read -p "Выбор [1]: " choice
@@ -249,7 +300,9 @@ while true; do
         1) setup_dhcp; read -p "Нажмите Enter..." ;;
         2) 
             echo -e "\n${CYAN}Проверка конфига:${NC}"
-            dhcpd -t -cf "$DHCP_CONF" 2>&1 || echo "Ошибка в конфиге"
+            dhcpd -t -cf "$DHCP_CONF" 2>&1 || echo "Ошибка"
+            echo -e "\nТекущий конфиг:"
+            cat "$DHCP_CONF" | head -30
             read -p "Нажмите Enter..."
             ;;
         3)
@@ -258,10 +311,19 @@ while true; do
             read -p "Нажмите Enter..."
             ;;
         4)
-            journalctl -u dhcpd --no-pager -n 20
+            journalctl -u dhcpd --no-pager -n 30
             read -p "Нажмите Enter..."
             ;;
-        5) exit 0 ;;
+        5)
+            echo -e "\n${CYAN}Выданные аренды:${NC}"
+            if [[ -f "$DHCP_LEASES" ]]; then
+                cat "$DHCP_LEASES" | grep -E "lease|hardware|uid" | head -20
+            else
+                echo "Файл leases не найден"
+            fi
+            read -p "Нажмите Enter..."
+            ;;
+        6) exit 0 ;;
         *) warn "Неверный выбор" ;;
     esac
 done
