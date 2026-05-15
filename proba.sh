@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # Настройка GRE туннеля + OSPF (Alt Linux / FRRouting)
-# Версия: 3.1 - ИСПРАВЛЕНО: применение конфигурации
+# Версия: 3.2 - ИСПРАВЛЕНО: обработка состояния UNKNOWN и стабильность проверок
 #===============================================================================
 set -e
 
@@ -24,22 +24,23 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 #===============================================================================
-# ФУНКЦИИ ПРОВЕРКИ
+# ФУНКЦИИ ПРОВЕРКИ (ИСПРАВЛЕНО!)
 #===============================================================================
 check_gre_tunnel() {
     echo -e "${CYAN}→ Проверка GRE туннеля...${NC}"
-    if ip link show gre1 &>/dev/null; then
-        local state=$(ip link show gre1 | grep -oP 'state \K\w+')
-        if [[ "$state" == "UP" ]]; then
-            echo -e "  ${GREEN}✓${NC} gre1: UP"
-            ip -brief addr show gre1 | grep "inet " | sed 's/^/    /'
-            return 0
-        else
-            echo -e "  ${YELLOW}!${NC} gre1: $state"
-            return 1
-        fi
-    else
+    if ! ip link show gre1 &>/dev/null; then
         echo -e "  ${RED}✗${NC} gre1: не существует"
+        return 1
+    fi
+    
+    # ИСПРАВЛЕНО: GRE туннели в состоянии UP часто показывают state UNKNOWN
+    local state=$(ip link show gre1 | grep -oP 'state \K\w+')
+    if [[ "$state" == "UP" || "$state" == "UNKNOWN" ]]; then
+        echo -e "  ${GREEN}✓${NC} gre1: $state (Активен)"
+        ip addr show gre1 2>/dev/null | grep "inet " | sed 's/^/    /'
+        return 0
+    else
+        echo -e "  ${RED}✗${NC} gre1: $state (Не активен)"
         return 1
     fi
 }
@@ -66,24 +67,33 @@ check_ospf_status() {
         return 1
     fi
     
-    local neighbors=$(vtysh -c "show ip ospf neighbor" 2>/dev/null | grep -c "Full" || echo "0")
+    local neighbors=$(vtysh -c "show ip ospf neighbor" 2>/dev/null | grep -c "Full" || true)
     if [[ $neighbors -gt 0 ]]; then
         echo -e "  ${GREEN}✓${NC} Соседи OSPF: $neighbors"
     else
-        echo -e "  ${YELLOW}!${NC} Соседей пока нет"
+        echo -e "  ${YELLOW}!${NC} Соседей пока нет (ожидайте)"
     fi
     return 0
 }
 
 check_persistence() {
     echo -e "${CYAN}→ Проверка сохранения...${NC}"
-    systemctl is-enabled frr &>/dev/null && echo -e "  ${GREEN}✓${NC} frr.service enabled" || echo -e "  ${RED}✗${NC} frr.service"
-    [[ -f /etc/frr/vtysh.conf ]] && echo -e "  ${GREEN}✓${NC} vtysh.conf существует" || echo -e "  ${RED}✗${NC} vtysh.conf"
+    if systemctl is-enabled frr &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} frr.service enabled"
+    else
+        echo -e "  ${RED}✗${NC} frr.service"
+    fi
+    
+    if [[ -f /etc/frr/vtysh.conf ]]; then
+        echo -e "  ${GREEN}✓${NC} vtysh.conf существует"
+    else
+        echo -e "  ${RED}✗${NC} vtysh.conf"
+    fi
 }
 
 check_nat_rules() {
     echo -e "${CYAN}→ Проверка NAT...${NC}"
-    local rules=$(iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -c "gre1" || echo "0")
+    local rules=$(iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -c "gre1" || true)
     if [[ $rules -gt 0 ]]; then
         echo -e "  ${GREEN}✓${NC} NAT правил: $rules"
     else
@@ -96,18 +106,20 @@ run_all_checks() {
     echo -e "${GREEN}   ПРОВЕРКА КОНФИГУРАЦИИ${NC}"
     echo -e "${GREEN}════════════════════════════════════${NC}\n"
     
-    check_gre_tunnel
+    # ИСПРАВЛЕНО: || true предотвращает выход из скрипта при ошибке проверки
+    check_gre_tunnel || true
     echo ""
-    check_ospf_status
+    check_ospf_status || true
     echo ""
-    check_persistence
+    check_persistence || true
     echo ""
-    check_nat_rules
+    check_nat_rules || true
+    
     echo ""
 }
 
 #===============================================================================
-# ФУНКЦИЯ ПРИМЕНЕНИЯ КОНФИГУРАЦИИ (ИСПРАВЛЕНО!)
+# ФУНКЦИЯ ПРИМЕНЕНИЯ КОНФИГУРАЦИИ
 #===============================================================================
 apply_configuration() {
     local EXT_IP="$1"
@@ -273,7 +285,7 @@ EOF
 while true; do
     clear
     echo -e "${CYAN}========================================${NC}"
-    echo -e "${CYAN} Настройка GRE туннеля и OSPF v3.1${NC}"
+    echo -e "${CYAN} Настройка GRE туннеля и OSPF v3.2${NC}"
     echo -e "${CYAN}========================================${NC}"
     echo ""
     echo "1) Настроить GRE + OSPF (с очисткой)"
@@ -284,6 +296,7 @@ while true; do
     echo ""
     
     read -p "Выбор [1]: " menu_choice
+    menu_choice=${menu_choice:-1} # Значение по умолчанию
     
     case $menu_choice in
         4)
@@ -315,6 +328,7 @@ while true; do
             echo "1) HQ-RTR (Router ID: 1.1.1.1)"
             echo "2) BR-RTR (Router ID: 2.2.2.2)"
             read -p "Выберите роль [1]: " role_choice
+            role_choice=${role_choice:-1}
             
             case $role_choice in
                 2) ROLE="BR-RTR"; RID="2.2.2.2"; GRE_IP="172.16.1.2" ;;
@@ -359,7 +373,7 @@ while true; do
             # Преобразуем ввод в массив
             IFS=' ' read -r -a NETWORKS_ARRAY <<< "$networks_input"
             
-            # ПРИМЕНЕНИЕ КОНФИГУРАЦИИ (ИСПРАВЛЕНО!)
+            # ПРИМЕНЕНИЕ КОНФИГУРАЦИИ
             if apply_configuration "$EXT_IP" "$REMOTE_IP" "$GRE_FULL_IP" "$RID" "$pass" "${NETWORKS_ARRAY[@]}"; then
                 # Показываем результат
                 run_all_checks
