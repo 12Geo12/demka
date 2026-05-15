@@ -1,7 +1,8 @@
 #!/bin/bash
 #===============================================================================
-# Настройка FRRouting (OSPF + GRE) - Версия 8.0
+# Настройка FRRouting (OSPF + GRE) - Версия 8.1
 # Добавлено: интерактивное меню с проверкой работоспособности
+# Исправлено: функция show_ospf_status (убрана ошибка "No such interface name")
 #===============================================================================
 
 RED='\033[0;31m'
@@ -178,7 +179,7 @@ check_frr_status() {
         warn "OSPF маршруты: ${YELLOW}НЕ НАЙДЕНЫ${NC}"
         WARNINGS=$((WARNINGS + 1))
         log ""
-        log "  ${YELLOW}Проверьте:${CN}"
+        log "  ${YELLOW}Проверьте:${NC}"
         log "    • OSPF соседи установлены?"
         log "    • Сети на удалённом роутере объявлены?"
     fi
@@ -1002,19 +1003,50 @@ show_ospf_status() {
     log ""
     
     log "${YELLOW}OSPF соседи:${NC}"
-    vtysh -c "show ip ospf neighbor" 2>/dev/null || warn "Нет соседей"
+    OSPF_NEIGH=$(vtysh -c "show ip ospf neighbor json" 2>/dev/null)
+    if [ -n "$OSPF_NEIGH" ] && echo "$OSPF_NEIGH" | grep -qv '"{}"'; then
+        vtysh -c "show ip ospf neighbor" 2>/dev/null
+    else
+        warn "Нет соседей OSPF"
+    fi
     
     log ""
     log "${YELLOW}OSPF интерфейсы:${NC}"
-    vtysh -c "show ip ospf interface brief" 2>/dev/null || warn "Нет интерфейсов в OSPF"
+    # Показываем все интерфейсы в OSPF
+    OSPF_IFACES=$(vtysh -c "show ip ospf interface" 2>/dev/null)
+    if [ -n "$OSPF_IFACES" ] && echo "$OSPF_IFACES" | grep -q "gre1\|Interface"; then
+        echo "$OSPF_IFACES"
+    else
+        warn "Нет интерфейсов в OSPF"
+        log "  ${YELLOW}Проверьте, что gre1 добавлен в OSPF${NC}"
+    fi
     
     log ""
     log "${YELLOW}OSPF маршруты:${NC}"
-    vtysh -c "show ip route ospf" 2>/dev/null || warn "Нет OSPF маршрутов"
+    OSPF_RTES=$(vtysh -c "show ip route ospf" 2>/dev/null)
+    if [ -n "$OSPF_RTES" ] && echo "$OSPF_RTES" | grep -q "O "; then
+        echo "$OSPF_RTES"
+    else
+        warn "Нет OSPF маршрутов"
+        log "  ${YELLOW}Маршруты появятся после установки соседей${NC}"
+    fi
     
     log ""
     log "${YELLOW}Router ID:${NC}"
-    vtysh -c "show ip ospf" 2>/dev/null | grep "Router ID" || warn "OSPF не настроен"
+    OSPF_INFO=$(vtysh -c "show ip ospf" 2>/dev/null)
+    if [ -n "$OSPF_INFO" ]; then
+        echo "$OSPF_INFO" | grep -A2 "OSPF Routing Process" || echo "$OSPF_INFO" | head -5
+    else
+        warn "OSPF не настроен или не запущен"
+    fi
+    
+    log ""
+    
+    # Дополнительная диагностика
+    log "${CYAN}--- Дополнительная информация ---${NC}"
+    log ""
+    log "${YELLOW}Конфигурация OSPF:${NC}"
+    vtysh -c "show running-config" 2>/dev/null | grep -A20 "router ospf" | head -15
     
     log ""
 }
