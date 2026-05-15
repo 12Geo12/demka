@@ -1,10 +1,9 @@
 #!/bin/bash
 #===============================================================================
-# Настройка FRRouting (OSPF + GRE туннель) - ПОЛНОСТЬЮ АВТОМАТИЧЕСКИЙ
-# Версия: 4.0 - Исправлены все ошибки совместимости
+# Настройка FRRouting (OSPF + GRE) - Версия 6.0
+# Полностью совместима с sh и bash, ручной ввод GRE IP
 #===============================================================================
 
-# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -15,23 +14,23 @@ NC='\033[0m'
 LOG_FILE="/var/log/frr-setup-$(date +%Y%m%d-%H%M%S).log"
 
 log() { echo -e "$1" | tee -a "$LOG_FILE"; }
-log_ok() { log "${GREEN}[OK]${NC} $1"; }
-log_warn() { log "${YELLOW}[WARN]${NC} $1"; }
-log_err() { log "${RED}[ERR]${NC} $1"; }
+ok() { log "${GREEN}[OK]${NC} $1"; }
+warn() { log "${YELLOW}[WARN]${NC} $1"; }
+err() { log "${RED}[ERR]${NC} $1"; }
 sep() { log "${CYAN}================================================${NC}"; }
 
 #===============================================================================
 # ПРОВЕРКА ROOT
 #===============================================================================
 
-if [ "$EUID" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}Запустите от root!${NC}"
     exit 1
 fi
 
 log ""
 log "${CYAN}╔════════════════════════════════════════════════════════╗${NC}"
-log "${CYAN}║${NC}   ${WHITE}FRRouting (OSPF + GRE) - Автоматическая настройка${NC}   ${CYAN}║${NC}"
+log "${CYAN}║${NC}    ${WHITE}FRRouting OSPF + GRE - Автоматическая настройка${NC}     ${CYAN}║${NC}"
 log "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
 log ""
 
@@ -44,148 +43,121 @@ log "${WHITE}=== Автоопределение интерфейсов ===${NC}"
 sep
 log ""
 
-# Временные файлы вместо массивов (для совместимости)
+# Временные файлы
 IFACE_LIST="/tmp/frr_ifaces_$$"
 VLAN_LIST="/tmp/frr_vlans_$$"
-NETWORKS_LIST="/tmp/frr_networks_$$"
+NETWORKS_LIST="/tmp/frr_nets_$$"
 > "$IFACE_LIST"
 > "$VLAN_LIST"
 > "$NETWORKS_LIST"
 
-# Функция получения IP (без local)
-get_ip() {
-    ip -4 addr show dev "$1" 2>/dev/null | awk '/inet /{print $2}' | head -1
-}
-
-# Функция получения статуса
-get_status() {
-    cat "/sys/class/net/$1/operstate" 2>/dev/null || echo "unknown"
-}
-
-# Функция определения типа интерфейса
-get_type() {
-    if echo "$1" | grep -q '\.'; then
-        echo "VLAN"
-    elif [ -d "/sys/class/net/$1/device" ]; then
-        echo "PHYSICAL"
-    else
-        echo "VIRTUAL"
-    fi
-}
-
-# Функция конвертации IP/маска в сеть (без ipcalc)
-ip_to_network() {
-    local ip_mask="$1"
-    local ip=$(echo "$ip_mask" | cut -d'/' -f1)
-    local cidr=$(echo "$ip_mask" | cut -d'/' -f2)
-    
-    if [ -z "$ip" ] || [ -z "$cidr" ]; then
-        return
-    fi
-    
-    # Простой расчёт маски
-    local IFS='.'
-    read -r o1 o2 o3 o4 <<< "$ip"
-    
-    # Определяем маску
-    local mask=""
-    case "$cidr" in
-        24) mask="0.0.0" ;;
-        25) mask="0.0.0" ;;
-        26) mask="0.0.0" ;;
-        27) mask="0.0.0" ;;
-        28) mask="0.0.0" ;;
-        29) mask="0.0.0" ;;
-        30) mask="0.0.0" ;;
-        16) mask="0.0" ;;
-        *) mask="0.0.0" ;;
-    esac
-    
-    # Для /24 и больше - обнуляем последний октет
-    if [ "$cidr" -ge 24 ]; then
-        echo "${o1}.${o2}.${o3}.0/${cidr}"
-    elif [ "$cidr" -ge 16 ]; then
-        echo "${o1}.${o2}.0.0/${cidr}"
-    else
-        echo "${o1}.0.0.0/${cidr}"
-    fi
-}
-
 # Получаем интерфейс с default route
-WAN_IFACE=$(ip route show default 2>/dev/null | awk '{print $5}')
+DEF_ROUTE_IFACE=$(ip route show default 2>/dev/null | awk '{print $5}')
+WAN_IFACE=""
 WAN_IP=""
 
-log "${CYAN}Обнаруженные интерфейсы:${NC}"
+log "${CYAN}Сканирование интерфейсов...${NC}"
 log ""
-printf "  %-16s %-8s %-20s %-10s\n" "Интерфейс" "Статус" "IP-адрес" "Тип"
+printf "  %-16s %-8s %-22s %-10s\n" "Интерфейс" "Статус" "IP-адрес" "Тип"
 echo "  --------------------------------------------------------------"
 
-# Перебираем все интерфейсы
-for iface in $(ls /sys/class/net/ 2>/dev/null | grep -v -E '^(lo|docker|veth|virbr|br-|flannel|cni|tun|tap|bond|gre|sit)$'); do
-    type=$(get_type "$iface")
-    status=$(get_status "$iface")
-    ip=$(get_ip "$iface")
-    
-    # Форматирование
-    [ "$status" = "up" ] && status_s="${GREEN}UP${NC}" || status_s="${YELLOW}$status${NC}"
-    
-    case "$type" in
-        PHYSICAL) type_s="${GREEN}PHYS${NC}" ;;
-        VLAN) type_s="${CYAN}VLAN${NC}" ;;
-        *) type_s="${YELLOW}$type${NC}" ;;
+# Перебираем интерфейсы
+for iface in $(ls /sys/class/net/ 2>/dev/null); do
+    # Пропускаем виртуальные
+    case "$iface" in
+        lo|docker*|veth*|virbr*|br-*|flannel*|cni*|tun*|tap*|bond*|gre*|sit*) continue ;;
     esac
     
-    [ -z "$ip" ] && ip="---"
+    # Определяем тип
+    iface_type="VIRTUAL"
+    case "$iface" in
+        *.*) iface_type="VLAN" ;;
+        *)
+            if [ -d "/sys/class/net/${iface}/device" ]; then
+                iface_type="PHYSICAL"
+            fi
+            ;;
+    esac
+    
+    # Получаем статус
+    iface_status=$(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo "unknown")
+    
+    # Получаем IP
+    iface_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2}' | head -1)
+    
+    # Форматирование вывода
+    case "$iface_status" in
+        up) status_out="${GREEN}UP${NC}" ;;
+        *) status_out="${YELLOW}$iface_status${NC}" ;;
+    esac
+    
+    case "$iface_type" in
+        PHYSICAL) type_out="${GREEN}PHYS${NC}" ;;
+        VLAN) type_out="${CYAN}VLAN${NC}" ;;
+        *) type_out="${YELLOW}VIRT${NC}" ;;
+    esac
+    
+    [ -z "$iface_ip" ] && iface_ip="---"
     
     printf "  %-16s " "$iface"
-    echo -e "$status_s\t$ip\t$type_s"
+    echo -e "$status_out\t$iface_ip\t$type_out"
     
-    # Классификация
-    if [ "$type" = "VLAN" ]; then
-        echo "$iface" >> "$VLAN_LIST"
-    elif [ "$type" = "PHYSICAL" ]; then
-        echo "$iface" >> "$IFACE_LIST"
-        
-        # Определяем WAN
-        if [ "$iface" = "$WAN_IFACE" ] && [ -n "$ip" ] && [ "$ip" != "---" ]; then
-            WAN_IP="$ip"
-        fi
-    fi
+    # Сохраняем в файлы
+    case "$iface_type" in
+        VLAN)
+            echo "$iface" >> "$VLAN_LIST"
+            ;;
+        PHYSICAL)
+            echo "$iface" >> "$IFACE_LIST"
+            # WAN = интерфейс с default route и IP
+            if [ "$iface" = "$DEF_ROUTE_IFACE" ] && [ -n "$iface_ip" ] && [ "$iface_ip" != "---" ]; then
+                WAN_IFACE="$iface"
+                WAN_IP="$iface_ip"
+            fi
+            ;;
+    esac
 done
 
 log ""
 
 #===============================================================================
-# ОПРЕДЕЛЕНИЕ WAN
+# ВЫБОР WAN
 #===============================================================================
 
 if [ -z "$WAN_IFACE" ] || [ -z "$WAN_IP" ]; then
-    log_warn "WAN не определён автоматически"
+    warn "WAN не определён автоматически"
     log ""
-    log "${YELLOW}Выберите WAN интерфейс (подключен к интернету/другому роутеру):${NC}"
+    log "${YELLOW}Выберите WAN интерфейс (для GRE туннеля):${NC}"
     
-    idx=1
+    idx=0
     while read -r iface; do
-        ip=$(get_ip "$iface")
-        echo "  $idx) $iface (${ip:-нет IP})"
         idx=$((idx + 1))
+        ip_tmp=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2}')
+        echo "  $idx) $iface (${ip_tmp:-нет IP})"
     done < "$IFACE_LIST"
     
     read -p "Номер: " wan_num
     wan_num=${wan_num:-1}
     
     WAN_IFACE=$(sed -n "${wan_num}p" "$IFACE_LIST")
-    WAN_IP=$(get_ip "$WAN_IFACE")
+    WAN_IP=$(ip -4 addr show dev "$WAN_IFACE" 2>/dev/null | awk '/inet /{print $2}')
 fi
 
-log_ok "WAN: ${WHITE}$WAN_IFACE${NC} (${WAN_IP:-нет IP})"
+# Если всё ещё нет IP - спрашиваем вручную
+if [ -z "$WAN_IP" ]; then
+    log ""
+    warn "IP на WAN интерфейсе не найден"
+    read -p "Введите IP адрес WAN (без маски): " WAN_IP
+fi
 
-# Убираем WAN из списка физических интерфейсов
+ok "WAN: ${WHITE}$WAN_IFACE${NC} (${WAN_IP})"
+
+# Убираем WAN из списка LAN
 grep -v "^${WAN_IFACE}$" "$IFACE_LIST" > "${IFACE_LIST}.tmp" 2>/dev/null
 mv "${IFACE_LIST}.tmp" "$IFACE_LIST" 2>/dev/null
 
 #===============================================================================
-# ОПРЕДЕЛЕНИЕ VLAN И СЕТЕЙ
+# АВТООПРЕДЕЛЕНИЕ СЕТЕЙ
 #===============================================================================
 
 sep
@@ -193,60 +165,76 @@ log "${WHITE}=== Автоопределение сетей OSPF ===${NC}"
 sep
 log ""
 
-# Собираем сети с VLAN
+# Функция конвертации IP/mask в сеть
+ip_to_net() {
+    _ip_mask="$1"
+    _ip=$(echo "$_ip_mask" | cut -d'/' -f1)
+    _cidr=$(echo "$_ip_mask" | cut -d'/' -f2)
+    
+    if [ -z "$_ip" ] || [ -z "$_cidr" ]; then
+        return
+    fi
+    
+    # Разбираем октеты
+    _o1=$(echo "$_ip" | cut -d'.' -f1)
+    _o2=$(echo "$_ip" | cut -d'.' -f2)
+    _o3=$(echo "$_ip" | cut -d'.' -f3)
+    
+    # Возвращаем сеть
+    echo "${_o1}.${_o2}.${_o3}.0/${_cidr}"
+}
+
+# Сети с VLAN
 if [ -s "$VLAN_LIST" ]; then
-    log "${CYAN}Сети с VLAN интерфейсов:${NC}"
+    log "${CYAN}VLAN интерфейсы:${NC}"
     while read -r vlan; do
-        ip=$(get_ip "$vlan")
-        if [ -n "$ip" ] && [ "$ip" != "---" ]; then
-            net=$(ip_to_network "$ip")
-            if [ -n "$net" ]; then
-                echo "$net" >> "$NETWORKS_LIST"
-                log "  ${GREEN}•${NC} $vlan: ${CYAN}$net${NC}"
+        vlan_ip=$(ip -4 addr show dev "$vlan" 2>/dev/null | awk '/inet /{print $2}')
+        if [ -n "$vlan_ip" ]; then
+            vlan_net=$(ip_to_net "$vlan_ip")
+            if [ -n "$vlan_net" ]; then
+                echo "$vlan_net" >> "$NETWORKS_LIST"
+                log "  ${GREEN}•${NC} $vlan: ${CYAN}$vlan_net${NC}"
             fi
         fi
     done < "$VLAN_LIST"
 fi
 
-# Собираем сети с LAN интерфейсов
+# Сети с LAN
 if [ -s "$IFACE_LIST" ]; then
-    log "${CYAN}Сети с LAN интерфейсов:${NC}"
+    log "${CYAN}LAN интерфейсы:${NC}"
     while read -r iface; do
-        ip=$(get_ip "$iface")
-        if [ -n "$ip" ] && [ "$ip" != "---" ]; then
-            net=$(ip_to_network "$ip")
-            if [ -n "$net" ]; then
-                # Проверка на дубликаты
-                if ! grep -q "^${net}$" "$NETWORKS_LIST" 2>/dev/null; then
-                    echo "$net" >> "$NETWORKS_LIST"
-                    log "  ${GREEN}•${NC} $iface: ${CYAN}$net${NC}"
+        lan_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2}')
+        if [ -n "$lan_ip" ]; then
+            lan_net=$(ip_to_net "$lan_ip")
+            if [ -n "$lan_net" ]; then
+                if ! grep -q "^${lan_net}$" "$NETWORKS_LIST" 2>/dev/null; then
+                    echo "$lan_net" >> "$NETWORKS_LIST"
+                    log "  ${GREEN}•${NC} $iface: ${CYAN}$lan_net${NC}"
                 fi
             fi
         fi
     done < "$IFACE_LIST"
 fi
 
-# Если сетей нет
+# Если сетей нет - спрашиваем
 if [ ! -s "$NETWORKS_LIST" ]; then
-    log_warn "Сети не определены автоматически"
-    log "${YELLOW}Введите сети для OSPF через пробел:${NC}"
-    log "  Пример: 192.168.10.0/26 192.168.20.0/28 192.168.99.0/29"
-    read -p "Сети: " networks_input
-    
-    for net in $networks_input; do
+    warn "Сети не найдены автоматически"
+    log "${YELLOW}Введите сети для OSPF (через пробел):${NC}"
+    log "  Пример: 192.168.10.0/26 192.168.20.0/28"
+    read -p "Сети: " nets_input
+    for net in $nets_input; do
         echo "$net" >> "$NETWORKS_LIST"
     done
 fi
 
-# Показываем итоговый список
 log ""
-log_ok "Сети для OSPF:"
+ok "Сети OSPF:"
 while read -r net; do
     log "  ${GREEN}•${NC} $net"
 done < "$NETWORKS_LIST"
 
 #===============================================================================
-# НАСТРОЙКА GRE
+# НАСТРОЙКА GRE ТУННЕЛЯ - РУЧНОЙ ВВОД
 #===============================================================================
 
 sep
@@ -255,44 +243,89 @@ sep
 log ""
 
 # Локальный IP для GRE
-GRE_LOCAL_IP=$(echo "$WAN_IP" | cut -d'/' -f1)
+GRE_LOCAL=$(echo "$WAN_IP" | cut -d'/' -f1)
 
-if [ -z "$GRE_LOCAL_IP" ]; then
-    log_err "Не удалось определить локальный IP"
-    read -p "Введите локальный IP: " GRE_LOCAL_IP
+log "${CYAN}Локальный IP для GRE туннеля:${NC}"
+log "  Автоопределено: ${GREEN}$GRE_LOCAL${NC}"
+log ""
+read -p "Использовать этот IP? (y/n) [y]: " use_auto_local
+use_auto_local=${use_auto_local:-y}
+
+if [ "$use_auto_local" != "y" ] && [ "$use_auto_local" != "Y" ]; then
+    read -p "Введите локальный IP для GRE: " GRE_LOCAL
 fi
 
-log_ok "Локальный IP для GRE: ${CYAN}$GRE_LOCAL_IP${NC}"
+ok "Локальный IP GRE: ${WHITE}$GRE_LOCAL${NC}"
 
-# Удаленный IP
+# Удалённый IP
 log ""
 log "${YELLOW}Введите удалённый IP для GRE туннеля:${NC}"
 log "  (IP адрес удалённого роутера для туннеля)"
-read -p "Удалённый IP: " GRE_REMOTE_IP
+read -p "Удалённый IP: " GRE_REMOTE
 
-# Роль роутера
+if [ -z "$GRE_REMOTE" ]; then
+    err "Удалённый IP не указан!"
+    exit 1
+fi
+
+ok "Удалённый IP GRE: ${WHITE}$GRE_REMOTE${NC}"
+
+# IP адрес GRE интерфейса - РУЧНОЙ ВВОД
 log ""
-log "${YELLOW}Выберите роль:${NC}"
-echo "  1) HQ-RTR (Router ID: 1.1.1.1, GRE IP: 172.16.1.1/24)"
-echo "  2) BR-RTR (Router ID: 2.2.2.2, GRE IP: 172.16.1.2/24)"
-read -p "Роль [1]: " role
-role=${role:-1}
+log "${YELLOW}Введите IP адрес для GRE интерфейса (туннель):${NC}"
+log "  Примеры:"
+log "    HQ-RTR: 172.16.1.1/24"
+log "    BR-RTR: 172.16.1.2/24"
+log "    Или любой другой: 10.0.0.1/30, 192.168.100.1/24"
+log ""
+read -p "GRE IP адрес с маской: " GRE_IP
 
-case "$role" in
-    2)
-        ROLE="BR-RTR"
-        RID="2.2.2.2"
-        GRE_IP="172.16.1.2/24"
-        ;;
-    *)
-        ROLE="HQ-RTR"
-        RID="1.1.1.1"
-        GRE_IP="172.16.1.1/24"
-        ;;
-esac
+if [ -z "$GRE_IP" ]; then
+    warn "GRE IP не указан, используется по умолчанию"
+    # Предлагаем выбор роли для дефолтного IP
+    log ""
+    log "${YELLOW}Выберите роль для стандартного GRE IP:${NC}"
+    echo "  1) HQ-RTR (GRE IP: 172.16.1.1/24, Router ID: 1.1.1.1)"
+    echo "  2) BR-RTR (GRE IP: 172.16.1.2/24, Router ID: 2.2.2.2)"
+    read -p "Роль [1]: " role
+    role=${role:-1}
+    
+    case "$role" in
+        2)
+            ROLE="BR-RTR"
+            RID="2.2.2.2"
+            GRE_IP="172.16.1.2/24"
+            ;;
+        *)
+            ROLE="HQ-RTR"
+            RID="1.1.1.1"
+            GRE_IP="172.16.1.1/24"
+            ;;
+    esac
+else
+    # Если IP введён вручную - спрашиваем Router ID
+    log ""
+    log "${YELLOW}Введите Router ID для OSPF:${NC}"
+    log "  Примеры: 1.1.1.1, 2.2.2.2, 3.3.3.3"
+    read -p "Router ID [1.1.1.1]: " RID
+    RID=${RID:-1.1.1.1}
+    ROLE="Custom"
+fi
 
-log_ok "Роль: ${WHITE}$ROLE${NC}, Router ID: $RID"
-log_ok "GRE IP: ${WHITE}$GRE_IP${NC}"
+ok "GRE IP: ${WHITE}$GRE_IP${NC}"
+ok "Router ID: ${WHITE}$RID${NC}"
+
+# Сеть GRE туннеля (автоопределение из GRE_IP)
+GRE_NET=$(ip_to_net "$GRE_IP")
+if [ -z "$GRE_NET" ]; then
+    # Простой вариант - берём сеть как есть
+    GRE_BASE=$(echo "$GRE_IP" | cut -d'.' -f1-3)
+    GRE_CIDR=$(echo "$GRE_IP" | cut -d'/' -f2)
+    GRE_NET="${GRE_BASE}.0/${GRE_CIDR}"
+fi
+
+log ""
+ok "Сеть GRE туннеля: ${CYAN}$GRE_NET${NC}"
 
 #===============================================================================
 # УСТАНОВКА FRR
@@ -311,18 +344,18 @@ elif command -v yum >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1; then
     dnf install -y -q frr 2>/dev/null
 else
-    log_err "Пакетный менеджер не найден"
+    err "Пакетный менеджер не найден"
     exit 1
 fi
 
-log_ok "FRR установлен"
+ok "FRR установлен"
 
 #===============================================================================
-# КОНФИГУРАЦИЯ FRR DAEMONS
+# КОНФИГУРАЦИЯ DAEMONS
 #===============================================================================
 
 sep
-log "${WHITE}=== Настройка демонов FRR ===${NC}"
+log "${WHITE}=== Настройка FRR daemons ===${NC}"
 sep
 log ""
 
@@ -348,10 +381,10 @@ fabricd=no
 vrrpd=no
 DAEMONS
 
-log_ok "Демоны настроены (zebra=yes, ospfd=yes)"
+ok "Daemons: zebra=yes, ospfd=yes"
 
 #===============================================================================
-# GRE ТУННЕЛЬ
+# СОЗДАНИЕ GRE
 #===============================================================================
 
 sep
@@ -362,17 +395,15 @@ log ""
 # ALT Linux etcnet
 if [ -d "/etc/net/ifaces" ]; then
     mkdir -p /etc/net/ifaces/gre1
-    
     cat > /etc/net/ifaces/gre1/options << GREOPT
 TYPE=gre
-REMOTE=${GRE_REMOTE_IP}
-LOCAL=${GRE_LOCAL_IP}
+REMOTE=${GRE_REMOTE}
+LOCAL=${GRE_LOCAL}
 TTL=64
 DISABLE=no
 GREOPT
-    
     echo "${GRE_IP}" > /etc/net/ifaces/gre1/ipv4address
-    log_ok "GRE настроен в /etc/net/ifaces/gre1"
+    ok "GRE в etcnet: /etc/net/ifaces/gre1"
 fi
 
 # Systemd service
@@ -385,7 +416,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/sbin/ip tunnel add gre1 mode gre local ${GRE_LOCAL_IP} remote ${GRE_REMOTE_IP} ttl 64
+ExecStart=/sbin/ip tunnel add gre1 mode gre local ${GRE_LOCAL} remote ${GRE_REMOTE} ttl 64
 ExecStart=/sbin/ip addr add ${GRE_IP} dev gre1
 ExecStart=/sbin/ip link set gre1 up
 ExecStart=/sbin/ip link set gre1 mtu 1400
@@ -401,15 +432,15 @@ systemctl enable gre-tunnel.service 2>/dev/null
 
 # Поднимаем GRE
 ip tunnel del gre1 2>/dev/null || true
-ip tunnel add gre1 mode gre local "$GRE_LOCAL_IP" remote "$GRE_REMOTE_IP" ttl 64
+ip tunnel add gre1 mode gre local "$GRE_LOCAL" remote "$GRE_REMOTE" ttl 64
 ip addr add "$GRE_IP" dev gre1
 ip link set gre1 up
 ip link set gre1 mtu 1400
 
-log_ok "GRE туннель поднят"
+ok "GRE туннель поднят"
 
 #===============================================================================
-# OSPF КОНФИГУРАЦИЯ
+# КОНФИГУРАЦИЯ OSPF
 #===============================================================================
 
 sep
@@ -417,7 +448,7 @@ log "${WHITE}=== Настройка OSPF ===${NC}"
 sep
 log ""
 
-cat > /etc/frr/frr.conf << OSPFCFG
+cat > /etc/frr/frr.conf << OSPFHEAD
 !
 frr version 9.0
 frr defaults traditional
@@ -432,18 +463,17 @@ router ospf
  interface gre1
   ip ospf authentication
   ip ospf authentication-key 123
-OSPFCFG
+OSPFHEAD
 
 # Добавляем сети
-log "${CYAN}Добавляем сети в OSPF:${NC}"
 while read -r net; do
     echo " network $net area 0" >> /etc/frr/frr.conf
-    log "  ${GREEN}+${NC} $net area 0"
+    log "  ${GREEN}+${NC} network $net area 0"
 done < "$NETWORKS_LIST"
 
-# Добавляем GRE сеть
-echo " network 172.16.1.0/24 area 0" >> /etc/frr/frr.conf
-log "  ${GREEN}+${NC} 172.16.1.0/24 area 0 (GRE)"
+# GRE сеть
+echo " network $GRE_NET area 0" >> /etc/frr/frr.conf
+log "  ${GREEN}+${NC} network $GRE_NET area 0 (GRE)"
 
 # Завершение
 cat >> /etc/frr/frr.conf << 'OSPFEND'
@@ -452,11 +482,10 @@ line vty
 !
 OSPFEND
 
-# Права
-chown frr:frr /etc/frr/frr.conf 2>/dev/null || chown frr /etc/frr/frr.conf 2>/dev/null
+chown frr:frr /etc/frr/frr.conf 2>/dev/null || true
 chmod 640 /etc/frr/frr.conf 2>/dev/null
 
-log_ok "OSPF настроен"
+ok "OSPF настроен"
 
 #===============================================================================
 # СИСТЕМНЫЕ НАСТРОЙКИ
@@ -467,36 +496,32 @@ log "${WHITE}=== Системные настройки ===${NC}"
 sep
 log ""
 
-# IP forwarding
 grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || \
     echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-log_ok "IP forwarding включён"
+ok "IP forwarding"
 
-# rp_filter
 grep -q 'rp_filter=2' /etc/sysctl.conf 2>/dev/null || cat >> /etc/sysctl.conf << 'SYSCTL'
 net.ipv4.conf.all.rp_filter=2
 net.ipv4.conf.default.rp_filter=2
 SYSCTL
 sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1
-sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1
-log_ok "rp_filter настроен"
+ok "rp_filter"
 
 #===============================================================================
 # ЗАПУСК
 #===============================================================================
 
 sep
-log "${WHITE}=== Запуск служб ===${NC}"
+log "${WHITE}=== Запуск FRR ===${NC}"
 sep
 log ""
 
 systemctl enable frr 2>/dev/null
 systemctl restart frr 2>/dev/null
+sleep 2
 
-sleep 3
-
-log_ok "FRR запущен"
+ok "FRR запущен"
 
 #===============================================================================
 # ПРОВЕРКА
@@ -507,29 +532,20 @@ log "${WHITE}=== Проверка ===${NC}"
 sep
 log ""
 
-# GRE
 if ip link show gre1 >/dev/null 2>&1; then
-    log_ok "GRE туннель: ${GREEN}активен${NC}"
-    ip -br addr show gre1 2>/dev/null || ip addr show gre1 2>/dev/null | head -3
+    ok "GRE: активен"
+    ip -br addr show gre1 2>/dev/null || ip addr show gre1 2>/dev/null | head -2
 else
-    log_err "GRE туннель не поднят!"
+    err "GRE: не поднят"
 fi
 
 log ""
 log "${CYAN}OSPF соседи:${NC}"
-if vtysh -c "show ip ospf neighbor" 2>/dev/null; then
-    :
-else
-    log_warn "Соседи не найдены (проверьте удалённый роутер)"
-fi
+vtysh -c "show ip ospf neighbor" 2>/dev/null || warn "Нет соседей"
 
 log ""
 log "${CYAN}OSPF маршруты:${NC}"
-if ip route show | grep -i ospf 2>/dev/null; then
-    :
-else
-    log_warn "Маршруты OSPF не найдены"
-fi
+ip route show | grep -i ospf 2>/dev/null || warn "Нет OSPF маршрутов"
 
 #===============================================================================
 # ИТОГ
@@ -537,32 +553,30 @@ fi
 
 log ""
 log "${GREEN}╔════════════════════════════════════════════════════════╗${NC}"
-log "${GREEN}║${NC}          ${WHITE}НАСТРОЙКА ЗАВЕРШЕНА!${NC}                          ${GREEN}║${NC}"
+log "${GREEN}║${NC}            ${WHITE}НАСТРОЙКА ЗАВЕРШЕНА!${NC}                        ${GREEN}║${NC}"
 log "${GREEN}╚════════════════════════════════════════════════════════╝${NC}"
 log ""
-log "${CYAN}Конфигурация:${NC}"
-log "  Роль:          ${WHITE}$ROLE${NC}"
-log "  Router ID:     ${WHITE}$RID${NC}"
-log "  WAN:           ${WHITE}$WAN_IFACE${NC} ($WAN_IP)"
-log "  GRE Local:     ${WHITE}$GRE_LOCAL_IP${NC}"
-log "  GRE Remote:    ${WHITE}$GRE_REMOTE_IP${NC}"
-log "  GRE IP:        ${WHITE}$GRE_IP${NC}"
+log "${CYAN}Параметры:${NC}"
+log "  Роль:       ${WHITE}$ROLE${NC}"
+log "  Router ID:  ${WHITE}$RID${NC}"
+log "  WAN:        ${WHITE}$WAN_IFACE${NC} ($WAN_IP)"
+log "  GRE Local:  ${WHITE}$GRE_LOCAL${NC}"
+log "  GRE Remote: ${WHITE}$GRE_REMOTE${NC}"
+log "  GRE IP:     ${WHITE}$GRE_IP${NC}"
+log "  GRE Net:    ${WHITE}$GRE_NET${NC}"
 log ""
 log "${CYAN}Сети OSPF:${NC}"
 while read -r net; do
     log "  ${GREEN}•${NC} $net"
 done < "$NETWORKS_LIST"
-log "  ${GREEN}•${NC} 172.16.1.0/24 (GRE)"
+log "  ${GREEN}•${NC} $GRE_NET (GRE)"
 log ""
-log "${CYAN}Команды проверки:${NC}"
+log "${CYAN}Команды:${NC}"
 log "  ${YELLOW}vtysh -c 'show ip ospf neighbor'${NC}"
 log "  ${YELLOW}ip route show | grep ospf${NC}"
-log "  ${YELLOW}systemctl status frr${NC}"
-log "  ${YELLOW}ping 172.16.1.2${NC}"
+log "  ${YELLOW}ping ${GRE_IP%%/*}${NC}"
 log ""
 
-# Очистка временных файлов
 rm -f "$IFACE_LIST" "$VLAN_LIST" "$NETWORKS_LIST"
-
 log "${CYAN}Лог: ${LOG_FILE}${NC}"
 log ""
