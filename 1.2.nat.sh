@@ -1,10 +1,10 @@
 #!/bin/bash
 #===============================================================================
-# NAT Setup for Demo2026 - Alt Linux (Совместимая версия)
-# Исходник: https://github.com/12Geo12/demka/blob/main/proba.sh
-#===============================================================================
-# Эта версия использует только стандартные конструкции bash
-# без process substitution для максимальной совместимости
+# NAT Setup for Demo2026 - Alt Linux (Улучшенная версия)
+# ИСПРАВЛЕНИЯ:
+# - Добавлена проверка и очистка старых правил NAT
+# - Добавлена проверка корректности правил перед применением
+# - Добавлена резервная копия правил
 #===============================================================================
 
 #--- Цвета --------------------------------------------------------------------
@@ -33,7 +33,7 @@ fi
 clear
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║     NAT Setup for Demo2026 - Compatible Version      ║"
+echo "║     NAT Setup for Demo2026 - Improved Version        ║"
 echo "╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -78,11 +78,41 @@ echo -e "  ${YELLOW}sysctl net.ipv4.ip_forward${NC}"
 sysctl net.ipv4.ip_forward 2>/dev/null
 
 #===============================================================================
-# ЭТАП 3: Список интерфейсов
+# ЭТАП 3: Проверка и отображение текущих правил (ИСПРАВЛЕНИЕ)
 #===============================================================================
 echo ""
 line
-echo -e "${WHITE}ЭТАП 3: Выбор интерфейсов${NC}"
+echo -e "${WHITE}ЭТАП 3: Анализ текущих правил NAT${NC}"
+line
+echo ""
+
+# Проверяем наличие существующих правил NAT
+NAT_RULES_COUNT=$(iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -c "MASQUERADE\|SNAT" || echo 0)
+FORWARD_RULES_COUNT=$(iptables -L FORWARD -n 2>/dev/null | wc -l)
+
+echo -e "${CYAN}Текущие правила NAT:${NC}"
+if [ "$NAT_RULES_COUNT" -gt 0 ]; then
+    echo -e "  ${YELLOW}Обнаружено $NAT_RULES_COUNT правил MASQUERADE/SNAT${NC}"
+    echo ""
+    iptables -t nat -L POSTROUTING -n -v --line-numbers 2>/dev/null | grep -E "MASQUERADE|SNAT|num"
+else
+    echo -e "  ${GREEN}Правила NAT не обнаружены${NC}"
+fi
+
+echo ""
+echo -e "${CYAN}Правила FORWARD:${NC}"
+if [ "$FORWARD_RULES_COUNT" -gt 2 ]; then
+    echo -e "  ${YELLOW}Обнаружено $((FORWARD_RULES_COUNT - 2)) правил FORWARD${NC}"
+else
+    echo -e "  ${GREEN}Правила FORWARD не обнаружены (только политика по умолчанию)${NC}"
+fi
+
+#===============================================================================
+# ЭТАП 4: Список интерфейсов
+#===============================================================================
+echo ""
+line
+echo -e "${WHITE}ЭТАП 4: Выбор интерфейсов${NC}"
 line
 echo ""
 
@@ -144,11 +174,11 @@ WAN_IP=$(sed -n "${wan_num}p" "$IFACE_IPS")
 msg_ok "WAN интерфейс: ${YELLOW}$WAN${NC} ($WAN_IP)"
 
 #===============================================================================
-# ЭТАП 4: LAN интерфейсы
+# ЭТАП 5: LAN интерфейсы
 #===============================================================================
 echo ""
 line
-echo -e "${WHITE}ЭТАП 4: LAN подсети${NC}"
+echo -e "${WHITE}ЭТАП 5: LAN подсети${NC}"
 line
 echo ""
 
@@ -186,7 +216,7 @@ fi
 msg_ok "Найдено LAN подсетей: ${YELLOW}$LAN_COUNT${NC}"
 
 #===============================================================================
-# ЭТАП 5: Подтверждение
+# ЭТАП 6: Подтверждение и выбор очистки (ИСПРАВЛЕНИЕ)
 #===============================================================================
 echo ""
 line
@@ -200,10 +230,78 @@ while IFS= read -r iface && IFS= read -r net <&3; do
 done < "$LAN_FILE" 3< "$LAN_NETS"
 
 echo ""
-echo -e "${YELLOW}Очистить старые правила NAT?${NC}"
-echo "  1) Да"
-echo "  2) Нет"
-read -r -p "Выбор [1-2]: " clear_choice
+echo -e "${YELLOW}══════════════════════════════════════════════${NC}"
+echo -e "${YELLOW}ВАЖНО: Очистка старых правил NAT${NC}"
+echo -e "${YELLOW}══════════════════════════════════════════════${NC}"
+echo ""
+echo "Выберите действие со старыми правилами:"
+echo "  1) Полная очистка - удалить ВСЕ правила NAT и FORWARD"
+echo "  2) Выборочная - удалить только правила для выбранных интерфейсов"
+echo "  3) Не очищать - добавить новые правила к существующим"
+echo ""
+read -r -p "Выбор [1]: " clear_choice
+clear_choice=${clear_choice:-1}
+
+case "$clear_choice" in
+    1)
+        # Полная очистка
+        echo ""
+        msg_wa "Будут удалены ВСЕ правила NAT и FORWARD!"
+        read -r -p "Подтвердите полную очистку? (y/n): " confirm_clear
+        
+        if [[ "$confirm_clear" =~ ^[Yy] ]]; then
+            # Резервная копия перед очисткой (ИСПРАВЛЕНИЕ)
+            BACKUP_FILE="/etc/sysconfig/iptables.backup.$(date +%Y%m%d_%H%M%S)"
+            mkdir -p /etc/sysconfig 2>/dev/null
+            iptables-save > "$BACKUP_FILE" 2>/dev/null
+            msg_ok "Резервная копия: $BACKUP_FILE"
+            
+            # Очистка
+            msg_in "Очистка правил NAT..."
+            iptables -t nat -F 2>/dev/null
+            iptables -t nat -X 2>/dev/null
+            msg_ok "Таблица NAT очищена"
+            
+            msg_in "Очистка правил FORWARD..."
+            iptables -F FORWARD 2>/dev/null
+            msg_ok "Цепочка FORWARD очищена"
+            
+            # Проверка очистки (ИСПРАВЛЕНИЕ)
+            echo ""
+            msg_in "Проверка очистки..."
+            NAT_CHECK=$(iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -c "MASQUERADE\|SNAT" || echo 0)
+            if [ "$NAT_CHECK" -eq 0 ]; then
+                msg_ok "Правила NAT успешно удалены"
+            else
+                msg_wa "Обнаружены остаточные правила NAT"
+            fi
+        else
+            echo "Очистка отменена"
+        fi
+        ;;
+    2)
+        # Выборочная очистка
+        echo ""
+        msg_in "Выборочная очистка правил для выбранных интерфейсов..."
+        
+        # Удаляем правила связанные с WAN интерфейсом
+        iptables -t nat -L POSTROUTING -n --line-numbers 2>/dev/null | \
+            grep "$WAN" | awk '{print $1}' | sort -rn | \
+            while read num; do
+                [ -n "$num" ] && iptables -t nat -D POSTROUTING "$num" 2>/dev/null
+            done
+        
+        # Удаляем правила для LAN подсетей
+        while IFS= read -r net; do
+            [ -n "$net" ] && iptables -t nat -D POSTROUTING -s "$net" 2>/dev/null
+        done < "$LAN_NETS"
+        
+        msg_ok "Выборочная очистка завершена"
+        ;;
+    3)
+        msg_in "Старые правила сохранены, новые будут добавлены"
+        ;;
+esac
 
 echo ""
 read -r -p "Применить NAT? (y/n): " confirm
@@ -214,22 +312,13 @@ if [[ ! "$confirm" =~ ^[Yy] ]]; then
 fi
 
 #===============================================================================
-# ЭТАП 6: Настройка NAT
+# ЭТАП 7: Настройка NAT
 #===============================================================================
 echo ""
 line
-echo -e "${WHITE}ЭТАП 5: Настройка NAT${NC}"
+echo -e "${WHITE}ЭТАП 6: Настройка NAT${NC}"
 line
 echo ""
-
-# Очистка
-if [ "$clear_choice" = "1" ]; then
-    msg_in "Очистка правил..."
-    iptables -t nat -F 2>/dev/null
-    iptables -t mangle -F 2>/dev/null
-    iptables -F FORWARD 2>/dev/null
-    msg_ok "Правила очищены"
-fi
 
 # MASQUERADE
 echo ""
@@ -237,34 +326,56 @@ msg_in "Добавление MASQUERADE правил..."
 
 while IFS= read -r iface && IFS= read -r net <&3; do
     if [ -n "$net" ]; then
-        iptables -t nat -A POSTROUTING -o "$WAN" -s "$net" -j MASQUERADE
-        echo -e "  ${GREEN}✓${NC} $net → $WAN"
+        # Проверяем, не существует ли уже такое правило
+        if ! iptables -t nat -C POSTROUTING -o "$WAN" -s "$net" -j MASQUERADE 2>/dev/null; then
+            iptables -t nat -A POSTROUTING -o "$WAN" -s "$net" -j MASQUERADE
+            echo -e "  ${GREEN}✓${NC} $net → $WAN"
+        else
+            echo -e "  ${YELLOW}○${NC} $net → $WAN (уже существует)"
+        fi
     fi
 done < "$LAN_FILE" 3< "$LAN_NETS"
 
 msg_ok "NAT правила добавлены"
 
 #===============================================================================
-# ЭТАП 7: FORWARD цепочка
+# ЭТАП 8: FORWARD цепочка
 #===============================================================================
 echo ""
 msg_in "Настройка FORWARD..."
 
+# Проверяем policy
+FORWARD_POLICY=$(iptables -L FORWARD -n 2>/dev/null | head -1 | grep -oP '(?<=policy )\w+')
+if [ "$FORWARD_POLICY" = "DROP" ]; then
+    echo -e "  ${YELLOW}!${NC} Policy FORWARD = DROP, требуется явное разрешение"
+fi
+
 # Established
-iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
-echo -e "  ${GREEN}✓${NC} ESTABLISHED,RELATED"
+if ! iptables -C FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
+    iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+    echo -e "  ${GREEN}✓${NC} ESTABLISHED,RELATED"
+else
+    echo -e "  ${YELLOW}○${NC} ESTABLISHED,RELATED (уже существует)"
+fi
 
 # LAN → WAN
 while IFS= read -r iface && IFS= read -r net <&3; do
     if [ -n "$net" ]; then
-        iptables -A FORWARD -i "$iface" -o "$WAN" -s "$net" -j ACCEPT
-        echo -e "  ${GREEN}✓${NC} $iface → $WAN"
+        if ! iptables -C FORWARD -i "$iface" -o "$WAN" -s "$net" -j ACCEPT 2>/dev/null; then
+            iptables -A FORWARD -i "$iface" -o "$WAN" -s "$net" -j ACCEPT
+            echo -e "  ${GREEN}✓${NC} $iface → $WAN"
+        else
+            echo -e "  ${YELLOW}○${NC} $iface → $WAN (уже существует)"
+        fi
     fi
 done < "$LAN_FILE" 3< "$LAN_NETS"
 
 # WAN → LAN (ответный)
 while IFS= read -r iface; do
-    iptables -A FORWARD -i "$WAN" -o "$iface" -m state --state ESTABLISHED,RELATED -j ACCEPT
+    if ! iptables -C FORWARD -i "$WAN" -o "$iface" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -i "$WAN" -o "$iface" -m state --state ESTABLISHED,RELATED -j ACCEPT
+        echo -e "  ${GREEN}✓${NC} $WAN → $iface (ответный)"
+    fi
 done < "$LAN_FILE"
 
 # Между VLAN
@@ -272,7 +383,9 @@ if [ "$LAN_COUNT" -gt 1 ]; then
     while IFS= read -r iface1; do
         while IFS= read -r iface2; do
             if [ "$iface1" != "$iface2" ]; then
-                iptables -A FORWARD -i "$iface1" -o "$iface2" -j ACCEPT
+                if ! iptables -C FORWARD -i "$iface1" -o "$iface2" -j ACCEPT 2>/dev/null; then
+                    iptables -A FORWARD -i "$iface1" -o "$iface2" -j ACCEPT
+                fi
             fi
         done < "$LAN_FILE"
     done < "$LAN_FILE"
@@ -284,11 +397,11 @@ msg_ok "FORWARD настроен"
 rm -f "$LAN_FILE" "$LAN_NETS"
 
 #===============================================================================
-# ЭТАП 8: Сохранение
+# ЭТАП 9: Сохранение
 #===============================================================================
 echo ""
 line
-echo -e "${WHITE}ЭТАП 6: Сохранение${NC}"
+echo -e "${WHITE}ЭТАП 7: Сохранение${NC}"
 line
 echo ""
 
@@ -302,11 +415,11 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 #===============================================================================
-# ЭТАП 9: Вывод результатов
+# ЭТАП 10: Вывод результатов
 #===============================================================================
 echo ""
 line
-echo -e "${WHITE}ЭТАП 7: Проверка${NC}"
+echo -e "${WHITE}ЭТАП 8: Проверка${NC}"
 line
 echo ""
 
@@ -329,11 +442,11 @@ echo -e "${CYAN}>>> cat /proc/sys/net/ipv4/ip_forward${NC}"
 cat /proc/sys/net/ipv4/ip_forward
 
 #===============================================================================
-# ЭТАП 10: Проверка связности
+# ЭТАП 11: Проверка связности
 #===============================================================================
 echo ""
 line
-echo -e "${WHITE}ЭТАП 8: Проверка связности${NC}"
+echo -e "${WHITE}ЭТАП 9: Проверка связности${NC}"
 line
 echo ""
 
@@ -372,8 +485,10 @@ echo -e "${CYAN}Команды для проверки:${NC}"
 echo -e "  ${YELLOW}iptables -t nat -L -n -v${NC}   - список NAT"
 echo -e "  ${YELLOW}iptables -L FORWARD -n${NC}     - список FORWARD"
 echo ""
+echo -e "${CYAN}Восстановление правил:${NC}"
+echo -e "  ${YELLOW}iptables-restore < /etc/sysconfig/iptables${NC}"
+echo ""
 echo -e "${CYAN}На клиенте:${NC}"
 echo -e "  ${YELLOW}ping 8.8.8.8${NC}"
 echo -e "  ${YELLOW}ping ya.ru${NC}"
 echo ""
-
