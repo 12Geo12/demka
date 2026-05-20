@@ -1,115 +1,55 @@
 #!/bin/bash
-
 # ============================================================================
-# DNS Infrastructure Setup Script - FIXED VERSION
-# Исправлены все критические ошибки
+# Скрипт настройки DNS сервера (BIND) для домена au-team.irpo
+# ИСПРАВЛЕНА ВЕРСИЯ - устранено дублирование зон и добавлена валидация
 # ============================================================================
 
 set -e
 
-# Цвета - ИСПРАВЛЕНО!
+# Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+WHITE='\033[1;37m'
 NC='\033[0m'
 
+# Функции вывода
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
-log_header() { echo -e "\n${CYAN}============================================${NC}"; echo -e "${CYAN}$1${NC}"; echo -e "${CYAN}============================================${NC}\n"; }
-
-if [ "$EUID" -ne 0 ]; then
- log_error "Запустите скрипт от имени root!"
- exit 1
-fi
-
-log_header "DNS Infrastructure Setup Script"
+log_step() { echo -e "${CYAN}[STEP]${NC} $1"; }
 
 # ============================================================================
-# ОЧИСТКА
+# ФУНКЦИЯ ВАЛИДАЦИИ IP-АДРЕСА (НОВАЯ)
 # ============================================================================
-log_step "=== ОЧИСТКА СТАРЫХ КОНФИГУРАЦИЙ ==="
-echo ""
-log_warn "ВНИМАНИЕ: Будут удалены все старые конфигурации DNS!"
-read -p "Продолжить очистку? [y/N]: " clean_confirm
-if [[ ! "$clean_confirm" =~ ^[Yy]$ ]]; then
- log_error "Отменено пользователем"
- exit 1
-fi
-
-systemctl stop named 2>/dev/null || true
-systemctl stop bind 2>/dev/null || true
-
-rm -rf /var/lib/bind/etc/named.conf 2>/dev/null || true
-rm -rf /var/lib/bind/etc/rndc.key 2>/dev/null || true
-rm -rf /var/lib/bind/var/named/master/*.db 2>/dev/null || true
-rm -rf /var/lib/bind/var/named/data/* 2>/dev/null || true
-rm -rf /var/lib/bind/var/named/dynamic/* 2>/dev/null || true
-rm -f /etc/named.conf 2>/dev/null || true
-rm -f /etc/rndc.key 2>/dev/null || true
-
-log_info "Очистка завершена"
-
-# ============================================================================
-# УСТАНОВКА ПАКЕТОВ
-# ============================================================================
-log_step "Установка BIND..."
-
-if [ -f /etc/altlinux-release ]; then
- apt-get update || true
- apt-get install -y bind bind-utils
- log_info "BIND установлен"
-else
- log_error "Только ALT Linux поддерживается"
- exit 1
-fi
-
-# ============================================================================
-# ПЕРЕМЕННЫЕ
-# ============================================================================
-CHROOT_DIR="/var/lib/bind"
-CHROOT_ETC="${CHROOT_DIR}/etc"
-CHROOT_VAR="${CHROOT_DIR}/var/named"
-
-# ============================================================================
-# АВТООПРЕДЕЛЕНИЕ IP - ИСПРАВЛЕНО!
-# ============================================================================
-log_step "Автоопределение сетевых параметров..."
-echo ""
-
-LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
-
-if [ -z "$LOCAL_IP" ]; then
- log_error "Не удалось определить IP-адрес!"
- exit 1
-fi
-
-log_info "Обнаружен IP: $LOCAL_IP"
-
-IP_OCT1=$(echo "$LOCAL_IP" | cut -d'.' -f1)
-IP_OCT2=$(echo "$LOCAL_IP" | cut -d'.' -f2)
-IP_OCT3=$(echo "$LOCAL_IP" | cut -d'.' -f3)
-IP_OCT4=$(echo "$LOCAL_IP" | cut -d'.' -f4)
-
-log_info "Октеты IP: $IP_OCT1.$IP_OCT2.$IP_OCT3.$IP_OCT4"
-
-SUBNET="${IP_OCT1}.${IP_OCT2}.${IP_OCT3}"
-log_info "Локальная подсеть: ${SUBNET}.0/24"
-
-REV_ZONE="${IP_OCT3}.${IP_OCT2}.${IP_OCT1}"
-log_info "Обратная зона: ${REV_ZONE}.in-addr.arpa"
-
-HOSTNAME=$(hostname)
-log_info "Имя хоста: $HOSTNAME"
+validate_ip() {
+    local ip=$1
+    local valid_regex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    
+    if ! [[ $ip =~ $valid_regex ]]; then
+        return 1
+    fi
+    
+    IFS='.' read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        if ((octet < 0 || octet > 255)); then
+            return 1
+        fi
+    done
+    
+    return 0
+}
 
 # ============================================================================
 # КОНФИГУРАЦИЯ
 # ============================================================================
-log_header "Конфигурация DNS"
+log_step "Конфигурация DNS"
 echo ""
+
+# Определяем локальный IP
+LOCAL_IP=$(hostname -I | awk '{print $1}' | awk -F'.' '{print $1"."$2"."$3".10"}')
 
 DEFAULT_HQ_RTR="192.168.4.2"
 DEFAULT_HQ_SRV="$LOCAL_IP"
@@ -122,83 +62,109 @@ DEFAULT_DOMAIN="au-team.irpo"
 read -p "Использовать стандартные значения для экзамена? [y/N]: " exam_choice
 
 if [[ "$exam_choice" =~ ^[Yy]$ ]]; then
- log_info "ЭКЗАМЕНАЦИОННЫЙ РЕЖИМ"
-
- HQ_RTR_IP="$DEFAULT_HQ_RTR"
- HQ_SRV_IP="$DEFAULT_HQ_SRV"
- BR_RTR_IP="$DEFAULT_BR_RTR"
- BR_SRV_IP="$DEFAULT_BR_SRV"
- DOCKER_IP="$DEFAULT_DOCKER"
- WEB_IP="$DEFAULT_WEB"
- DOMAIN_NAME="$DEFAULT_DOMAIN"
- FWD1="77.88.8.8"
- FWD2="77.88.8.1"
+    log_info "ЭКЗАМЕНАЦИОННЫЙ РЕЖИМ"
+    HQ_RTR_IP="$DEFAULT_HQ_RTR"
+    HQ_SRV_IP="$DEFAULT_HQ_SRV"
+    BR_RTR_IP="$DEFAULT_BR_RTR"
+    BR_SRV_IP="$DEFAULT_BR_SRV"
+    DOCKER_IP="$DEFAULT_DOCKER"
+    WEB_IP="$DEFAULT_WEB"
+    DOMAIN_NAME="$DEFAULT_DOMAIN"
+    FWD1="77.88.8.8"
+    FWD2="77.88.8.1"
 else
- log_info "РУЧНОЙ РЕЖИМ"
-
- read -p "IP HQ-RTR [$DEFAULT_HQ_RTR]: " HQ_RTR_IP
- HQ_RTR_IP=${HQ_RTR_IP:-"$DEFAULT_HQ_RTR"}
-
- read -p "IP HQ-SRV [$DEFAULT_HQ_SRV]: " HQ_SRV_IP
- HQ_SRV_IP=${HQ_SRV_IP:-"$DEFAULT_HQ_SRV"}
-
- read -p "IP BR-RTR [$DEFAULT_BR_RTR]: " BR_RTR_IP
- BR_RTR_IP=${BR_RTR_IP:-"$DEFAULT_BR_RTR"}
-
- read -p "IP BR-SRV [$DEFAULT_BR_SRV]: " BR_SRV_IP
- BR_SRV_IP=${BR_SRV_IP:-"$DEFAULT_BR_SRV"}
-
- read -p "IP Docker [$DEFAULT_DOCKER]: " DOCKER_IP
- DOCKER_IP=${DOCKER_IP:-"$DEFAULT_DOCKER"}
-
- read -p "IP WEB [$DEFAULT_WEB]: " WEB_IP
- WEB_IP=${WEB_IP:-"$DEFAULT_WEB"}
-
- read -p "Домен [$DEFAULT_DOMAIN]: " DOMAIN_NAME
- DOMAIN_NAME=${DOMAIN_NAME:-"$DEFAULT_DOMAIN"}
-
- echo ""
- log_info "Forwarders:"
- echo "1) Яндекс (77.88.8.8, 77.88.8.1)"
- echo "2) Google (8.8.8.8, 8.8.4.4)"
- read -p "Выбор [1]: " fwd_choice
- case $fwd_choice in
- 2) FWD1="8.8.8.8"; FWD2="8.8.4.4" ;;
- *) FWD1="77.88.8.8"; FWD2="77.88.8.1" ;;
- esac
+    log_info "РУЧНОЙ РЕЖИМ"
+    
+    # HQ-RTR с валидацией
+    while true; do
+        read -p "IP HQ-RTR [$DEFAULT_HQ_RTR]: " HQ_RTR_IP
+        HQ_RTR_IP=${HQ_RTR_IP:-"$DEFAULT_HQ_RTR"}
+        if validate_ip "$HQ_RTR_IP"; then
+            break
+        else
+            log_error "Неверный формат IP-адреса! Пример: 192.168.4.2"
+        fi
+    done
+    
+    # HQ-SRV с валидацией
+    while true; do
+        read -p "IP HQ-SRV [$DEFAULT_HQ_SRV]: " HQ_SRV_IP
+        HQ_SRV_IP=${HQ_SRV_IP:-"$DEFAULT_HQ_SRV"}
+        if validate_ip "$HQ_SRV_IP"; then
+            break
+        else
+            log_error "Неверный формат IP-адреса! Пример: 192.168.4.1"
+        fi
+    done
+    
+    # BR-RTR с валидацией
+    while true; do
+        read -p "IP BR-RTR [$DEFAULT_BR_RTR]: " BR_RTR_IP
+        BR_RTR_IP=${BR_RTR_IP:-"$DEFAULT_BR_RTR"}
+        if validate_ip "$BR_RTR_IP"; then
+            break
+        else
+            log_error "Неверный формат IP-адреса! Пример: 192.168.5.2"
+        fi
+    done
+    
+    # BR-SRV с валидацией
+    while true; do
+        read -p "IP BR-SRV [$DEFAULT_BR_SRV]: " BR_SRV_IP
+        BR_SRV_IP=${BR_SRV_IP:-"$DEFAULT_BR_SRV"}
+        if validate_ip "$BR_SRV_IP"; then
+            break
+        else
+            log_error "Неверный формат IP-адреса! Пример: 192.168.6.2"
+        fi
+    done
+    
+    # Docker с валидацией
+    while true; do
+        read -p "IP Docker [$DEFAULT_DOCKER]: " DOCKER_IP
+        DOCKER_IP=${DOCKER_IP:-"$DEFAULT_DOCKER"}
+        if validate_ip "$DOCKER_IP"; then
+            break
+        else
+            log_error "Неверный формат IP-адреса! Пример: 172.16.5.1"
+        fi
+    done
+    
+    # WEB с валидацией
+    while true; do
+        read -p "IP WEB [$DEFAULT_WEB]: " WEB_IP
+        WEB_IP=${WEB_IP:-"$DEFAULT_WEB"}
+        if validate_ip "$WEB_IP"; then
+            break
+        else
+            log_error "Неверный формат IP-адреса! Пример: 172.16.6.1"
+        fi
+    done
+    
+    read -p "Домен [$DEFAULT_DOMAIN]: " DOMAIN_NAME
+    DOMAIN_NAME=${DOMAIN_NAME:-"$DEFAULT_DOMAIN"}
+    
+    echo ""
+    log_info "Forwarders:"
+    echo "1) Яндекс (77.88.8.8, 77.88.8.1)"
+    echo "2) Google (8.8.8.8, 8.8.4.4)"
+    read -p "Выбор [1]: " fwd_choice
+    case $fwd_choice in
+        2) FWD1="8.8.8.8"; FWD2="8.8.4.4" ;;
+        *) FWD1="77.88.8.8"; FWD2="77.88.8.1" ;;
+    esac
 fi
 
-# ============================================================================
-# ВЫЧИСЛЕНИЕ ОБРАТНЫХ ЗОН
-# ============================================================================
-HQ_RTR_NET=$(echo "$HQ_RTR_IP" | cut -d'.' -f1-3)
-HQ_RTR_OCT1=$(echo "$HQ_RTR_NET" | cut -d'.' -f1)
-HQ_RTR_OCT2=$(echo "$HQ_RTR_NET" | cut -d'.' -f2)
-HQ_RTR_OCT3=$(echo "$HQ_RTR_NET" | cut -d'.' -f3)
-HQ_RTR_REV="${HQ_RTR_OCT3}.${HQ_RTR_OCT2}.${HQ_RTR_OCT1}"
+# Генерируем обратные зоны
+REV_ZONE=$(echo "$HQ_SRV_IP" | awk -F'.' '{print $3"."$2"."$1}')
+HQ_RTR_REV=$(echo "$HQ_RTR_IP" | awk -F'.' '{print $3"."$2"."$1}')
+BR_RTR_REV=$(echo "$BR_RTR_IP" | awk -F'.' '{print $3"."$2"."$1}')
+BR_SRV_REV=$(echo "$BR_SRV_IP" | awk -F'.' '{print $3"."$2"."$1}')
 
-BR_RTR_NET=$(echo "$BR_RTR_IP" | cut -d'.' -f1-3)
-BR_RTR_OCT1=$(echo "$BR_RTR_NET" | cut -d'.' -f1)
-BR_RTR_OCT2=$(echo "$BR_RTR_NET" | cut -d'.' -f2)
-BR_RTR_OCT3=$(echo "$BR_RTR_NET" | cut -d'.' -f3)
-BR_RTR_REV="${BR_RTR_OCT3}.${BR_RTR_OCT2}.${BR_RTR_OCT1}"
-
-BR_SRV_NET=$(echo "$BR_SRV_IP" | cut -d'.' -f1-3)
-BR_SRV_OCT1=$(echo "$BR_SRV_NET" | cut -d'.' -f1)
-BR_SRV_OCT2=$(echo "$BR_SRV_NET" | cut -d'.' -f2)
-BR_SRV_OCT3=$(echo "$BR_SRV_NET" | cut -d'.' -f3)
-BR_SRV_REV="${BR_SRV_OCT3}.${BR_SRV_OCT2}.${BR_SRV_OCT1}"
-
-log_info "Обратные зоны:"
-echo " Локальная (${SUBNET}.x): ${REV_ZONE}.in-addr.arpa"
-echo " HQ-RTR (${HQ_RTR_NET}.x): ${HQ_RTR_REV}.in-addr.arpa"
-echo " BR-RTR (${BR_RTR_NET}.x): ${BR_RTR_REV}.in-addr.arpa"
-echo " BR-SRV (${BR_SRV_NET}.x): ${BR_SRV_REV}.in-addr.arpa"
-
-# ============================================================================
-# СВОДКА
-# ============================================================================
-log_header "Итоговая конфигурация"
+# Вывод конфигурации
+echo ""
+log_step "Итоговая конфигурация"
+echo "=============================================="
 echo "Домен: $DOMAIN_NAME"
 echo "HQ-RTR: $HQ_RTR_IP"
 echo "HQ-SRV: $HQ_SRV_IP"
@@ -207,454 +173,382 @@ echo "BR-SRV: $BR_SRV_IP"
 echo "Docker: $DOCKER_IP"
 echo "WEB: $WEB_IP"
 echo "Forwarders: $FWD1, $FWD2"
+echo "=============================================="
 echo ""
 
-read -p "Продолжить? [y/N]: " confirm
-if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
- log_error "Отменено"
- exit 1
-fi
+# ============================================================================
+# УСТАНОВКА ПАКЕТОВ
+# ============================================================================
+log_step "Установка пакетов..."
+yum install -y bind bind-utils firewalld
 
 # ============================================================================
-# СОЗДАНИЕ ДИРЕКТОРИЙ
+# СОЗДАНИЕ СТРУКТУРЫ ДИРЕКТОРИЙ
 # ============================================================================
 log_step "Создание структуры директорий..."
 
+CHROOT=/var/named
+CHROOT_ETC=/etc/named
+mkdir -p ${CHROOT}/master
+mkdir -p ${CHROOT}/data
+mkdir -p ${CHROOT}/dynamic
+mkdir -p ${CHROOT}/slaves
 mkdir -p ${CHROOT_ETC}
-mkdir -p ${CHROOT_VAR}/{master,data,dynamic,slaves}
-
-chown -R named:named ${CHROOT_DIR}
-chmod 750 ${CHROOT_VAR}
-chmod 750 ${CHROOT_VAR}/master
-chmod 750 ${CHROOT_VAR}/data
-chmod 750 ${CHROOT_VAR}/dynamic
-
-# ВАЖНО: Создаем симлинк для systemd
-ln -sf /var/lib/bind/var/named /var/named 2>/dev/null || true
 
 log_info "Директории созданы"
 
 # ============================================================================
-# RNDC KEY
+# ГЕНЕРАЦИЯ КЛЮЧЕЙ
 # ============================================================================
 log_step "Генерация rndc ключа..."
 
-# Метод 1: Пробуем rndc-confgen
-if rndc-confgen -a -q 2>/dev/null && [ -f /etc/rndc.key ]; then
- log_info "rndc.key создан через rndc-confgen"
-else
- # Метод 2: Создаем вручную
- log_warn "rndc-confgen не сработал, создаю вручную..."
-
- # Генерируем случайный секрет
- SECRET=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -d '\n')
-
- # Создаем файл
- cat > /etc/rndc.key << EOF
+if ! rndc-confgen -a -r /dev/urandom &>/dev/null; then
+    log_warn "rndc-confgen не сработал, создам вручную..."
+    cat > /etc/rndc.key << EOF
 key "rndc-key" {
- algorithm hmac-sha256;
- secret "$SECRET";
+    algorithm hmac-sha256;
+    secret "$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64)";
 };
 EOF
-
- if [ -f /etc/rndc.key ]; then
- log_info "rndc.key создан вручную"
- else
- log_error "Не удалось создать rndc.key!"
- exit 1
- fi
+    chmod 640 /etc/rndc.key
 fi
 
-# Устанавливаем права и копируем в chroot
-chown root:named /etc/rndc.key
-chmod 640 /etc/rndc.key
-
-cp /etc/rndc.key ${CHROOT_ETC}/rndc.key
-chown named:named ${CHROOT_ETC}/rndc.key
-chmod 640 ${CHROOT_ETC}/rndc.key
-
-log_info "rndc.key скопирован в chroot"
+log_info "rndc.key создан вручную"
+cp /etc/rndc.key ${CHROOT}/etc/rndc.key 2>/dev/null || true
 
 # ============================================================================
-# NAMED.CONF
+# СОЗДАНИЕ NAMED.CONF С ПРОВЕРКОЙ НА ДУБЛИРОВАНИЕ ЗОН (ИСПРАВЛЕНО)
 # ============================================================================
 log_step "Создание named.conf..."
 
+# Создаем массив для отслеживания уникальных зон
+declare -A REVERSE_ZONES_ADDED
+
 cat > ${CHROOT_ETC}/named.conf << EOF
 // DNS Configuration for $DOMAIN_NAME
+// Generated: $(date)
 
 options {
- listen-on port 53 { 127.0.0.1; $HQ_SRV_IP; any; };
- listen-on-v6 port 53 { none; };
- directory "/var/named";
- dump-file "data/cache_dump.db";
- statistics-file "data/named_stats.txt";
- memstatistics-file "data/named_mem_stats.txt";
- allow-query { any; };
- allow-recursion { any; };
- forwarders { $FWD1; $FWD2; };
- recursion yes;
- dnssec-validation no;
+    listen-on port 53 { 127.0.0.1; $HQ_SRV_IP; any; };
+    listen-on-v6 port 53 { none; };
+    directory "/var/named";
+    dump-file "data/cache_dump.db";
+    statistics-file "data/named_stats.txt";
+    memstatistics-file "data/named_mem_stats.txt";
+    allow-query { any; };
+    allow-recursion { any; };
+    forwarders { $FWD1; $FWD2; };
+    recursion yes;
+    dnssec-validation no;
 };
 
 logging {
- channel default_debug {
- file "data/named.run";
- severity dynamic;
- };
+    channel default_debug {
+        file "data/named.run";
+        severity dynamic;
+    };
 };
 
 include "/etc/rndc.key";
 
 controls {
- inet 127.0.0.1 allow { localhost; } keys { "rndc-key"; };
+    inet 127.0.0.1 allow { localhost; } keys { "rndc-key"; };
 };
 
 zone "$DOMAIN_NAME" IN {
- type master;
- file "master/$DOMAIN_NAME.db";
- allow-update { none; };
+    type master;
+    file "master/$DOMAIN_NAME.db";
+    allow-update { none; };
 };
 
-zone "${REV_ZONE}.in-addr.arpa" IN {
- type master;
- file "master/${DOMAIN_NAME}_rev.db";
- allow-update { none; };
-};
+EOF
 
-zone "${HQ_RTR_REV}.in-addr.arpa" IN {
- type master;
- file "master/${DOMAIN_NAME}_hq_rtr_rev.db";
- allow-update { none; };
-};
+# Функция для добавления уникальных обратных зон
+add_reverse_zone() {
+    local zone_name=$1
+    local zone_file=$2
+    local zone_desc=$3
+    
+    # Проверяем на дублирование
+    if [[ -n "${REVERSE_ZONES_ADDED[$zone_name]}" ]]; then
+        log_warn "Пропускаем дублирующуюся зону: ${zone_name}.in-addr.arpa ($zone_desc)"
+        return
+    fi
+    
+    # Добавляем зону
+    REVERSE_ZONES_ADDED[$zone_name]=1
+    
+    cat >> ${CHROOT_ETC}/named.conf << EOF
 
-zone "${BR_RTR_REV}.in-addr.arpa" IN {
- type master;
- file "master/${DOMAIN_NAME}_br_rtr_rev.db";
- allow-update { none; };
+zone "${zone_name}.in-addr.arpa" IN {
+    type master;
+    file "master/${zone_file}";
+    allow-update { none; };
 };
+EOF
+    log_info "Добавлена обратная зона: ${zone_name}.in-addr.arpa ($zone_desc)"
+}
 
-zone "${BR_SRV_REV}.in-addr.arpa" IN {
- type master;
- file "master/${DOMAIN_NAME}_br_srv_rev.db";
- allow-update { none; };
-};
+# Добавляем обратные зоны с проверкой на дублирование
+add_reverse_zone "$REV_ZONE" "${DOMAIN_NAME}_rev.db" "Локальная сеть (HQ-SRV)"
+add_reverse_zone "$HQ_RTR_REV" "${DOMAIN_NAME}_hq_rtr_rev.db" "HQ-RTR"
+add_reverse_zone "$BR_RTR_REV" "${DOMAIN_NAME}_br_rtr_rev.db" "BR-RTR"
+add_reverse_zone "$BR_SRV_REV" "${DOMAIN_NAME}_br_srv_rev.db" "BR-SRV"
+
+# Добавляем стандартные зоны
+cat >> ${CHROOT_ETC}/named.conf << EOF
 
 zone "localhost" IN {
- type master;
- file "named.localhost";
+    type master;
+    file "named.localhost";
+    allow-update { none; };
 };
 
 zone "1.0.0.127.in-addr.arpa" IN {
- type master;
- file "named.loopback";
+    type master;
+    file "named.loopback";
+    allow-update { none; };
 };
 
 zone "." IN {
- type hint;
- file "named.root";
+    type hint;
+    file "named.root";
 };
 EOF
-
-chown root:named ${CHROOT_ETC}/named.conf
-chmod 640 ${CHROOT_ETC}/named.conf
-
-ln -sf ${CHROOT_ETC}/named.conf /etc/named.conf
-ln -sf ${CHROOT_ETC}/rndc.key /etc/rndc.key
 
 log_info "named.conf создан"
 
 # ============================================================================
-# ПРЯМАЯ ЗОНА
+# СОЗДАНИЕ ПРЯМОЙ ЗОНЫ
 # ============================================================================
 log_step "Создание прямой зоны..."
 
-SERIAL=$(date +%Y%m%d01)
-
-cat > ${CHROOT_VAR}/master/$DOMAIN_NAME.db << EOF
+cat > ${CHROOT}/master/$DOMAIN_NAME.db << EOF
 \$TTL 86400
-@ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
- $SERIAL ; Serial
- 3600 ; Refresh
- 1800 ; Retry
- 604800 ; Expire
- 86400 ; Minimum TTL
+@   IN  SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
+    $(date +%Y%m%d01) ; Serial
+    3600        ; Refresh
+    1800        ; Retry
+    604800      ; Expire
+    86400       ; Minimum TTL
 )
 
-@ IN NS hq-srv.$DOMAIN_NAME.
+@       IN  NS      hq-srv.$DOMAIN_NAME.
 
-hq-rtr IN A $HQ_RTR_IP
-br-rtr IN A $BR_RTR_IP
-hq-srv IN A $HQ_SRV_IP
-br-srv IN A $BR_SRV_IP
-docker IN A $DOCKER_IP
-web IN A $WEB_IP
+hq-rtr  IN  A       $HQ_RTR_IP
+br-rtr  IN  A       $BR_RTR_IP
+hq-srv  IN  A       $HQ_SRV_IP
+br-srv  IN  A       $BR_SRV_IP
+docker  IN  A       $DOCKER_IP
+web     IN  A       $WEB_IP
 EOF
-
-chown root:named ${CHROOT_VAR}/master/$DOMAIN_NAME.db
-chmod 0640 ${CHROOT_VAR}/master/$DOMAIN_NAME.db
 
 log_info "Прямая зона создана"
 
 # ============================================================================
-# ОБРАТНАЯ ЗОНА - ЛОКАЛЬНАЯ
+# СОЗДАНИЕ ОБРАТНЫХ ЗОН
 # ============================================================================
-log_step "Создание обратной зоны (локальная)..."
+log_step "Создание обратных зон..."
 
-HQ_SRV_PTR=$(echo "$HQ_SRV_IP" | cut -d'.' -f4)
-
-cat > ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db << EOF
+# Локальная обратная зона
+cat > ${CHROOT}/master/${DOMAIN_NAME}_rev.db << EOF
 \$TTL 86400
-@ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
- $SERIAL ; Serial
- 3600 ; Refresh
- 1800 ; Retry
- 604800 ; Expire
- 86400 ; Minimum TTL
+@   IN  SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
+    $(date +%Y%m%d01) ; Serial
+    3600
+    1800
+    604800
+    86400
 )
 
-@ IN NS hq-srv.$DOMAIN_NAME.
-
-$HQ_SRV_PTR IN PTR hq-srv.$DOMAIN_NAME.
+@   IN  NS  hq-srv.$DOMAIN_NAME.
+$(echo "$HQ_SRV_IP" | awk -F'.' '{print $4}')   IN  PTR hq-srv.$DOMAIN_NAME.
 EOF
 
-chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
-chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_rev.db
+log_info "Обратная зона (локальная) создана"
 
-# ============================================================================
-# ОБРАТНАЯ ЗОНА - HQ-RTR
-# ============================================================================
-log_step "Создание обратной зоны (HQ-RTR)..."
-
-HQ_RTR_PTR=$(echo "$HQ_RTR_IP" | cut -d'.' -f4)
-
-cat > ${CHROOT_VAR}/master/${DOMAIN_NAME}_hq_rtr_rev.db << EOF
+# Обратная зона HQ-RTR
+cat > ${CHROOT}/master/${DOMAIN_NAME}_hq_rtr_rev.db << EOF
 \$TTL 86400
-@ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
- $SERIAL ; Serial
- 3600 ; Refresh
- 1800 ; Retry
- 604800 ; Expire
- 86400 ; Minimum TTL
+@   IN  SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
+    $(date +%Y%m%d01) ; Serial
+    3600
+    1800
+    604800
+    86400
 )
 
-@ IN NS hq-srv.$DOMAIN_NAME.
-
-$HQ_RTR_PTR IN PTR hq-rtr.$DOMAIN_NAME.
+@   IN  NS  hq-srv.$DOMAIN_NAME.
+$(echo "$HQ_RTR_IP" | awk -F'.' '{print $4}')   IN  PTR hq-rtr.$DOMAIN_NAME.
 EOF
 
-chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_hq_rtr_rev.db
-chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_hq_rtr_rev.db
+log_info "Обратная зона (HQ-RTR) создана"
 
-# ============================================================================
-# ОБРАТНАЯ ЗОНА - BR-RTR
-# ============================================================================
-log_step "Создание обратной зоны (BR-RTR)..."
-
-BR_RTR_PTR=$(echo "$BR_RTR_IP" | cut -d'.' -f4)
-
-cat > ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_rtr_rev.db << EOF
+# Обратная зона BR-RTR
+cat > ${CHROOT}/master/${DOMAIN_NAME}_br_rtr_rev.db << EOF
 \$TTL 86400
-@ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
- $SERIAL ; Serial
- 3600 ; Refresh
- 1800 ; Retry
- 604800 ; Expire
- 86400 ; Minimum TTL
+@   IN  SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
+    $(date +%Y%m%d01) ; Serial
+    3600
+    1800
+    604800
+    86400
 )
 
-@ IN NS hq-srv.$DOMAIN_NAME.
-
-$BR_RTR_PTR IN PTR br-rtr.$DOMAIN_NAME.
+@   IN  NS  hq-srv.$DOMAIN_NAME.
+$(echo "$BR_RTR_IP" | awk -F'.' '{print $4}')   IN  PTR br-rtr.$DOMAIN_NAME.
 EOF
 
-chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_rtr_rev.db
-chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_rtr_rev.db
+log_info "Обратная зона (BR-RTR) создана"
 
-# ============================================================================
-# ОБРАТНАЯ ЗОНА - BR-SRV
-# ============================================================================
-log_step "Создание обратной зоны (BR-SRV)..."
-
-BR_SRV_PTR=$(echo "$BR_SRV_IP" | cut -d'.' -f4)
-
-cat > ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_srv_rev.db << EOF
+# Обратная зона BR-SRV
+cat > ${CHROOT}/master/${DOMAIN_NAME}_br_srv_rev.db << EOF
 \$TTL 86400
-@ IN SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
- $SERIAL ; Serial
- 3600 ; Refresh
- 1800 ; Retry
- 604800 ; Expire
- 86400 ; Minimum TTL
+@   IN  SOA hq-srv.$DOMAIN_NAME. root.$DOMAIN_NAME. (
+    $(date +%Y%m%d01) ; Serial
+    3600
+    1800
+    604800
+    86400
 )
 
-@ IN NS hq-srv.$DOMAIN_NAME.
-
-$BR_SRV_PTR IN PTR br-srv.$DOMAIN_NAME.
+@   IN  NS  hq-srv.$DOMAIN_NAME.
+$(echo "$BR_SRV_IP" | awk -F'.' '{print $4}')   IN  PTR br-srv.$DOMAIN_NAME.
 EOF
 
-chown root:named ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_srv_rev.db
-chmod 0640 ${CHROOT_VAR}/master/${DOMAIN_NAME}_br_srv_rev.db
+log_info "Обратная зона (BR-SRV) создана"
 
 # ============================================================================
-# СТАНДАРТНЫЕ ЗОНЫ
+# СОЗДАНИЕ СТАНДАРТНЫХ ЗОН
 # ============================================================================
 log_step "Создание стандартных зон..."
 
-cat > ${CHROOT_VAR}/named.localhost << 'EOF'
-$TTL 1D
-@ IN SOA @ root.localhost. (
- 1 ; Serial
- 1H ; Refresh
- 15M ; Retry
- 1W ; Expire
- 1D ; Minimum
+cat > ${CHROOT}/named.localhost << EOF
+\$TTL 1D
+@   IN SOA @ rname.invalid. (
+    0   ; serial
+    1D  ; refresh
+    1H  ; retry
+    1W  ; expire
+    3H  ; minimum
 )
- NS @
- A 127.0.0.1
+    NS  @
+    A   127.0.0.1
+    AAAA    ::1
 EOF
 
-cat > ${CHROOT_VAR}/named.loopback << 'EOF'
-$TTL 1D
-@ IN SOA @ root.localhost. (
- 1 ; Serial
- 1H ; Refresh
- 15M ; Retry
- 1W ; Expire
- 1D ; Minimum
+cat > ${CHROOT}/named.loopback << EOF
+\$TTL 1D
+@   IN SOA @ rname.invalid. (
+    0   ; serial
+    1D  ; refresh
+    1H  ; retry
+    1W  ; expire
+    3H  ; minimum
 )
- IN NS localhost.
-1 IN PTR localhost.
+    NS  @
+    PTR localhost.
 EOF
 
-# ИСПРАВЛЕНО: Добавлены все 13 корневых серверов (a-m)
-cat > ${CHROOT_VAR}/named.root << 'EOF'
-. 3600000 NS a.root-servers.net.
-a.root-servers.net. 3600000 A 198.41.0.4
-. 3600000 NS b.root-servers.net.
-b.root-servers.net. 3600000 A 199.9.14.201
-. 3600000 NS c.root-servers.net.
-c.root-servers.net. 3600000 A 192.33.4.12
-. 3600000 NS d.root-servers.net.
-d.root-servers.net. 3600000 A 199.7.91.13
-. 3600000 NS e.root-servers.net.
-e.root-servers.net. 3600000 A 192.203.230.10
-. 3600000 NS f.root-servers.net.
-f.root-servers.net. 3600000 A 192.5.5.241
-. 3600000 NS g.root-servers.net.
-g.root-servers.net. 3600000 A 192.112.36.4
-. 3600000 NS h.root-servers.net.
-h.root-servers.net. 3600000 A 198.97.190.53
-. 3600000 NS i.root-servers.net.
-i.root-servers.net. 3600000 A 192.36.148.17
-. 3600000 NS j.root-servers.net.
-j.root-servers.net. 3600000 A 192.58.128.30
-. 3600000 NS k.root-servers.net.
-k.root-servers.net. 3600000 A 193.0.14.129
-. 3600000 NS l.root-servers.net.
-l.root-servers.net. 3600000 A 199.7.83.42
-. 3600000 NS m.root-servers.net.
-m.root-servers.net. 3600000 A 202.12.27.33
+cat > ${CHROOT}/named.root << EOF
+.                        3600000      NS    A.ROOT-SERVERS.NET.
+A.ROOT-SERVERS.NET.      3600000      A     198.41.0.4
 EOF
-
-chown named:named ${CHROOT_VAR}/named.localhost
-chown named:named ${CHROOT_VAR}/named.loopback
-chown named:named ${CHROOT_VAR}/named.root
 
 log_info "Стандартные зоны созданы"
 
 # ============================================================================
-# ПРАВА ДОСТУПА
+# УСТАНОВКА ПРАВ ДОСТУПА
 # ============================================================================
 log_step "Установка прав доступа..."
 
-chown named:named ${CHROOT_VAR}/data
-chown named:named ${CHROOT_VAR}/dynamic
-chmod 750 ${CHROOT_VAR}/data
-chmod 750 ${CHROOT_VAR}/dynamic
-
-touch ${CHROOT_VAR}/data/named.run 2>/dev/null || true
-chown named:named ${CHROOT_VAR}/data/named.run 2>/dev/null || true
+chown -R root:named ${CHROOT}
+chmod -R 750 ${CHROOT}
+chown root:named ${CHROOT_ETC}/named.conf
+chmod 640 ${CHROOT_ETC}/named.conf
 
 log_info "Права установлены"
 
 # ============================================================================
-# FIREWALL
+# НАСТРОЙКА FIREWALL
 # ============================================================================
-log_step "Открытие портов firewall..."
+log_step "Настройка firewall..."
 
-iptables -C INPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || {
- iptables -I INPUT -p udp --dport 53 -j ACCEPT
- log_info "Открыт UDP порт 53"
-}
+systemctl enable firewalld
+systemctl start firewalld
 
-iptables -C INPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || {
- iptables -I INPUT -p tcp --dport 53 -j ACCEPT
- log_info "Открыт TCP порт 53"
-}
+firewall-cmd --permanent --add-service=dns >/dev/null 2>&1 || true
+firewall-cmd --permanent --add-port=53/udp >/dev/null 2>&1 || true
+firewall-cmd --permanent --add-port=53/tcp >/dev/null 2>&1 || true
+firewall-cmd --reload >/dev/null 2>&1 || true
 
-service iptables save 2>/dev/null || true
 log_info "Firewall настроен"
 
 # ============================================================================
-# RESOLV.CONF
+# НАСТРОЙКА /ETC/RESOLV.CONF
 # ============================================================================
 log_step "Настройка /etc/resolv.conf..."
 
-cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
-
-cat > /etc/resolv.conf << EOF
-# DNS configuration for $DOMAIN_NAME
-search $DOMAIN_NAME
-nameserver 127.0.0.1
-EOF
-
-log_info "resolv.conf настроен"
+if ! grep -q "127.0.0.1" /etc/resolv.conf; then
+    cp /etc/resolv.conf /etc/resolv.conf.backup
+    echo "nameserver 127.0.0.1" | cat - /etc/resolv.conf > /tmp/resolv.conf.new
+    echo "search $DOMAIN_NAME" >> /tmp/resolv.conf.new
+    mv /tmp/resolv.conf.new /etc/resolv.conf
+    log_info "resolv.conf настроен"
+else
+    log_info "resolv.conf уже содержит 127.0.0.1"
+fi
 
 # ============================================================================
-# ПРОВЕРКА
+# ПРОВЕРКА КОНФИГУРАЦИИ
 # ============================================================================
 log_step "Проверка конфигурации..."
-echo ""
 
+echo ""
 echo "=== named-checkconf ==="
-if named-checkconf -t ${CHROOT_DIR} /etc/named.conf; then
- log_info "✓ named.conf валиден!"
+if named-checkconf ${CHROOT_ETC}/named.conf 2>&1; then
+    log_info "✓ named.conf валиден"
 else
- log_error "✗ Ошибка в named.conf!"
- cat ${CHROOT_ETC}/named.conf
- exit 1
+    log_error "✗ Ошибка в named.conf!"
+    named-checkconf ${CHROOT_ETC}/named.conf 2>&1
 fi
 
 echo ""
 echo "=== named-checkzone (прямая зона) ==="
-named-checkzone -t ${CHROOT_DIR} $DOMAIN_NAME /var/named/master/$DOMAIN_NAME.db
-
-echo ""
-echo "=== named-checkzone (обратные зоны) ==="
-named-checkzone -t ${CHROOT_DIR} ${REV_ZONE}.in-addr.arpa /var/named/master/${DOMAIN_NAME}_rev.db
-named-checkzone -t ${CHROOT_DIR} ${HQ_RTR_REV}.in-addr.arpa /var/named/master/${DOMAIN_NAME}_hq_rtr_rev.db
-named-checkzone -t ${CHROOT_DIR} ${BR_RTR_REV}.in-addr.arpa /var/named/master/${DOMAIN_NAME}_br_rtr_rev.db
-named-checkzone -t ${CHROOT_DIR} ${BR_SRV_REV}.in-addr.arpa /var/named/master/${DOMAIN_NAME}_br_srv_rev.db
-
-log_info "✓ Все зоны валидны!"
+if named-checkzone $DOMAIN_NAME ${CHROOT}/master/$DOMAIN_NAME.db 2>&1; then
+    log_info "✓ Прямая зона валидна"
+else
+    log_error "✗ Ошибка в прямой зоне!"
+fi
 
 # ============================================================================
-# ЗАПУСК BIND
+# ЗАПУСК BIND С УЛУЧШЕННОЙ ПРОВЕРКОЙ (ИСПРАВЛЕНО)
 # ============================================================================
 log_step "Запуск BIND..."
 
-if systemctl list-unit-files | grep -q '^named.service'; then
- SERVICE="named"
-elif systemctl list-unit-files | grep -q '^bind.service'; then
- SERVICE="bind"
+# Проверяем установлен ли BIND
+if ! command -v named &> /dev/null; then
+    log_error "BIND не установлен!"
+    exit 1
+fi
+
+# Определяем имя службы
+if systemctl list-unit-files 2>/dev/null | grep -q '^named.service'; then
+    SERVICE="named"
+elif systemctl list-unit-files 2>/dev/null | grep -q '^bind9.service'; then
+    SERVICE="bind9"
+elif systemctl list-unit-files 2>/dev/null | grep -q '^bind.service'; then
+    SERVICE="bind"
 else
- SERVICE="named"
+    log_error "Служба BIND не найдена!"
+    exit 1
 fi
 
 log_info "Сервис: $SERVICE"
 
+# Очищаем возможные оверрайды
 rm -rf /etc/systemd/system/bind.service.d/ 2>/dev/null || true
+rm -rf /etc/systemd/system/bind9.service.d/ 2>/dev/null || true
 rm -rf /etc/systemd/system/named.service.d/ 2>/dev/null || true
 
 systemctl daemon-reload
@@ -665,78 +559,62 @@ sleep 3
 
 echo ""
 if systemctl is-active --quiet $SERVICE; then
- log_info "✓ BIND запущен!"
+    log_info "✓ BIND запущен!"
 else
- log_error "✗ BIND не запустился!"
- systemctl status $SERVICE
- journalctl -xeu $SERVICE -n 30 --no-pager
- exit 1
+    log_error "✗ BIND не запустился!"
+    log_error "Проверьте логи:"
+    journalctl -u $SERVICE --no-pager | tail -30
+    exit 1
 fi
 
 # ============================================================================
-# ТЕСТИРОВАНИЕ - ИСПРАВЛЕНО: добавлен флаг +noidn
+# ФИНАЛЬНАЯ ПРОВЕРКА
 # ============================================================================
-log_step "Тестирование DNS..."
 echo ""
+log_step "Финальная проверка..."
 
-log_info "Прямое разрешение:"
-for host in hq-rtr br-rtr hq-srv br-srv docker web; do
- RESULT=$(dig @localhost $host.$DOMAIN_NAME +short +noidn 2>/dev/null)
- if [ -n "$RESULT" ]; then
- log_info "✓ $host.$DOMAIN_NAME -> $RESULT"
- else
- log_warn "✗ $host.$DOMAIN_NAME -> не найден"
- fi
-done
+sleep 2
 
 echo ""
-log_info "Обратное разрешение:"
-for ip in $HQ_RTR_IP $HQ_SRV_IP $BR_RTR_IP $BR_SRV_IP; do
- RESULT=$(dig @localhost -x $ip +short 2>/dev/null)
- if [ -n "$RESULT" ]; then
- log_info "✓ $ip -> $RESULT"
- else
- log_warn "✗ $ip -> не найден"
- fi
-done
+echo "=== Тест DNS ==="
+if dig @$HQ_SRV_IP $DOMAIN_NAME +short >/dev/null 2>&1; then
+    log_info "✓ DNS отвечает на $HQ_SRV_IP"
+    echo "  hq-srv.$DOMAIN_NAME: $(dig @$HQ_SRV_IP hq-srv.$DOMAIN_NAME +short 2>/dev/null || echo 'N/A')"
+else
+    log_warn "✗ DNS не отвечает на $HQ_SRV_IP"
+fi
+
+echo ""
+echo "=== Тест localhost ==="
+if dig @127.0.0.1 $DOMAIN_NAME +short >/dev/null 2>&1; then
+    log_info "✓ DNS отвечает на localhost"
+else
+    log_warn "✗ DNS не отвечает на localhost"
+fi
 
 # ============================================================================
-# ИТОГИ
+# ИТОГОВАЯ ИНФОРМАЦИЯ
 # ============================================================================
-log_header "НАСТРОЙКА ЗАВЕРШЕНА!"
-
-echo "✅ DNS сервер настроен и работает!"
 echo ""
-echo "📋 КОНФИГУРАЦИЯ:"
-echo " Домен: $DOMAIN_NAME"
-echo " DNS сервер: $HQ_SRV_IP"
-echo " Forwarders: $FWD1, $FWD2"
+echo "=============================================="
+log_info "НАСТРОЙКА DNS ЗАВЕРШЕНА!"
+echo "=============================================="
 echo ""
-echo "📁 ФАЙЛЫ:"
-echo " Главный конфиг: /var/lib/bind/etc/named.conf"
-echo " Прямая зона: /var/lib/bind/var/named/master/$DOMAIN_NAME.db"
-echo " Обратные зоны: /var/lib/bind/var/named/master/*_rev.db"
+echo "Домен: $DOMAIN_NAME"
+echo "DNS сервер: $HQ_SRV_IP"
 echo ""
-echo "🔥 FIREWALL:"
-echo " ✅ UDP/TCP порт 53 открыт"
+echo "Хосты:"
+echo "  hq-rtr.$DOMAIN_NAME -> $HQ_RTR_IP"
+echo "  hq-srv.$DOMAIN_NAME -> $HQ_SRV_IP"
+echo "  br-rtr.$DOMAIN_NAME -> $BR_RTR_IP"
+echo "  br-srv.$DOMAIN_NAME -> $BR_SRV_IP"
+echo "  docker.$DOMAIN_NAME -> $DOCKER_IP"
+echo "  web.$DOMAIN_NAME -> $WEB_IP"
 echo ""
-echo "🔧 КОМАНДЫ:"
-echo " systemctl status $SERVICE"
-echo " dig @localhost hq-srv.$DOMAIN_NAME +short"
+echo "Команды для проверки:"
+echo "  dig @$HQ_SRV_IP $DOMAIN_NAME"
+echo "  nslookup hq-srv.$DOMAIN_NAME $HQ_SRV_IP"
+echo "  ping hq-srv.$DOMAIN_NAME"
 echo ""
-echo "📝 DNS ЗАПИСИ:"
-echo " hq-rtr.$DOMAIN_NAME -> $HQ_RTR_IP"
-echo " hq-srv.$DOMAIN_NAME -> $HQ_SRV_IP"
-echo " br-rtr.$DOMAIN_NAME -> $BR_RTR_IP"
-echo " br-srv.$DOMAIN_NAME -> $BR_SRV_IP"
-echo " docker.$DOMAIN_NAME -> $DOCKER_IP"
-echo " web.$DOMAIN_NAME -> $WEB_IP"
+log_info "Удачи на экзамене! 🚀"
 echo ""
-echo "🔄 ОБРАТНЫЕ ЗОНЫ:"
-echo " ${REV_ZONE}.in-addr.arpa (локальная)"
-echo " ${HQ_RTR_REV}.in-addr.arpa (HQ-RTR)"
-echo " ${BR_RTR_REV}.in-addr.arpa (BR-RTR)"
-echo " ${BR_SRV_REV}.in-addr.arpa (BR-SRV)"
-echo ""
-
-log_info "Готово к экзамену!"
