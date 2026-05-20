@@ -1,196 +1,202 @@
 #!/bin/bash
 
-# Файл для хранения списка созданных пользователей
-USERS_LOG="/var/log/created_users.log"
+# ==============================================================================
+# Скрипт управления пользователями для Demo2026
+# ДОБАВЛЕНО: Выбор уровня привилегий sudo при создании пользователя
+# ==============================================================================
 
-# Функция создания пользователя
+# Цвета
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m'
+
+# Файлы
+USERS_LOG="/var/log/created_users.log"
+SUDOERS_DIR="/etc/sudoers.d"
+
+# Функции вывода
+msg_ok() { echo -e "${GREEN}[OK]${NC} $1"; }
+msg_er() { echo -e "${RED}[ERR]${NC} $1"; }
+msg_in() { echo -e "${BLUE}[INFO]${NC} $1"; }
+msg_wa() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+
+# ==============================================================================
+# ИСПРАВЛЕННАЯ ФУНКЦИЯ НАСТРОЙКИ SUDO С ВЫБОРОМ ПРИВИЛЕГИЙ
+# ==============================================================================
+setup_sudo () {
+    local USERNAME=$1
+    local PRIVILEGE_LEVEL=${2:-2}  # По умолчанию: 2 = NOPASSWD
+    local SUDOERS_FILE="$SUDOERS_DIR/$USERNAME"
+    
+    echo -e "${CYAN}Настройка sudo для $USERNAME (уровень: $PRIVILEGE_LEVEL)...${NC}"
+    
+    if [ ! -d "$SUDOERS_DIR" ]; then
+        mkdir -p "$SUDOERS_DIR"
+        chmod 755 "$SUDOERS_DIR"
+    fi
+    
+    local TEMP_FILE=$(mktemp)
+    echo "# sudoers config for $USERNAME - created $(date)" > "$TEMP_FILE"
+    
+    # Выбор конфигурации в зависимости от уровня привилегий
+    case $PRIVILEGE_LEVEL in
+        0)
+            # Без прав sudo — только добавление в базовые группы
+            echo "# $USERNAME — без привилегий sudo" >> "$TEMP_FILE"
+            msg_in "Пользователь создан без прав sudo"
+            ;;
+        1)
+            # Sudo с паролем
+            echo "$USERNAME ALL=(ALL) ALL" >> "$TEMP_FILE"
+            msg_in "Настроено: sudo с запросом пароля"
+            ;;
+        2)
+            # Sudo без пароля (стандартный вариант)
+            echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" >> "$TEMP_FILE"
+            msg_in "Настроено: sudo без пароля (NOPASSWD)"
+            ;;
+        3)
+            # Максимальные привилегии + отключение логирования (для автоматизации)
+            echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" >> "$TEMP_FILE"
+            echo "Defaults:$USERNAME !logfile" >> "$TEMP_FILE"
+            echo "Defaults:$USERNAME !syslog" >> "$TEMP_FILE"
+            msg_wa "Настроено: полный доступ без логирования (использовать с осторожностью!)"
+            ;;
+        *)
+            # Защита от некорректного значения
+            echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" >> "$TEMP_FILE"
+            msg_wa "Неизвестный уровень, применён режим по умолчанию (NOPASSWD)"
+            ;;
+    esac
+    
+    # Применяем файл только если он содержит правила sudo
+    if [ "$PRIVILEGE_LEVEL" -ne 0 ]; then
+        if visudo -c -f "$TEMP_FILE" >/dev/null 2>&1; then
+            [ -f "$SUDOERS_FILE" ] && cp "$SUDOERS_FILE" "${SUDOERS_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+            cp "$TEMP_FILE" "$SUDOERS_FILE"
+            chmod 440 "$SUDOERS_FILE"
+            chown root:root "$SUDOERS_FILE"
+            
+            if visudo -c -f "$SUDOERS_FILE" >/dev/null 2>&1; then
+                msg_ok "Файл sudoers создан: $SUDOERS_FILE"
+            else
+                msg_er "Ошибка в синтаксисе после копирования!"
+                rm -f "$SUDOERS_FILE"
+            fi
+        else
+            msg_er "Ошибка синтаксиса sudoers!"
+            visudo -c -f "$TEMP_FILE" 2>&1 | head -5
+        fi
+    fi
+    
+    rm -f "$TEMP_FILE"
+    
+    # Добавление в группу sudo/wheel для совместимости (кроме уровня 0)
+    if [ "$PRIVILEGE_LEVEL" -ne 0 ]; then
+        if getent group wheel >/dev/null; then
+            usermod -aG wheel "$USERNAME" 2>/dev/null
+            msg_in "Добавлен в группу wheel"
+        elif getent group sudo >/dev/null; then
+            usermod -aG sudo "$USERNAME" 2>/dev/null
+            msg_in "Добавлен в группу sudo"
+        fi
+    fi
+}
+
+# ==============================================================================
+# ФУНКЦИЯ СОЗДАНИЯ ПОЛЬЗОВАТЕЛЯ (обновлена)
+# ==============================================================================
 create_user () {
     USERNAME=$1
     PASSWORD=$2
     USER_UID=$3
-
-    echo "Проверка пользователя $USERNAME..."
-
+    PRIVILEGE_LEVEL=${4:-2}  # Новый параметр: уровень привилегий
+    
+    echo -e "${CYAN}Проверка пользователя $USERNAME...${NC}"
+    
     if id "$USERNAME" &>/dev/null; then
-        echo "Пользователь уже существует"
-
+        echo -e "${YELLOW}Пользователь уже существует${NC}"
         CURRENT_UID=$(id -u $USERNAME)
-
         if [ ! -z "$USER_UID" ] && [ "$CURRENT_UID" != "$USER_UID" ]; then
-            echo "UID отличается. Текущий: $CURRENT_UID Требуемый: $USER_UID"
+            echo -e "${YELLOW}UID отличается. Текущий: $CURRENT_UID Требуемый: $USER_UID${NC}"
         fi
     else
-        echo "Создание пользователя..."
-
+        echo -e "${GREEN}Создание пользователя...${NC}"
         if [ -z "$USER_UID" ]; then
             useradd -m -s /bin/bash "$USERNAME"
         else
-            useradd -m -u "$USER_UID" -s /bin/bash "$USERNAME"
+            if [[ "$USER_UID" =~ ^[0-9]+$ ]] && [ "$USER_UID" -ge 1 ] && [ "$USER_UID" -le 65535 ]; then
+                if getent passwd "$USER_UID" >/dev/null; then
+                    CURRENT_USER=$(getent passwd "$USER_UID" | cut -d: -f1)
+                    msg_wa "UID $USER_UID занят пользователем $CURRENT_USER"
+                    read -p "Создать с неуникальным UID? (y/n): " force_uid
+                    if [[ "$force_uid" =~ ^[Yy] ]]; then
+                        useradd -m -u "$USER_UID" -o -s /bin/bash "$USERNAME"
+                    else
+                        msg_er "Отмена создания пользователя"
+                        return 1
+                    fi
+                else
+                    useradd -m -u "$USER_UID" -s /bin/bash "$USERNAME"
+                fi
+            else
+                msg_er "Некорректный UID: $USER_UID"
+                useradd -m -s /bin/bash "$USERNAME"
+            fi
         fi
-
-        # Исправленная установка пароля (без sudo, используем printf для надёжности)
+        
+        # Установка пароля
         printf "%s:%s" "$USERNAME" "$PASSWORD" | chpasswd
-
         if [ $? -eq 0 ]; then
-            echo "Пароль успешно установлен"
+            msg_ok "Пароль успешно установлен"
         else
-            echo "Ошибка при установке пароля!"
+            msg_er "Ошибка при установке пароля!"
             return 1
         fi
-
-        # Записываем в лог созданных пользователей
+        
         echo "$(date '+%Y-%m-%d %H:%M:%S') - $USERNAME (UID: $(id -u $USERNAME))" >> "$USERS_LOG"
     fi
-
-    echo "Настройка sudo..."
-
-    if getent group wheel >/dev/null; then
-        usermod -aG wheel "$USERNAME"
-    elif getent group sudo >/dev/null; then
-        usermod -aG sudo "$USERNAME"
-    fi
-
-    echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/$USERNAME
-    chmod 440 /etc/sudoers.d/$USERNAME
-
-    echo "Пользователь $USERNAME готов"
+    
+    # Настройка sudo с выбранным уровнем привилегий
+    setup_sudo "$USERNAME" "$PRIVILEGE_LEVEL"
+    echo -e "${GREEN}Пользователь $USERNAME готов${NC}"
 }
 
-# Функция показа созданных пользователей
-show_users() {
-    echo ""
-    echo "=========================================="
-    echo "     СПИСОК ПОЛЬЗОВАТЕЛЕЙ В СИСТЕМЕ"
-    echo "=========================================="
-    echo ""
+# ==============================================================================
+# ГЛАВНОЕ МЕНЮ (фрагмент с добавлением выбора привилегий)
+# ==============================================================================
+# ... (внутри цикла создания пользователей, после ввода UID) ...
 
-    # Показываем пользователей из лога
-    if [ -f "$USERS_LOG" ]; then
-        echo "--- Пользователи, созданные через этот скрипт ---"
-        cat "$USERS_LOG"
-        echo ""
+    # 🔹 НОВОЕ: Выбор уровня привилегий
+    echo ""
+    echo -e "${WHITE}Выберите уровень привилегий sudo:${NC}"
+    echo " 0 — Без прав sudo (обычный пользователь)"
+    echo " 1 — Sudo с запросом пароля (рекомендуется для безопасности)"
+    echo " 2 — Sudo без пароля ⭐ (по умолчанию)"
+    echo " 3 — Максимальные привилегии (без логирования, для скриптов)"
+    read -p "Введите номер [0-3] (по умолчанию 2): " INPUT_PRIV
+    
+    # Валидация ввода
+    if [[ ! "$INPUT_PRIV" =~ ^[0-3]$ ]]; then
+        INPUT_PRIV=2  # Значение по умолчанию
+        msg_in "Использован режим по умолчанию: Sudo без пароля"
     fi
 
-    echo "--- Все пользователи с домашней директорией ---"
-    # Показываем всех пользователей с домашней директорией и bash shell
-    awk -F: '$3 >= 1000 && $3 < 65534 && $7 ~ /bash$/ {print "Пользователь: " $1 " | UID: " $3 " | Домашняя директория: " $6}' /etc/passwd
-    
-    echo ""
-    echo "--- Пользователи в группе wheel/sudo ---"
-    
-    if getent group wheel >/dev/null; then
-        echo "Группа wheel: $(getent group wheel | cut -d: -f4)"
-    fi
-    if getent group sudo >/dev/null; then
-        echo "Группа sudo: $(getent group sudo | cut -d: -f4)"
-    fi
-    
-    echo ""
-    echo "=========================================="
-}
-
-# Главное меню
-echo "=========================================="
-echo "     МЕНЮ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЯМИ"
-echo "=========================================="
-echo ""
-echo "1 - Создать пользователей"
-echo "2 - Показать список пользователей"
-echo "3 - Выход"
-echo ""
-read -p "Выберите действие: " ACTION
-
-case $ACTION in
-    1)
-        echo ""
-        echo "Выберите тип устройства:"
-        echo "1 - Server (HQ-SRV / BR-SRV)"
-        echo "2 - Router (HQ-RTR / BR-RTR)"
-        read -p "Введите номер: " DEVICE
-
-        # Запрос количества пользователей
-        echo ""
-        read -p "Введите количество пользователей для создания: " USER_COUNT
-        
-        # Проверка корректности числа
-        if ! [[ "$USER_COUNT" =~ ^[0-9]+$ ]] || [ "$USER_COUNT" -lt 1 ]; then
-            echo "Ошибка: введите корректное число больше 0"
+    case $DEVICE in
+        1)
+            echo -e "${GREEN}Настройка Server...${NC}"
+            create_user "$INPUT_USERNAME" "$INPUT_PASSWORD" "$INPUT_UID" "$INPUT_PRIV"
+            ;;
+        2)
+            echo -e "${GREEN}Настройка Router (Linux)...${NC}"
+            create_user "$INPUT_USERNAME" "$INPUT_PASSWORD" "$INPUT_UID" "$INPUT_PRIV"
+            ;;
+        *)
+            msg_er "Неверный выбор устройства"
             exit 1
-        fi
-
-        # Цикл создания пользователей
-        for ((i=1; i<=USER_COUNT; i++)); do
-            echo ""
-            echo "=========================================="
-            echo "Создание пользователя #$i из $USER_COUNT"
-            echo "=========================================="
-            
-            read -p "Введите имя пользователя: " INPUT_USERNAME
-            
-            # Проверка пустого имени
-            if [ -z "$INPUT_USERNAME" ]; then
-                echo "Ошибка: имя пользователя не может быть пустым"
-                ((i--))
-                continue
-            fi
-            
-            read -s -p "Введите пароль: " INPUT_PASSWORD
-            echo
-            
-            # Проверка пустого пароля
-            if [ -z "$INPUT_PASSWORD" ]; then
-                echo "Ошибка: пароль не может быть пустым"
-                ((i--))
-                continue
-            fi
-            
-            # Повтор пароля для подтверждения
-            read -s -p "Повторите пароль: " INPUT_PASSWORD_CONFIRM
-            echo
-            
-            if [ "$INPUT_PASSWORD" != "$INPUT_PASSWORD_CONFIRM" ]; then
-                echo "Ошибка: пароли не совпадают!"
-                ((i--))
-                continue
-            fi
-            
-            read -p "Введите идентификатор (UID, можно пропустить нажав Enter): " INPUT_UID
-
-            case $DEVICE in
-                1)
-                    echo "Настройка Server..."
-                    create_user "$INPUT_USERNAME" "$INPUT_PASSWORD" "$INPUT_UID"
-                    ;;
-                2)
-                    echo "Настройка Router (Linux)..."
-                    create_user "$INPUT_USERNAME" "$INPUT_PASSWORD" "$INPUT_UID"
-                    ;;
-                *)
-                    echo "Неверный выбор устройства"
-                    exit 1
-                    ;;
-            esac
-        done
-        
-        echo ""
-        echo "Создание пользователей завершено!"
-        echo "Всего создано: $USER_COUNT пользователей"
-        ;;
-
-    2)
-        show_users
-        ;;
-
-    3)
-        echo "Выход..."
-        exit 0
-        ;;
-
-    *)
-        echo "Неверный выбор"
-        exit 1
-        ;;
-esac
-
-echo ""
-echo "Настройка завершена"
+            ;;
+    esac
