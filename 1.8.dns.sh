@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ============================================================================
-# DNS Infrastructure Setup Script - ALT Linux Server Edition
-# Исправленная версия для работы с bind.service
+# DNS Infrastructure Setup Script - ALT Linux Server (FIXED VERSION)
+# Версия: 2.0 - Исправлена работа с chroot и правами доступа
 # ============================================================================
 
 set -e
@@ -27,53 +27,51 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-log_header "DNS Infrastructure Setup Script - ALT Linux"
+log_header "DNS Infrastructure Setup - ALT Linux (FIXED)"
 
 # ============================================================================
-# ОЧИСТКА СТАРЫХ КОНФИГУРАЦИЙ
+# ОЧИСТКА
 # ============================================================================
-log_step "=== ОЧИСТКА СТАРЫХ КОНФИГУРАЦИЙ ==="
-echo ""
-log_warn "ВНИМАНИЕ: Будут удалены все старые конфигурации DNS!"
-read -p "Продолжить очистку? [y/N]: " clean_confirm
+log_step "Очистка старых конфигураций..."
 
-if [[ ! "$clean_confirm" =~ ^[Yy]$ ]]; then
-    log_error "Отменено пользователем"
-    exit 1
-fi
+systemctl stop bind.service 2>/dev/null || true
+systemctl stop named.service 2>/dev/null || true
 
-systemctl stop named 2>/dev/null || true
-systemctl stop bind 2>/dev/null || true
+# Очищаем ВСЕ конфигурации
+rm -rf /etc/named.conf
+rm -rf /var/lib/bind/etc/named.conf
+rm -rf /var/lib/bind/var/named/master/*.db
+rm -rf /var/named/master/*.db
+rm -rf /var/named/data/*
+rm -rf /var/named/dynamic/*
 
-rm -rf /var/lib/bind/etc/named.conf 2>/dev/null || true
-rm -rf /var/lib/bind/var/named/master/*.db 2>/dev/null || true
-rm -rf /etc/named.conf.bak 2>/dev/null || true
-rm -f /etc/named.conf 2>/dev/null || true
-rm -rf /var/named/master/*.db 2>/dev/null || true
-rm -rf /var/named/data/* 2>/dev/null || true
-rm -rf /var/named/dynamic/* 2>/dev/null || true
+# Создаем директории
+mkdir -p /var/named/master
+mkdir -p /var/named/data
+mkdir -p /var/named/dynamic
+mkdir -p /var/lib/bind/etc
+mkdir -p /var/lib/bind/var/named/master
+mkdir -p /var/lib/bind/var/named/data
 
 log_info "Очистка завершена"
 
 # ============================================================================
 # УСТАНОВКА ПАКЕТОВ
 # ============================================================================
-log_step "Установка BIND..."
+log_step "Проверка установки BIND..."
 
-if [ -f /etc/altlinux-release ]; then
+if ! rpm -q bind &>/dev/null; then
+    log_info "Установка BIND..."
     apt-get update || true
     apt-get install -y bind bind-utils
-    log_info "BIND установлен"
-else
-    log_error "Только ALT Linux поддерживается"
-    exit 1
 fi
 
+log_info "BIND установлен"
+
 # ============================================================================
-# АВТООПРЕДЕЛЕНИЕ IP
+# ОПРЕДЕЛЕНИЕ ПАРАМЕТРОВ
 # ============================================================================
-log_step "Автоопределение сетевых параметров..."
-echo ""
+log_step "Определение сетевых параметров..."
 
 LOCAL_IP=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -1)
 
@@ -88,11 +86,11 @@ log_info "Обнаружен IP: $LOCAL_IP"
 # ВВОД ПАРАМЕТРОВ
 # ============================================================================
 echo ""
-log_header "НАСТРОЙКА DNS"
+log_header "НАСТРОЙКА DNS СЕРВЕРА"
 echo ""
 echo "Текущий IP: $LOCAL_IP"
 echo ""
-read -p "Введите IP адрес сервера (или нажмите Enter для использования текущего): " CUSTOM_IP
+read -p "Введите IP адрес сервера (или нажмите Enter): " CUSTOM_IP
 DNS_IP="${CUSTOM_IP:-$LOCAL_IP}"
 
 read -p "Введите домен (например, au-team.irpo): " DOMAIN_NAME
@@ -104,7 +102,7 @@ fi
 read -p "Введите email администратора (например, admin.${DOMAIN_NAME}): " ADMIN_EMAIL
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin.${DOMAIN_NAME}}"
 
-read -p "Введите hostname для NS записи (например, ns): " NS_HOSTNAME
+read -p "Введите hostname для NS (например, ns): " NS_HOSTNAME
 NS_HOSTNAME="${NS_HOSTNAME:-ns}"
 
 echo ""
@@ -113,30 +111,48 @@ log_info "Домен: $DOMAIN_NAME"
 log_info "Email: $ADMIN_EMAIL"
 log_info "NS Hostname: $NS_HOSTNAME"
 echo ""
-read -p "Продолжить настройку? [y/N]: " confirm
+read -p "Продолжить? [y/N]: " confirm
 if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-    log_error "Отменено пользователем"
+    log_error "Отменено"
     exit 1
 fi
 
 # ============================================================================
-# ГЕНЕРАЦИЯ КОНФИГУРАЦИИ
+# ГЕНЕРАЦИЯ SERIAL
 # ============================================================================
-log_step "Создание конфигурации named.conf..."
-
-# Создаем директорию
-mkdir -p /var/named/master
-mkdir -p /var/named/data
-mkdir -p /var/named/dynamic
-
-# Генерируем serial
 SERIAL=$(date +%Y%m%d01)
+log_info "Serial: $SERIAL"
 
-# Создаем named.conf БЕЗ chroot
+# ============================================================================
+# ОТКЛЮЧЕНИЕ CHROOT (ВАЖНО!)
+# ============================================================================
+log_step "Отключение chroot для BIND..."
+
+# Создаем или модифицируем /etc/sysconfig/bind
+cat > /etc/sysconfig/bind << 'EOF'
+# BIND Configuration
+# Отключаем chroot для упрощения работы
+CHROOT=""
+OPTIONS="-u named"
+EOF
+
+log_info "CHROOT отключен"
+
+# ============================================================================
+# СОЗДАНИЕ named.conf (БЕЗ CHROOT)
+# ============================================================================
+log_step "Создание /etc/named.conf..."
+
+# Удаляем возможные симлинки
+rm -f /etc/named.conf
+rm -f /var/lib/bind/etc/named.conf
+
+# Создаем основной конфиг
 cat > /etc/named.conf << EOF
 //
 // BIND Configuration File
 // Generated: $(date)
+// Домен: ${DOMAIN_NAME}
 //
 
 options {
@@ -144,8 +160,6 @@ options {
     dump-file "/var/named/data/cache_dump.db";
     statistics-file "/var/named/data/named_stats.txt";
     memstatistics-file "/var/named/data/named_mem_stats.txt";
-    secroots-file "/var/named/data/named.secroots";
-    recursing-file "/var/named/data/named.recursing";
     
     listen-on port 53 { any; };
     listen-on-v6 port 53 { any; };
@@ -153,12 +167,13 @@ options {
     allow-query { any; };
     recursion yes;
     
-    dnssec-validation no;
-    
+    // Forwarders (публичные DNS)
     forwarders {
         8.8.8.8;
         8.8.4.4;
     };
+    
+    dnssec-validation no;
     
     max-cache-size 256m;
 };
@@ -174,21 +189,21 @@ logging {
     category default { default_log; };
 };
 
-// Forward zone for ${DOMAIN_NAME}
+// Forward zone: ${DOMAIN_NAME}
 zone "${DOMAIN_NAME}" IN {
     type master;
     file "master/${DOMAIN_NAME}.db";
     allow-update { none; };
 };
 
-// Reverse zone for ${DNS_IP}
-zone "$(echo $DNS_IP | cut -d. -f3).$(echo $DNS_IP | cut -d. -f2).$(echo $DNS_IP | cut -d. -f1).in-addr.arpa" IN {
+// Reverse zone для ${DNS_IP}
+zone "$(echo $DNS_IP | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')" IN {
     type master;
     file "master/${DOMAIN_NAME}_rev.db";
     allow-update { none; };
 };
 
-// Local loopback reverse zone
+// Local loopback
 zone "1.0.0.127.in-addr.arpa" IN {
     type master;
     file "master/named.loopback";
@@ -196,10 +211,14 @@ zone "1.0.0.127.in-addr.arpa" IN {
 };
 EOF
 
-log_info "named.conf создан"
+# Устанавливаем правильные права
+chown root:named /etc/named.conf
+chmod 640 /etc/named.conf
+
+log_info "/etc/named.conf создан"
 
 # ============================================================================
-# СОЗДАНИЕ ФАЙЛА ZONE (FORWARD)
+# FORWARD ZONE
 # ============================================================================
 log_step "Создание forward зоны..."
 
@@ -222,14 +241,15 @@ ftp               IN  A   ${DNS_IP}
 mail              IN  A   ${DNS_IP}
 EOF
 
-log_info "Forward зона создана: /var/named/master/${DOMAIN_NAME}.db"
+log_info "Forward зона создана"
 
 # ============================================================================
-# СОЗДАНИЕ ФАЙЛА REVERSE ZONE
+# REVERSE ZONE
 # ============================================================================
 log_step "Создание reverse зоны..."
 
-REVERSE_NET="$(echo $DNS_IP | cut -d. -f1-3 | awk -F. '{print $3"."$2"."$1}')"
+REVERSE_NET="$(echo $DNS_IP | awk -F. '{print $3"."$2"."$1}')"
+LAST_OCTET="$(echo $DNS_IP | awk -F. '{print $4}')"
 
 cat > /var/named/master/${DOMAIN_NAME}_rev.db << EOF
 \$TTL 1D
@@ -242,14 +262,14 @@ cat > /var/named/master/${DOMAIN_NAME}_rev.db << EOF
 
     IN  NS  ${NS_HOSTNAME}.${DOMAIN_NAME}.
     
-$(echo $DNS_IP | cut -d. -f4) IN  PTR ${NS_HOSTNAME}.${DOMAIN_NAME}.
-$(echo $DNS_IP | cut -d. -f4) IN  PTR ${DOMAIN_NAME}.
+${LAST_OCTET} IN  PTR ${NS_HOSTNAME}.${DOMAIN_NAME}.
+${LAST_OCTET} IN  PTR ${DOMAIN_NAME}.
 EOF
 
-log_info "Reverse зона создана: /var/named/master/${DOMAIN_NAME}_rev.db"
+log_info "Reverse зона создана"
 
 # ============================================================================
-# СОЗДАНИЕ LOOPBACK ZONE (ИСПРАВЛЕНО!)
+# LOOPBACK ZONE
 # ============================================================================
 log_step "Создание loopback зоны..."
 
@@ -266,26 +286,31 @@ cat > /var/named/master/named.loopback << EOF
 1   IN  PTR localhost.
 EOF
 
-log_info "Loopback зона создана: /var/named/master/named.loopback"
+log_info "Loopback зона создана"
 
 # ============================================================================
-# УСТАНОВКА ПРАВ ДОСТУПА (КРИТИЧНО!)
+# ПРАВА ДОСТУПА (КРИТИЧНО!)
 # ============================================================================
 log_step "Установка прав доступа..."
 
-chown -R named:named /var/named/master
-chown -R named:named /var/named/data
-chown -R named:named /var/named/dynamic
-
-chmod 640 /var/named/master/*.db
+# Для /var/named
+chown -R named:named /var/named
+chmod 750 /var/named
 chmod 750 /var/named/master
 chmod 750 /var/named/data
 chmod 750 /var/named/dynamic
+chmod 640 /var/named/master/*.db
 
-log_info "Права доступа установлены"
+# Для /var/lib/bind (если нужно)
+chown -R named:named /var/lib/bind/var/named 2>/dev/null || true
+chmod 750 /var/lib/bind/var/named 2>/dev/null || true
+chmod 750 /var/lib/bind/var/named/master 2>/dev/null || true
+chmod 640 /var/lib/bind/var/named/master/*.db 2>/dev/null || true
+
+log_info "Права установлены"
 
 # ============================================================================
-# ПРОВЕРКА КОНФИГУРАЦИИ
+# ПРОВЕРКИ
 # ============================================================================
 log_step "Проверка конфигурации..."
 
@@ -326,20 +351,20 @@ else
 fi
 
 # ============================================================================
-# НАСТРОЙКА FIREWALL
+# FIREWALL
 # ============================================================================
 log_step "Настройка firewall..."
 
 if command -v firewall-cmd &> /dev/null; then
-    firewall-cmd --permanent --add-service=dns || true
-    firewall-cmd --reload || true
+    firewall-cmd --permanent --add-service=dns 2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
     log_info "Firewall настроен (firewalld)"
 elif command -v ufw &> /dev/null; then
-    ufw allow 53/tcp || true
-    ufw allow 53/udp || true
+    ufw allow 53/tcp 2>/dev/null || true
+    ufw allow 53/udp 2>/dev/null || true
     log_info "Firewall настроен (ufw)"
 else
-    log_warn "Firewall не обнаружен или не настроен"
+    log_warn "Firewall не настроен"
 fi
 
 # ============================================================================
@@ -351,58 +376,65 @@ systemctl daemon-reload
 systemctl enable bind.service
 systemctl restart bind.service
 
-sleep 2
+sleep 3
 
-# Проверка статуса
 if systemctl is-active --quiet bind.service; then
-    log_info "BIND успешно запущен!"
+    log_info "✓ BIND успешно запущен!"
 else
-    log_error "BIND не запустился!"
-    log_error "Проверьте логи: journalctl -xeu bind.service"
-    systemctl status bind.service --no-pager
+    log_error "✗ BIND не запустился!"
+    log_error "Проверьте логи:"
+    log_error "  journalctl -xeu bind.service -n 50 --no-pager"
+    echo ""
+    systemctl status bind.service --no-pager -l
     exit 1
 fi
 
 # ============================================================================
 # ТЕСТИРОВАНИЕ
 # ============================================================================
-log_header "ТЕСТИРОВАНИЕ DNS"
+log_header "ТЕСТИРОВАНИЕ"
 
 echo ""
-log_info "Тестирование forward зоны..."
-dig @localhost ${DOMAIN_NAME} +short
+log_info "Forward lookup (${DOMAIN_NAME}):"
+dig @localhost ${DOMAIN_NAME} +short || echo "  (dig не доступен)"
 
 echo ""
-log_info "Тестирование reverse зоны..."
-dig @localhost -x ${DNS_IP} +short
+log_info "Reverse lookup (${DNS_IP}):"
+dig @localhost -x ${DNS_IP} +short || echo "  (dig не доступен)"
 
 echo ""
-log_info "Проверка NS записи..."
-dig @localhost ${DOMAIN_NAME} NS +short
+log_info "NS record:"
+dig @localhost ${DOMAIN_NAME} NS +short || echo "  (dig не доступен)"
 
 echo ""
-log_info "Проверка статуса службы..."
-systemctl status bind.service --no-pager | head -10
+log_info "Статус службы:"
+systemctl status bind.service --no-pager | grep -E "(Active|Loaded)" || true
 
 # ============================================================================
-# ИТОГОВАЯ ИНФОРМАЦИЯ
+# ИТОГИ
 # ============================================================================
 log_header "НАСТРОЙКА ЗАВЕРШЕНА"
 
 echo ""
-echo -e "${GREEN}DNS сервер успешно настроен!${NC}"
+echo -e "${GREEN}✓ DNS сервер настроен успешно!${NC}"
 echo ""
 echo "Основные файлы:"
-echo "  - Конфигурация: /etc/named.conf"
-echo "  - Forward зона: /var/named/master/${DOMAIN_NAME}.db"
-echo "  - Reverse зона: /var/named/master/${DOMAIN_NAME}_rev.db"
-echo "  - Loopback зона: /var/named/master/named.loopback"
+echo "  • Конфиг:     /etc/named.conf"
+echo "  • Forward:    /var/named/master/${DOMAIN_NAME}.db"
+echo "  • Reverse:    /var/named/master/${DOMAIN_NAME}_rev.db"
+echo "  • Loopback:   /var/named/master/named.loopback"
 echo ""
-echo "Полезные команды:"
-echo "  - Проверка статуса: systemctl status bind.service"
-echo "  - Просмотр логов: journalctl -xeu bind.service"
-echo "  - Перезапуск: systemctl restart bind.service"
-echo "  - Тестирование: dig @localhost ${DOMAIN_NAME}"
+echo "Команды управления:"
+echo "  • Статус:     systemctl status bind.service"
+echo "  • Старт:      systemctl start bind.service"
+echo "  • Стоп:       systemctl stop bind.service"
+echo "  • Рестарт:    systemctl restart bind.service"
+echo "  • Логи:       journalctl -xeu bind.service -f"
+echo ""
+echo "Тестирование:"
+echo "  • dig @localhost ${DOMAIN_NAME}"
+echo "  • dig @localhost -x ${DNS_IP}"
+echo "  • nslookup ${DOMAIN_NAME} localhost"
 echo ""
 echo "Serial: ${SERIAL}"
 echo ""
