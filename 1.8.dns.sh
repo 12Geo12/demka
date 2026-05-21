@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ============================================================================
-# DNS Infrastructure Setup Script - ALT Linux Server (FIXED VERSION)
-# Версия: 2.0 - Исправлена работа с chroot и правами доступа
+# DNS Infrastructure Setup Script - ALT Linux Server
+# Версия: 3.0 - Полностью рабочая версия с учетом chroot
 # ============================================================================
 
 set -e
@@ -27,31 +27,29 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-log_header "DNS Infrastructure Setup - ALT Linux (FIXED)"
+log_header "DNS Infrastructure Setup - ALT Linux Server"
 
 # ============================================================================
-# ОЧИСТКА
+# ОЧИСТКА СТАРЫХ КОНФИГУРАЦИЙ
 # ============================================================================
 log_step "Очистка старых конфигураций..."
 
 systemctl stop bind.service 2>/dev/null || true
 systemctl stop named.service 2>/dev/null || true
 
-# Очищаем ВСЕ конфигурации
+# Очищаем ВСЕ старые конфиги
 rm -rf /etc/named.conf
 rm -rf /var/lib/bind/etc/named.conf
-rm -rf /var/lib/bind/var/named/master/*.db
-rm -rf /var/named/master/*.db
-rm -rf /var/named/data/*
-rm -rf /var/named/dynamic/*
+rm -rf /var/lib/bind/var/named/master/*.db 2>/dev/null || true
+rm -rf /var/named/master/*.db 2>/dev/null || true
+rm -rf /var/named/data/* 2>/dev/null || true
+rm -rf /var/named/dynamic/* 2>/dev/null || true
 
-# Создаем директории
-mkdir -p /var/named/master
-mkdir -p /var/named/data
-mkdir -p /var/named/dynamic
-mkdir -p /var/lib/bind/etc
+# Создаем необходимые директории (В CHROOT!)
 mkdir -p /var/lib/bind/var/named/master
 mkdir -p /var/lib/bind/var/named/data
+mkdir -p /var/lib/bind/var/named/dynamic
+mkdir -p /var/lib/bind/etc
 
 log_info "Очистка завершена"
 
@@ -64,12 +62,13 @@ if ! rpm -q bind &>/dev/null; then
     log_info "Установка BIND..."
     apt-get update || true
     apt-get install -y bind bind-utils
+    log_info "BIND установлен"
+else
+    log_info "BIND уже установлен"
 fi
 
-log_info "BIND установлен"
-
 # ============================================================================
-# ОПРЕДЕЛЕНИЕ ПАРАМЕТРОВ
+# ОПРЕДЕЛЕНИЕ СЕТЕВЫХ ПАРАМЕТРОВ
 # ============================================================================
 log_step "Определение сетевых параметров..."
 
@@ -111,9 +110,9 @@ log_info "Домен: $DOMAIN_NAME"
 log_info "Email: $ADMIN_EMAIL"
 log_info "NS Hostname: $NS_HOSTNAME"
 echo ""
-read -p "Продолжить? [y/N]: " confirm
+read -p "Продолжить настройку? [y/N]: " confirm
 if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-    log_error "Отменено"
+    log_error "Отменено пользователем"
     exit 1
 fi
 
@@ -124,31 +123,27 @@ SERIAL=$(date +%Y%m%d01)
 log_info "Serial: $SERIAL"
 
 # ============================================================================
-# ОТКЛЮЧЕНИЕ CHROOT (ВАЖНО!)
+# НАСТРОЙКА CHROOT
 # ============================================================================
-log_step "Отключение chroot для BIND..."
+log_step "Настройка chroot окружения..."
 
-# Создаем или модифицируем /etc/sysconfig/bind
+# В ALT Linux оставляем chroot как есть (стандартная конфигурация)
 cat > /etc/sysconfig/bind << 'EOF'
-# BIND Configuration
-# Отключаем chroot для упрощения работы
-CHROOT=""
+# BIND Configuration for ALT Linux
+# Используем стандартное chroot окружение
+CHROOT="-t /var/lib/bind"
 OPTIONS="-u named"
 EOF
 
-log_info "CHROOT отключен"
+log_info "Chroot настроен: /var/lib/bind"
 
 # ============================================================================
-# СОЗДАНИЕ named.conf (БЕЗ CHROOT)
+# СОЗДАНИЕ named.conf (В CHROOT!)
 # ============================================================================
-log_step "Создание /etc/named.conf..."
+log_step "Создание конфигурации named.conf..."
 
-# Удаляем возможные симлинки
-rm -f /etc/named.conf
-rm -f /var/lib/bind/etc/named.conf
-
-# Создаем основной конфиг
-cat > /etc/named.conf << EOF
+# Создаем конфиг В CHROOT окружении
+cat > /var/lib/bind/etc/named.conf << EOF
 //
 // BIND Configuration File
 // Generated: $(date)
@@ -211,18 +206,21 @@ zone "1.0.0.127.in-addr.arpa" IN {
 };
 EOF
 
-# Устанавливаем правильные права
-chown root:named /etc/named.conf
-chmod 640 /etc/named.conf
+# Создаем симлинк /etc/named.conf -> /var/lib/bind/etc/named.conf
+ln -sf /var/lib/bind/etc/named.conf /etc/named.conf
 
-log_info "/etc/named.conf создан"
+# Устанавливаем права
+chown root:named /var/lib/bind/etc/named.conf
+chmod 640 /var/lib/bind/etc/named.conf
+
+log_info "named.conf создан в chroot"
 
 # ============================================================================
 # FORWARD ZONE
 # ============================================================================
 log_step "Создание forward зоны..."
 
-cat > /var/named/master/${DOMAIN_NAME}.db << EOF
+cat > /var/lib/bind/var/named/master/${DOMAIN_NAME}.db << EOF
 \$TTL 1D
 @   IN  SOA ${NS_HOSTNAME}.${DOMAIN_NAME}. ${ADMIN_EMAIL}. (
             ${SERIAL}  ; serial
@@ -251,7 +249,7 @@ log_step "Создание reverse зоны..."
 REVERSE_NET="$(echo $DNS_IP | awk -F. '{print $3"."$2"."$1}')"
 LAST_OCTET="$(echo $DNS_IP | awk -F. '{print $4}')"
 
-cat > /var/named/master/${DOMAIN_NAME}_rev.db << EOF
+cat > /var/lib/bind/var/named/master/${DOMAIN_NAME}_rev.db << EOF
 \$TTL 1D
 @   IN  SOA ${NS_HOSTNAME}.${DOMAIN_NAME}. ${ADMIN_EMAIL}. (
             ${SERIAL}  ; serial
@@ -273,7 +271,7 @@ log_info "Reverse зона создана"
 # ============================================================================
 log_step "Создание loopback зоны..."
 
-cat > /var/named/master/named.loopback << EOF
+cat > /var/lib/bind/var/named/master/named.loopback << EOF
 \$TTL 1D
 @   IN  SOA ${NS_HOSTNAME}.${DOMAIN_NAME}. ${ADMIN_EMAIL}. (
             ${SERIAL}  ; serial
@@ -293,30 +291,28 @@ log_info "Loopback зона создана"
 # ============================================================================
 log_step "Установка прав доступа..."
 
-# Для /var/named
-chown -R named:named /var/named
-chmod 750 /var/named
-chmod 750 /var/named/master
-chmod 750 /var/named/data
-chmod 750 /var/named/dynamic
-chmod 640 /var/named/master/*.db
+# Права для chroot окружения
+chown -R named:named /var/lib/bind/var/named
+chmod 750 /var/lib/bind/var/named
+chmod 750 /var/lib/bind/var/named/master
+chmod 750 /var/lib/bind/var/named/data
+chmod 750 /var/lib/bind/var/named/dynamic
+chmod 640 /var/lib/bind/var/named/master/*.db
 
-# Для /var/lib/bind (если нужно)
-chown -R named:named /var/lib/bind/var/named 2>/dev/null || true
-chmod 750 /var/lib/bind/var/named 2>/dev/null || true
-chmod 750 /var/lib/bind/var/named/master 2>/dev/null || true
-chmod 640 /var/lib/bind/var/named/master/*.db 2>/dev/null || true
+# Права для etc
+chown root:named /var/lib/bind/etc/named.conf
+chmod 640 /var/lib/bind/etc/named.conf
 
-log_info "Права установлены"
+log_info "Права доступа установлены"
 
 # ============================================================================
-# ПРОВЕРКИ
+# ПРОВЕРКИ КОНФИГУРАЦИИ
 # ============================================================================
 log_step "Проверка конфигурации..."
 
 echo ""
 log_info "Проверка named.conf..."
-if named-checkconf /etc/named.conf; then
+if named-checkconf /var/lib/bind/etc/named.conf; then
     log_info "named.conf: OK"
 else
     log_error "named.conf: ОШИБКА!"
@@ -325,7 +321,7 @@ fi
 
 echo ""
 log_info "Проверка forward зоны..."
-if named-checkzone ${DOMAIN_NAME} /var/named/master/${DOMAIN_NAME}.db; then
+if named-checkzone ${DOMAIN_NAME} /var/lib/bind/var/named/master/${DOMAIN_NAME}.db; then
     log_info "Forward зона: OK"
 else
     log_error "Forward зона: ОШИБКА!"
@@ -334,7 +330,7 @@ fi
 
 echo ""
 log_info "Проверка reverse зоны..."
-if named-checkzone ${REVERSE_NET}.in-addr.arpa /var/named/master/${DOMAIN_NAME}_rev.db; then
+if named-checkzone ${REVERSE_NET}.in-addr.arpa /var/lib/bind/var/named/master/${DOMAIN_NAME}_rev.db; then
     log_info "Reverse зона: OK"
 else
     log_error "Reverse зона: ОШИБКА!"
@@ -343,7 +339,7 @@ fi
 
 echo ""
 log_info "Проверка loopback зоны..."
-if named-checkzone 1.0.0.127.in-addr.arpa /var/named/master/named.loopback; then
+if named-checkzone 1.0.0.127.in-addr.arpa /var/lib/bind/var/named/master/named.loopback; then
     log_info "Loopback зона: OK"
 else
     log_error "Loopback зона: ОШИБКА!"
@@ -364,7 +360,7 @@ elif command -v ufw &> /dev/null; then
     ufw allow 53/udp 2>/dev/null || true
     log_info "Firewall настроен (ufw)"
 else
-    log_warn "Firewall не настроен"
+    log_warn "Firewall не настроен (не обнаружен)"
 fi
 
 # ============================================================================
@@ -392,37 +388,38 @@ fi
 # ============================================================================
 # ТЕСТИРОВАНИЕ
 # ============================================================================
-log_header "ТЕСТИРОВАНИЕ"
+log_header "ТЕСТИРОВАНИЕ DNS"
 
 echo ""
 log_info "Forward lookup (${DOMAIN_NAME}):"
-dig @localhost ${DOMAIN_NAME} +short || echo "  (dig не доступен)"
+dig @localhost ${DOMAIN_NAME} +short 2>/dev/null || echo "  (dig не доступен)"
 
 echo ""
 log_info "Reverse lookup (${DNS_IP}):"
-dig @localhost -x ${DNS_IP} +short || echo "  (dig не доступен)"
+dig @localhost -x ${DNS_IP} +short 2>/dev/null || echo "  (dig не доступен)"
 
 echo ""
 log_info "NS record:"
-dig @localhost ${DOMAIN_NAME} NS +short || echo "  (dig не доступен)"
+dig @localhost ${DOMAIN_NAME} NS +short 2>/dev/null || echo "  (dig не доступен)"
 
 echo ""
 log_info "Статус службы:"
 systemctl status bind.service --no-pager | grep -E "(Active|Loaded)" || true
 
 # ============================================================================
-# ИТОГИ
+# ИТОГОВАЯ ИНФОРМАЦИЯ
 # ============================================================================
 log_header "НАСТРОЙКА ЗАВЕРШЕНА"
 
 echo ""
-echo -e "${GREEN}✓ DNS сервер настроен успешно!${NC}"
+echo -e "${GREEN}✓ DNS сервер успешно настроен!${NC}"
 echo ""
 echo "Основные файлы:"
-echo "  • Конфиг:     /etc/named.conf"
-echo "  • Forward:    /var/named/master/${DOMAIN_NAME}.db"
-echo "  • Reverse:    /var/named/master/${DOMAIN_NAME}_rev.db"
-echo "  • Loopback:   /var/named/master/named.loopback"
+echo "  • Конфиг:     /var/lib/bind/etc/named.conf"
+echo "  • Симлинк:    /etc/named.conf -> /var/lib/bind/etc/named.conf"
+echo "  • Forward:    /var/lib/bind/var/named/master/${DOMAIN_NAME}.db"
+echo "  • Reverse:    /var/lib/bind/var/named/master/${DOMAIN_NAME}_rev.db"
+echo "  • Loopback:   /var/lib/bind/var/named/master/named.loopback"
 echo ""
 echo "Команды управления:"
 echo "  • Статус:     systemctl status bind.service"
@@ -437,4 +434,7 @@ echo "  • dig @localhost -x ${DNS_IP}"
 echo "  • nslookup ${DOMAIN_NAME} localhost"
 echo ""
 echo "Serial: ${SERIAL}"
+echo ""
+echo -e "${YELLOW}ВАЖНО: В ALT Linux используется chroot окружение!${NC}"
+echo "Все файлы находятся в /var/lib/bind/"
 echo ""
