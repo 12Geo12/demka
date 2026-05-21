@@ -2,7 +2,7 @@
 
 # ============================================================================
 # DNS Infrastructure Setup Script - ALT Linux Server
-# Полная версия с интерактивной настройкой всех параметров
+# Версия: 5.0 - Полностью адаптивная версия
 # ============================================================================
 
 set -e
@@ -21,7 +21,6 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 log_header() { echo -e "\n${CYAN}============================================${NC}"; echo -e "${CYAN}$1${NC}"; echo -e "${CYAN}============================================${NC}\n"; }
 
-# Проверка root
 if [ "$EUID" -ne 0 ]; then
     log_error "Запустите скрипт от имени root!"
     exit 1
@@ -33,139 +32,131 @@ log_header "DNS Infrastructure Setup - ALT Linux Server"
 # ОЧИСТКА
 # ============================================================================
 log_step "Очистка старых конфигураций..."
-
 systemctl stop bind.service 2>/dev/null || true
-
 rm -rf /var/lib/bind/etc/named.conf
 rm -rf /var/lib/bind/var/named/master/*.db 2>/dev/null || true
-rm -rf /var/named/master/*.db 2>/dev/null || true
-
 mkdir -p /var/lib/bind/var/named/master
 mkdir -p /var/lib/bind/var/named/data
 mkdir -p /var/lib/bind/var/named/dynamic
 mkdir -p /var/lib/bind/etc
-
 log_info "Очистка завершена"
 
 # ============================================================================
 # УСТАНОВКА BIND
 # ============================================================================
 log_step "Проверка BIND..."
-
 if ! rpm -q bind &>/dev/null; then
     log_info "Установка BIND..."
     apt-get update || true
     apt-get install -y bind bind-utils
 fi
-
 log_info "BIND установлен"
 
 # ============================================================================
 # ВВОД ПАРАМЕТРОВ
 # ============================================================================
-log_header "ВВОД ПАРАМЕТРОВ DNS"
+log_header "ОСНОВНЫЕ ПАРАМЕТРЫ"
 echo ""
 
-# Домен
 read -p "Введите домен (например, au-team.irpo): " DOMAIN_NAME
 if [ -z "$DOMAIN_NAME" ]; then
     log_error "Домен не может быть пустым!"
     exit 1
 fi
 
-# Email администратора
-read -p "Введите email администратора (например, admin.${DOMAIN_NAME}): " ADMIN_EMAIL
-ADMIN_EMAIL="${ADMIN_EMAIL:-admin.${DOMAIN_NAME}}"
-
-# Hostname для NS
-read -p "Введите hostname для NS записи (например, ns): " NS_HOSTNAME
-NS_HOSTNAME="${NS_HOSTNAME:-ns}"
+# Автоматически генерируем email и NS hostname на основе домена
+NS_HOSTNAME="ns"
+ADMIN_EMAIL="hostmaster.${DOMAIN_NAME}"
 
 echo ""
-log_header "IP АДРЕСА УСТРОЙСТВ (из Таблицы 3)"
+log_header "УСТРОЙСТВА И ИХ IP АДРЕСА"
 echo ""
-echo "Введите IP адреса для каждого устройства:"
+echo "Введите данные для каждого устройства (оставьте пустым если устройство не используется):"
 echo ""
 
-# HQ-RTR
+# Массив для хранения устройств
+declare -A DEVICES
+declare -A DEVICE_IPS
+
+# Ввод устройств
 read -p "HQ-RTR IP адрес: " HQ_RTR_IP
-if [ -z "$HQ_RTR_IP" ]; then
-    log_error "IP адрес HQ-RTR обязателен!"
-    exit 1
-fi
+[ -n "$HQ_RTR_IP" ] && { DEVICES[hq-rtr]="$HQ_RTR_IP"; DEVICE_IPS[$HQ_RTR_IP]="hq-rtr"; }
 
-# BR-RTR
 read -p "BR-RTR IP адрес: " BR_RTR_IP
-if [ -z "$BR_RTR_IP" ]; then
-    log_error "IP адрес BR-RTR обязателен!"
-    exit 1
-fi
+[ -n "$BR_RTR_IP" ] && { DEVICES[br-rtr]="$BR_RTR_IP"; DEVICE_IPS[$BR_RTR_IP]="br-rtr"; }
 
-# HQ-SRV
 read -p "HQ-SRV IP адрес: " HQ_SRV_IP
-if [ -z "$HQ_SRV_IP" ]; then
-    log_error "IP адрес HQ-SRV обязателен!"
-    exit 1
-fi
+[ -n "$HQ_SRV_IP" ] && { DEVICES[hq-srv]="$HQ_SRV_IP"; DEVICE_IPS[$HQ_SRV_IP]="hq-srv"; }
 
-# HQ-CLI
 read -p "HQ-CLI IP адрес: " HQ_CLI_IP
-if [ -z "$HQ_CLI_IP" ]; then
-    log_error "IP адрес HQ-CLI обязателен!"
-    exit 1
-fi
+[ -n "$HQ_CLI_IP" ] && { DEVICES[hq-cli]="$HQ_CLI_IP"; DEVICE_IPS[$HQ_CLI_IP]="hq-cli"; }
 
-# BR-SRV
 read -p "BR-SRV IP адрес: " BR_SRV_IP
-if [ -z "$BR_SRV_IP" ]; then
-    log_error "IP адрес BR-SRV обязателен!"
+[ -n "$BR_SRV_IP" ] && { DEVICES[br-srv]="$BR_SRV_IP"; DEVICE_IPS[$BR_SRV_IP]="br-srv"; }
+
+read -p "ISP docker IP (интерфейс к HQ-RTR, или Enter): " ISP_DOCKER_IP
+[ -n "$ISP_DOCKER_IP" ] && { DEVICES[docker]="$ISP_DOCKER_IP"; DEVICE_IPS[$ISP_DOCKER_IP]="docker"; }
+
+read -p "ISP web IP (интерфейс к BR-RTR, или Enter): " ISP_WEB_IP
+[ -n "$ISP_WEB_IP" ] && { DEVICES[web]="$ISP_WEB_IP"; DEVICE_IPS[$ISP_WEB_IP]="web"; }
+
+# Проверяем что введено хотя бы одно устройство
+if [ ${#DEVICES[@]} -eq 0 ]; then
+    log_error "Не введено ни одного IP адреса!"
     exit 1
 fi
 
-# ISP docker (интерфейс к HQ-RTR)
-read -p "ISP docker IP адрес (интерфейс к HQ-RTR): " ISP_DOCKER_IP
-if [ -z "$ISP_DOCKER_IP" ]; then
-    log_warn "ISP docker IP не указан, будет пропущен"
-fi
+echo ""
+log_header "НАСТРОЙКА DNS СЕРВЕРА"
+echo ""
 
-# ISP web (интерфейс к BR-RTR)
-read -p "ISP web IP адрес (интерфейс к BR-RTR): " ISP_WEB_IP
-if [ -z "$ISP_WEB_IP" ]; then
-    log_warn "ISP web IP не указан, будет пропущен"
+# Спрашиваем какой device является DNS сервером
+echo "Какое устройство будет DNS сервером?"
+echo "Варианты: ${!DEVICES[@]}"
+echo ""
+read -p "DNS сервер (оставьте пустым для ${NS_HOSTNAME}.${DOMAIN_NAME} на первом устройстве): " DNS_DEVICE
+
+if [ -z "$DNS_DEVICE" ]; then
+    # Используем первое устройство или HQ-SRV
+    if [ -n "${DEVICES[hq-srv]}" ]; then
+        DNS_DEVICE="hq-srv"
+    else
+        DNS_DEVICE="${!DEVICES[1]}"
+    fi
+    DNS_IP="${DEVICES[$DNS_DEVICE]}"
+    DNS_FQDN="${NS_HOSTNAME}.${DOMAIN_NAME}"
+else
+    DNS_IP="${DEVICES[$DNS_DEVICE]}"
+    if [ -z "$DNS_IP" ]; then
+        log_error "Устройство $DNS_DEVICE не найдено!"
+        exit 1
+    fi
+    DNS_FQDN="${DNS_DEVICE}.${DOMAIN_NAME}"
 fi
 
 echo ""
 log_header "DNS FORWARDERS"
 echo ""
-echo "Введите публичные DNS серверы для пересылки запросов:"
-echo "Можно использовать: 8.8.8.8, 8.8.4.4, 77.88.8.7, 77.88.8.3"
-echo ""
-
-read -p "Первый DNS сервер (например, 8.8.8.8): " DNS1
+read -p "Первый DNS сервер для пересылки (например, 8.8.8.8): " DNS1
 DNS1="${DNS1:-8.8.8.8}"
 
-read -p "Второй DNS сервер (например, 8.8.4.4): " DNS2
+read -p "Второй DNS сервер для пересылки (например, 8.8.4.4): " DNS2
 DNS2="${DNS2:-8.8.4.4}"
 
 echo ""
-log_info "Проверка введенных данных:"
+log_info "Сводка конфигурации:"
 echo ""
 echo "Домен: $DOMAIN_NAME"
-echo "Email: $ADMIN_EMAIL"
-echo "NS Hostname: $NS_HOSTNAME"
+echo "DNS сервер: $DNS_FQDN ($DNS_IP)"
+echo "NS hostname: $NS_HOSTNAME"
+echo "Admin email: $ADMIN_EMAIL"
 echo ""
 echo "Устройства:"
-echo "  HQ-RTR:  $HQ_RTR_IP"
-echo "  BR-RTR:  $BR_RTR_IP"
-echo "  HQ-SRV:  $HQ_SRV_IP"
-echo "  HQ-CLI:  $HQ_CLI_IP"
-echo "  BR-SRV:  $BR_SRV_IP"
-[ -n "$ISP_DOCKER_IP" ] && echo "  ISP docker: $ISP_DOCKER_IP"
-[ -n "$ISP_WEB_IP" ] && echo "  ISP web: $ISP_WEB_IP"
+for device in "${!DEVICES[@]}"; do
+    echo "  $device -> ${DEVICES[$device]}"
+done
 echo ""
-echo "DNS Forwarders:"
-echo "  Primary:   $DNS1"
-echo "  Secondary: $DNS2"
+echo "Forwarders: $DNS1, $DNS2"
 echo ""
 
 read -p "Продолжить настройку? [y/N]: " confirm
@@ -182,49 +173,22 @@ SERIAL=$(date +%Y%m%d01)
 # ============================================================================
 # ОПРЕДЕЛЕНИЕ REVERSE ZONES
 # ============================================================================
-# Извлекаем подсети для reverse зон
-HQ_RTR_REV=$(echo $HQ_RTR_IP | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
-HQ_RTR_LAST=$(echo $HQ_RTR_IP | awk -F. '{print $4}')
-
-HQ_SRV_REV=$(echo $HQ_SRV_IP | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
-HQ_SRV_LAST=$(echo $HQ_SRV_IP | awk -F. '{print $4}')
-
-HQ_CLI_REV=$(echo $HQ_CLI_IP | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
-HQ_CLI_LAST=$(echo $HQ_CLI_IP | awk -F. '{print $4}')
-
-BR_RTR_REV=$(echo $BR_RTR_IP | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
-BR_RTR_LAST=$(echo $BR_RTR_IP | awk -F. '{print $4}')
-
-BR_SRV_REV=$(echo $BR_SRV_IP | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
-BR_SRV_LAST=$(echo $BR_SRV_IP | awk -F. '{print $4}')
-
-# Собираем уникальные reverse зоны
 declare -A REVERSE_ZONES
-REVERSE_ZONES[$HQ_RTR_REV]="$HQ_RTR_LAST"
-REVERSE_ZONES[$HQ_SRV_REV]="$HQ_SRV_LAST"
-REVERSE_ZONES[$HQ_CLI_REV]="$HQ_CLI_LAST"
-[ -n "$ISP_DOCKER_IP" ] && {
-    ISP_DOCKER_REV=$(echo $ISP_DOCKER_IP | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
-    ISP_DOCKER_LAST=$(echo $ISP_DOCKER_IP | awk -F. '{print $4}')
-    REVERSE_ZONES[$ISP_DOCKER_REV]="$ISP_DOCKER_LAST"
-}
-[ -n "$ISP_WEB_IP" ] && {
-    ISP_WEB_REV=$(echo $ISP_WEB_IP | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
-    ISP_WEB_LAST=$(echo $ISP_WEB_IP | awk -F. '{print $4}')
-    REVERSE_ZONES[$ISP_WEB_REV]="$ISP_WEB_LAST"
-}
+for ip in "${!DEVICE_IPS[@]}"; do
+    REV_NET=$(echo $ip | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
+    REV_LAST=$(echo $ip | awk -F. '{print $4}')
+    REVERSE_ZONES[$REV_NET]="${REVERSE_ZONES[$REV_NET]} $REV_LAST"
+done
 
 # ============================================================================
 # НАСТРОЙКА CHROOT
 # ============================================================================
 log_step "Настройка chroot окружения..."
-
 cat > /etc/sysconfig/bind << 'EOF'
 # BIND Configuration for ALT Linux
 CHROOT="-t /var/lib/bind"
 OPTIONS="-u named"
 EOF
-
 log_info "Chroot настроен"
 
 # ============================================================================
@@ -232,12 +196,12 @@ log_info "Chroot настроен"
 # ============================================================================
 log_step "Создание конфигурации named.conf..."
 
-# Начинаем создавать конфиг
 cat > /var/lib/bind/etc/named.conf << EOF
 //
 // BIND Configuration File
 // Generated: $(date)
 // Domain: ${DOMAIN_NAME}
+// DNS Server: ${DNS_FQDN} (${DNS_IP})
 //
 
 options {
@@ -252,14 +216,13 @@ options {
     allow-query { any; };
     recursion yes;
     
-    // Forwarders (публичные DNS)
+    // Forwarders
     forwarders {
         ${DNS1};
         ${DNS2};
     };
     
     dnssec-validation no;
-    
     max-cache-size 256m;
 };
 
@@ -283,7 +246,7 @@ zone "${DOMAIN_NAME}" IN {
 
 EOF
 
-# Добавляем reverse zones в конфиг
+# Добавляем reverse zones
 for REV_ZONE in "${!REVERSE_ZONES[@]}"; do
     cat >> /var/lib/bind/etc/named.conf << EOF
 // Reverse zone: ${REV_ZONE}
@@ -296,7 +259,7 @@ zone "${REV_ZONE}" IN {
 EOF
 done
 
-# Добавляем loopback zone
+# Loopback zone
 cat >> /var/lib/bind/etc/named.conf << EOF
 // Local loopback
 zone "1.0.0.127.in-addr.arpa" IN {
@@ -306,76 +269,77 @@ zone "1.0.0.127.in-addr.arpa" IN {
 };
 EOF
 
-# Создаем симлинк
 ln -sf /var/lib/bind/etc/named.conf /etc/named.conf
 chown root:named /var/lib/bind/etc/named.conf
 chmod 640 /var/lib/bind/etc/named.conf
-
 log_info "named.conf создан"
 
 # ============================================================================
-# FORWARD ZONE
+# FORWARD ZONE (АДАПТИВНАЯ)
 # ============================================================================
 log_step "Создание forward зоны..."
 
+# Создаем forward зону с адаптивными записями
 cat > /var/lib/bind/var/named/master/${DOMAIN_NAME}.db << EOF
 \$TTL 1D
-@   IN  SOA ${NS_HOSTNAME}.${DOMAIN_NAME}. ${ADMIN_EMAIL}. (
+@   IN  SOA ${DNS_FQDN}. ${ADMIN_EMAIL}. (
             ${SERIAL}  ; serial
             1H         ; refresh
             15M        ; retry
             1W         ; expire
             1D )       ; minimum
 
-    IN  NS  ${NS_HOSTNAME}.${DOMAIN_NAME}.
-    IN  MX 10 ${NS_HOSTNAME}.${DOMAIN_NAME}.
-    
-; Из Таблицы 3 - устройства
-hq-rtr      IN  A   ${HQ_RTR_IP}
-br-rtr      IN  A   ${BR_RTR_IP}
-hq-srv      IN  A   ${HQ_SRV_IP}
-hq-cli      IN  A   ${HQ_CLI_IP}
-br-srv      IN  A   ${BR_SRV_IP}
+    IN  NS  ${DNS_FQDN}.
+    IN  MX 10 ${DNS_FQDN}.
+
+; DNS Server A record (ОБЯЗАТЕЛЬНО для работы NS)
+${DNS_DEVICE}      IN  A   ${DNS_IP}
+
+; Устройства из конфигурации
 EOF
 
-# Добавляем ISP записи если указаны
-[ -n "$ISP_DOCKER_IP" ] && echo "docker      IN  A   ${ISP_DOCKER_IP}" >> /var/lib/bind/var/named/master/${DOMAIN_NAME}.db
-[ -n "$ISP_WEB_IP" ] && echo "web         IN  A   ${ISP_WEB_IP}" >> /var/lib/bind/var/named/master/${DOMAIN_NAME}.db
+# Добавляем все устройства
+for device in "${!DEVICES[@]}"; do
+    if [ "$device" != "$DNS_DEVICE" ]; then
+        echo "${device}      IN  A   ${DEVICES[$device]}" >> /var/lib/bind/var/named/master/${DOMAIN_NAME}.db
+    fi
+done
 
 log_info "Forward зона создана"
 
 # ============================================================================
-# REVERSE ZONES
+# REVERSE ZONES (АДАПТИВНЫЕ)
 # ============================================================================
 log_step "Создание reverse зон..."
 
 for REV_ZONE in "${!REVERSE_ZONES[@]}"; do
-    LAST_OCTET="${REVERSE_ZONES[$REV_ZONE]}"
-    
-    # Определяем имя хоста для этого IP
-    HOSTNAME=""
-    [ "$LAST_OCTET" = "$HQ_RTR_LAST" ] && HOSTNAME="hq-rtr"
-    [ "$LAST_OCTET" = "$HQ_SRV_LAST" ] && HOSTNAME="hq-srv"
-    [ "$LAST_OCTET" = "$HQ_CLI_LAST" ] && HOSTNAME="hq-cli"
-    [ "$LAST_OCTET" = "$BR_RTR_LAST" ] && HOSTNAME="br-rtr"
-    [ "$LAST_OCTET" = "$BR_SRV_LAST" ] && HOSTNAME="br-srv"
-    [ -n "$ISP_DOCKER_IP" ] && [ "$LAST_OCTET" = "$(echo $ISP_DOCKER_IP | awk -F. '{print $4}')" ] && HOSTNAME="docker"
-    [ -n "$ISP_WEB_IP" ] && [ "$LAST_OCTET" = "$(echo $ISP_WEB_IP | awk -F. '{print $4}')" ] && HOSTNAME="web"
+    LAST_OCTETS="${REVERSE_ZONES[$REV_ZONE]}"
     
     cat > /var/lib/bind/var/named/master/${REV_ZONE}.db << EOF
 \$TTL 1D
-@   IN  SOA ${NS_HOSTNAME}.${DOMAIN_NAME}. ${ADMIN_EMAIL}. (
+@   IN  SOA ${DNS_FQDN}. ${ADMIN_EMAIL}. (
             ${SERIAL}  ; serial
             1H         ; refresh
             15M        ; retry
             1W         ; expire
             1D )       ; minimum
 
-    IN  NS  ${NS_HOSTNAME}.${DOMAIN_NAME}.
-    
-${LAST_OCTET} IN  PTR ${HOSTNAME}.${DOMAIN_NAME}.
+    IN  NS  ${DNS_FQDN}.
+
 EOF
 
+    # Добавляем PTR записи для всех IP в этой подсети
+    for LAST in $LAST_OCTETS; do
+        # Находим device для этого IP
+        for ip in "${!DEVICE_IPS[@]}"; do
+            IP_LAST=$(echo $ip | awk -F. '{print $4}')
+            if [ "$IP_LAST" = "$LAST" ]; then
+                DEVICE="${DEVICE_IPS[$ip]}"
+                echo "${LAST} IN  PTR  ${DEVICE}.${DOMAIN_NAME}." >> /var/lib/bind/var/named/master/${REV_ZONE}.db
+            fi
+        done
+    done
+    
     log_info "Reverse зона ${REV_ZONE} создана"
 done
 
@@ -386,14 +350,14 @@ log_step "Создание loopback зоны..."
 
 cat > /var/lib/bind/var/named/master/named.loopback << EOF
 \$TTL 1D
-@   IN  SOA ${NS_HOSTNAME}.${DOMAIN_NAME}. ${ADMIN_EMAIL}. (
+@   IN  SOA ${DNS_FQDN}. ${ADMIN_EMAIL}. (
             ${SERIAL}  ; serial
             1H         ; refresh
             15M        ; retry
             1W         ; expire
             1D )       ; minimum
 
-    IN  NS  ${NS_HOSTNAME}.${DOMAIN_NAME}.
+    IN  NS  ${DNS_FQDN}.
 1   IN  PTR localhost.
 EOF
 
@@ -403,17 +367,14 @@ log_info "Loopback зона создана"
 # ПРАВА ДОСТУПА
 # ============================================================================
 log_step "Установка прав доступа..."
-
 chown -R named:named /var/lib/bind/var/named
 chmod 750 /var/lib/bind/var/named
 chmod 750 /var/lib/bind/var/named/master
 chmod 750 /var/lib/bind/var/named/data
 chmod 750 /var/lib/bind/var/named/dynamic
 chmod 640 /var/lib/bind/var/named/master/*.db
-
 chown root:named /var/lib/bind/etc/named.conf
 chmod 640 /var/lib/bind/etc/named.conf
-
 log_info "Права доступа установлены"
 
 # ============================================================================
@@ -422,7 +383,6 @@ log_info "Права доступа установлены"
 log_step "Проверка конфигурации..."
 
 echo ""
-log_info "Проверка named.conf..."
 if named-checkconf /var/lib/bind/etc/named.conf; then
     log_info "named.conf: OK"
 else
@@ -431,7 +391,6 @@ else
 fi
 
 echo ""
-log_info "Проверка forward зоны..."
 if named-checkzone ${DOMAIN_NAME} /var/lib/bind/var/named/master/${DOMAIN_NAME}.db; then
     log_info "Forward зона: OK"
 else
@@ -439,10 +398,7 @@ else
     exit 1
 fi
 
-# Проверяем reverse зоны
 for REV_ZONE in "${!REVERSE_ZONES[@]}"; do
-    echo ""
-    log_info "Проверка reverse зоны ${REV_ZONE}..."
     if named-checkzone ${REV_ZONE} /var/lib/bind/var/named/master/${REV_ZONE}.db; then
         log_info "Reverse зона ${REV_ZONE}: OK"
     else
@@ -451,8 +407,6 @@ for REV_ZONE in "${!REVERSE_ZONES[@]}"; do
     fi
 done
 
-echo ""
-log_info "Проверка loopback зоны..."
 if named-checkzone 1.0.0.127.in-addr.arpa /var/lib/bind/var/named/master/named.loopback; then
     log_info "Loopback зона: OK"
 else
@@ -464,7 +418,6 @@ fi
 # FIREWALL
 # ============================================================================
 log_step "Настройка firewall..."
-
 if command -v firewall-cmd &> /dev/null; then
     firewall-cmd --permanent --add-service=dns 2>/dev/null || true
     firewall-cmd --reload 2>/dev/null || true
@@ -481,18 +434,15 @@ fi
 # ЗАПУСК СЛУЖБЫ
 # ============================================================================
 log_step "Запуск BIND..."
-
 systemctl daemon-reload
 systemctl enable bind.service
 systemctl restart bind.service
-
 sleep 3
 
 if systemctl is-active --quiet bind.service; then
     log_info "✓ BIND успешно запущен!"
 else
     log_error "✗ BIND не запустился!"
-    log_error "Проверьте логи: journalctl -xeu bind.service -n 50 --no-pager"
     systemctl status bind.service --no-pager -l
     exit 1
 fi
@@ -503,18 +453,22 @@ fi
 log_header "ТЕСТИРОВАНИЕ"
 
 echo ""
-log_info "Тестирование forward зоны:"
+log_info "Forward lookup:"
 dig @localhost ${DOMAIN_NAME} +short
-dig @localhost hq-rtr.${DOMAIN_NAME} +short
-dig @localhost hq-srv.${DOMAIN_NAME} +short
+dig @localhost ${DNS_FQDN} +short
+for device in "${!DEVICES[@]}"; do
+    dig @localhost ${device}.${DOMAIN_NAME} +short
+done
 
 echo ""
-log_info "Тестирование reverse зоны:"
-dig @localhost -x ${HQ_SRV_IP} +short
+log_info "Reverse lookup:"
+for ip in "${!DEVICE_IPS[@]}"; do
+    dig @localhost -x ${ip} +short
+done
 
 echo ""
-log_info "Статус службы:"
-systemctl status bind.service --no-pager | grep -E "(Active|Loaded)" || true
+log_info "NS record:"
+dig @localhost ${DOMAIN_NAME} NS +short
 
 # ============================================================================
 # ИТОГИ
@@ -524,34 +478,22 @@ log_header "НАСТРОЙКА ЗАВЕРШЕНА"
 echo ""
 echo -e "${GREEN}✓ DNS сервер успешно настроен!${NC}"
 echo ""
-echo "Основные файлы:"
-echo "  • Конфиг:     /var/lib/bind/etc/named.conf"
-echo "  • Симлинк:    /etc/named.conf"
-echo "  • Forward:    /var/lib/bind/var/named/master/${DOMAIN_NAME}.db"
-echo "  • Reverse:    /var/lib/bind/var/named/master/*.db"
+echo "Конфигурация:"
+echo "  • Домен: ${DOMAIN_NAME}"
+echo "  • DNS сервер: ${DNS_FQDN} (${DNS_IP})"
+echo "  • Forwarders: ${DNS1}, ${DNS2}"
 echo ""
-echo "Созданные DNS записи (из Таблицы 3):"
-echo "  • hq-rtr.${DOMAIN_NAME}   -> ${HQ_RTR_IP}"
-echo "  • br-rtr.${DOMAIN_NAME}   -> ${BR_RTR_IP}"
-echo "  • hq-srv.${DOMAIN_NAME}   -> ${HQ_SRV_IP}"
-echo "  • hq-cli.${DOMAIN_NAME}   -> ${HQ_CLI_IP}"
-echo "  • br-srv.${DOMAIN_NAME}   -> ${BR_SRV_IP}"
-[ -n "$ISP_DOCKER_IP" ] && echo "  • docker.${DOMAIN_NAME}   -> ${ISP_DOCKER_IP}"
-[ -n "$ISP_WEB_IP" ] && echo "  • web.${DOMAIN_NAME}      -> ${ISP_WEB_IP}"
+echo "Созданные записи:"
+echo "  • ${DNS_FQDN} -> ${DNS_IP} (NS server)"
+for device in "${!DEVICES[@]}"; do
+    if [ "$device" != "$DNS_DEVICE" ]; then
+        echo "  • ${device}.${DOMAIN_NAME} -> ${DEVICES[$device]}"
+    fi
+done
 echo ""
-echo "DNS Forwarders:"
-echo "  • Primary:   ${DNS1}"
-echo "  • Secondary: ${DNS2}"
-echo ""
-echo "Команды управления:"
-echo "  • Статус:     systemctl status bind.service"
-echo "  • Рестарт:    systemctl restart bind.service"
-echo "  • Логи:       journalctl -xeu bind.service -f"
-echo ""
-echo "Тестирование:"
-echo "  • dig @localhost hq-rtr.${DOMAIN_NAME}"
-echo "  • dig @localhost -x ${HQ_SRV_IP}"
-echo "  • nslookup hq-srv.${DOMAIN_NAME} localhost"
+echo "Файлы:"
+echo "  • Конфиг: /var/lib/bind/etc/named.conf"
+echo "  • Зоны: /var/lib/bind/var/named/master/"
 echo ""
 echo "Serial: ${SERIAL}"
 echo ""
