@@ -1,216 +1,241 @@
 #!/bin/bash
 
-# ==============================================================================
-# Скрипт управления пользователями для Demo2026
-# ДОБАВЛЕНО: Выбор уровня привилегий sudo при создании пользователя
-# ==============================================================================
+# ============================================
+# Скрипт создания пользователей v1.5
+# ============================================
 
 # Цвета
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-WHITE='\033[1;37m'
 NC='\033[0m'
 
-# Файлы
-USERS_LOG="/var/log/created_users.log"
-SUDOERS_DIR="/etc/sudoers.d"
-
-# Функции вывода
-msg_ok() { echo -e "${GREEN}[OK]${NC} $1"; }
-msg_er() { echo -e "${RED}[ERR]${NC} $1"; }
-msg_in() { echo -e "${BLUE}[INFO]${NC} $1"; }
-msg_wa() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-
-# ==============================================================================
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ НАСТРОЙКИ SUDO С ВЫБОРОМ ПРИВИЛЕГИЙ
-# ==============================================================================
-setup_sudo () {
-    local USERNAME=$1
-    local PRIVILEGE_LEVEL=${2:-2}  # По умолчанию: 2 = NOPASSWD
-    local SUDOERS_FILE="$SUDOERS_DIR/$USERNAME"
-    
-    echo -e "${CYAN}Настройка sudo для $USERNAME (уровень: $PRIVILEGE_LEVEL)...${NC}"
-    
-    if [ ! -d "$SUDOERS_DIR" ]; then
-        mkdir -p "$SUDOERS_DIR"
-        chmod 755 "$SUDOERS_DIR"
-    fi
-    
-    local TEMP_FILE=$(mktemp)
-    echo "# sudoers config for $USERNAME - created $(date)" > "$TEMP_FILE"
-    
-    # Выбор конфигурации в зависимости от уровня привилегий
-    case $PRIVILEGE_LEVEL in
-        0)
-            # Без прав sudo — только добавление в базовые группы
-            echo "# $USERNAME — без привилегий sudo" >> "$TEMP_FILE"
-            msg_in "Пользователь создан без прав sudo"
-            ;;
-        1)
-            # Sudo с паролем
-            echo "$USERNAME ALL=(ALL) ALL" >> "$TEMP_FILE"
-            msg_in "Настроено: sudo с запросом пароля"
-            ;;
-        2)
-            # Sudo без пароля (стандартный вариант)
-            echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" >> "$TEMP_FILE"
-            msg_in "Настроено: sudo без пароля (NOPASSWD)"
-            ;;
-        3)
-            # Максимальные привилегии + отключение логирования (для автоматизации)
-            echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" >> "$TEMP_FILE"
-            echo "Defaults:$USERNAME !logfile" >> "$TEMP_FILE"
-            echo "Defaults:$USERNAME !syslog" >> "$TEMP_FILE"
-            msg_wa "Настроено: полный доступ без логирования (использовать с осторожностью!)"
-            ;;
-        *)
-            # Защита от некорректного значения
-            echo "$USERNAME ALL=(ALL) NOPASSWD: ALL" >> "$TEMP_FILE"
-            msg_wa "Неизвестный уровень, применён режим по умолчанию (NOPASSWD)"
-            ;;
-    esac
-    
-    # Применяем файл только если он содержит правила sudo
-    if [ "$PRIVILEGE_LEVEL" -ne 0 ]; then
-        if visudo -c -f "$TEMP_FILE" >/dev/null 2>&1; then
-            [ -f "$SUDOERS_FILE" ] && cp "$SUDOERS_FILE" "${SUDOERS_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-            cp "$TEMP_FILE" "$SUDOERS_FILE"
-            chmod 440 "$SUDOERS_FILE"
-            chown root:root "$SUDOERS_FILE"
-            
-            if visudo -c -f "$SUDOERS_FILE" >/dev/null 2>&1; then
-                msg_ok "Файл sudoers создан: $SUDOERS_FILE"
-            else
-                msg_er "Ошибка в синтаксисе после копирования!"
-                rm -f "$SUDOERS_FILE"
-            fi
-        else
-            msg_er "Ошибка синтаксиса sudoers!"
-            visudo -c -f "$TEMP_FILE" 2>&1 | head -5
-        fi
-    fi
-    
-    rm -f "$TEMP_FILE"
-    
-    # Добавление в группу sudo/wheel для совместимости (кроме уровня 0)
-    if [ "$PRIVILEGE_LEVEL" -ne 0 ]; then
-        if getent group wheel >/dev/null; then
-            usermod -aG wheel "$USERNAME" 2>/dev/null
-            msg_in "Добавлен в группу wheel"
-        elif getent group sudo >/dev/null; then
-            usermod -aG sudo "$USERNAME" 2>/dev/null
-            msg_in "Добавлен в группу sudo"
-        fi
-    fi
+# Логирование
+log_ok() {
+    echo -e "${GREEN}[OK] $1${NC}"
 }
 
-# ==============================================================================
-# ФУНКЦИЯ СОЗДАНИЯ ПОЛЬЗОВАТЕЛЯ (обновлена)
-# ==============================================================================
-# Определяем тип устройства если не задано
+log_err() {
+    echo -e "${RED}[ERR] $1${NC}"
+}
+
+log_info() {
+    echo -e "${CYAN}[INFO] $1${NC}"
+}
+
+# ============================================
+# ШАГ 1: Выбор устройства
+# ============================================
+echo -e "${CYAN}============================================${NC}"
+echo -e "${CYAN}   НАСТРОЙКА ПОЛЬЗОВАТЕЛЕЙ${NC}"
+echo -e "${CYAN}============================================${NC}"
+echo ""
+
+# Проверяем, задана ли DEVICE извне
 if [[ -z "$DEVICE" ]]; then
     echo -e "${CYAN}Выберите устройство:${NC}"
     echo "1) Server"
     echo "2) Router (Linux)"
-    read -p "Введите номер \[1-2\]: " DEVICE
+    read -p "Введите номер [1-2] (по умолчанию 2): " DEVICE_INPUT
+    
+    # Устанавливаем значение по умолчанию если пустое
+    DEVICE=${DEVICE_INPUT:-2}
 fi
 
-# Валидация
+# Проверяем корректность ввода
 if [[ ! "$DEVICE" =~ ^[1-2]$ ]]; then
-    msg_er "Неверный выбор устройства"
+    log_err "Неверный выбор устройства (должно быть 1 или 2)"
     exit 1
 fi
 
-create_user () {
-    USERNAME=$1
-    PASSWORD=$2
-    USER_UID=$3
-    PRIVILEGE_LEVEL=${4:-2}  # Новый параметр: уровень привилегий
-    
-    echo -e "${CYAN}Проверка пользователя $USERNAME...${NC}"
-    
-    if id "$USERNAME" &>/dev/null; then
-        echo -e "${YELLOW}Пользователь уже существует${NC}"
-        CURRENT_UID=$(id -u $USERNAME)
-        if [ ! -z "$USER_UID" ] && [ "$CURRENT_UID" != "$USER_UID" ]; then
-            echo -e "${YELLOW}UID отличается. Текущий: $CURRENT_UID Требуемый: $USER_UID${NC}"
-        fi
-    else
-        echo -e "${GREEN}Создание пользователя...${NC}"
-        if [ -z "$USER_UID" ]; then
-            useradd -m -s /bin/bash "$USERNAME"
-        else
-            if [[ "$USER_UID" =~ ^[0-9]+$ ]] && [ "$USER_UID" -ge 1 ] && [ "$USER_UID" -le 65535 ]; then
-                if getent passwd "$USER_UID" >/dev/null; then
-                    CURRENT_USER=$(getent passwd "$USER_UID" | cut -d: -f1)
-                    msg_wa "UID $USER_UID занят пользователем $CURRENT_USER"
-                    read -p "Создать с неуникальным UID? (y/n): " force_uid
-                    if [[ "$force_uid" =~ ^[Yy] ]]; then
-                        useradd -m -u "$USER_UID" -o -s /bin/bash "$USERNAME"
-                    else
-                        msg_er "Отмена создания пользователя"
-                        return 1
-                    fi
-                else
-                    useradd -m -u "$USER_UID" -s /bin/bash "$USERNAME"
-                fi
-            else
-                msg_er "Некорректный UID: $USER_UID"
-                useradd -m -s /bin/bash "$USERNAME"
-            fi
-        fi
-        
-        # Установка пароля
-        printf "%s:%s" "$USERNAME" "$PASSWORD" | chpasswd
-        if [ $? -eq 0 ]; then
-            msg_ok "Пароль успешно установлен"
-        else
-            msg_er "Ошибка при установке пароля!"
-            return 1
-        fi
-        
-        echo "$(date '+%Y-%m-%d %H:%M:%S') - $USERNAME (UID: $(id -u $USERNAME))" >> "$USERS_LOG"
-    fi
-    
-    # Настройка sudo с выбранным уровнем привилегий
-    setup_sudo "$USERNAME" "$PRIVILEGE_LEVEL"
-    echo -e "${GREEN}Пользователь $USERNAME готов${NC}"
-}
+# Определяем имя устройства
+if [[ "$DEVICE" == "1" ]]; then
+    DEVICE_NAME="Server"
+else
+    DEVICE_NAME="Router"
+fi
 
-# ==============================================================================
-# ГЛАВНОЕ МЕНЮ (фрагмент с добавлением выбора привилегий)
-# ==============================================================================
-# ... (внутри цикла создания пользователей, после ввода UID) ...
+log_info "Выбрано устройство: $DEVICE_NAME"
+echo ""
 
-    # 🔹 НОВОЕ: Выбор уровня привилегий
+# ============================================
+# ШАГ 2: Выбор уровня привилегий sudo
+# ============================================
+echo "Выберите уровень привилегий sudo:"
+echo "0 - Без прав sudo (обычный пользователь)"
+echo "1 - Sudo с запросом пароля (рекомендуется для безопасности)"
+echo "2 - Sudo без пароля ⭐ (по умолчанию)"
+echo "3 - Максимальные привилегии (без логирования, для скриптов)"
+read -p "Введите номер [0-3] (по умолчанию 2): " SUDO_INPUT
+
+# Устанавливаем значение по умолчанию
+SUDO_LEVEL=${SUDO_INPUT:-2}
+
+# Проверяем корректность
+if [[ ! "$SUDO_LEVEL" =~ ^[0-3]$ ]]; then
+    log_err "Неверный выбор уровня sudo (должно быть 0-3)"
+    exit 1
+fi
+
+log_info "Выбран уровень привилегий: $SUDO_LEVEL"
+echo ""
+
+# ============================================
+# ШАГ 3: Ввод имени пользователя
+# ============================================
+read -p "Введите имя пользователя: " USERNAME
+
+if [[ -z "$USERNAME" ]]; then
+    log_err "Имя пользователя не может быть пустым"
+    exit 1
+fi
+
+# Проверяем, существует ли пользователь
+if id "$USERNAME" &>/dev/null; then
+    log_err "Пользователь $USERNAME уже существует"
+    exit 1
+fi
+
+log_info "Создание пользователя: $USERNAME"
+echo ""
+
+# ============================================
+# ШАГ 4: Ввод пароля
+# ============================================
+read -sp "Введите пароль для пользователя: " PASSWORD
+echo ""
+read -sp "Подтвердите пароль: " PASSWORD_CONFIRM
+echo ""
+
+if [[ "$PASSWORD" != "$PASSWORD_CONFIRM" ]]; then
+    log_err "Пароли не совпадают"
+    exit 1
+fi
+
+if [[ ${#PASSWORD} -lt 4 ]]; then
+    log_err "Пароль слишком короткий (минимум 4 символа)"
+    exit 1
+fi
+
+# ============================================
+# ШАГ 5: Создание пользователя
+# ============================================
+echo ""
+echo -e "${CYAN}============================================${NC}"
+echo -e "${CYAN}   СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ${NC}"
+echo -e "${CYAN}============================================${NC}"
+
+# Создаем пользователя
+if useradd -m -s /bin/bash "$USERNAME"; then
+    log_ok "Пользователь $USERNAME создан"
+else
+    log_err "Ошибка создания пользователя"
+    exit 1
+fi
+
+# Устанавливаем пароль
+echo "$USERNAME:$PASSWORD" | chpasswd 2>/dev/null || echo "$USERNAME:$PASSWORD" | chpasswd
+if [[ $? -eq 0 ]]; then
+    log_ok "Пароль установлен"
+else
+    log_err "Ошибка установки пароля"
+    exit 1
+fi
+
+# ============================================
+# ШАГ 6: Настройка sudo
+# ============================================
+echo ""
+log_info "Настройка прав sudo..."
+
+case $SUDO_LEVEL in
+    0)
+        # Без sudo
+        log_info "Пользователь без прав sudo"
+        ;;
+    1)
+        # Sudo с паролем
+        usermod -aG sudo "$USERNAME" 2>/dev/null || usermod -aG wheel "$USERNAME"
+        if [[ $? -eq 0 ]]; then
+            log_ok "Добавлен в группу sudo (с паролем)"
+        fi
+        ;;
+    2)
+        # Sudo без пароля
+        usermod -aG sudo "$USERNAME" 2>/dev/null || usermod -aG wheel "$USERNAME"
+        
+        # Добавляем в sudoers без пароля
+        if ! grep -q "$USERNAME" /etc/sudoers.d/* 2>/dev/null; then
+            echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME"
+            chmod 440 "/etc/sudoers.d/$USERNAME"
+            log_ok "Добавлен в sudoers без пароля"
+        fi
+        ;;
+    3)
+        # Максимальные привилегии
+        usermod -aG sudo "$USERNAME" 2>/dev/null || usermod -aG wheel "$USERNAME"
+        
+        # Добавляем в sudoers без пароля и без логов
+        if ! grep -q "$USERNAME" /etc/sudoers.d/* 2>/dev/null; then
+            echo "$USERNAME ALL=(ALL) NOPASSWD:ALL, !logfile" > "/etc/sudoers.d/$USERNAME"
+            chmod 440 "/etc/sudoers.d/$USERNAME"
+            log_ok "Добавлены максимальные привилегии"
+        fi
+        ;;
+esac
+
+# ============================================
+# ШАГ 7: Дополнительные настройки
+# ============================================
+echo ""
+log_info "Применение дополнительных настроек..."
+
+# Добавляем в дополнительные группы (если нужно)
+if [[ "$DEVICE" == "2" ]]; then
+    # Для роутера добавляем в группу netdev
+    usermod -aG netdev "$USERNAME" 2>/dev/null || true
+fi
+
+# Копируем .bashrc если есть
+if [[ -f /etc/skel/.bashrc ]] && [[ ! -f /home/$USERNAME/.bashrc ]]; then
+    cp /etc/skel/.bashrc /home/$USERNAME/
+    chown $USERNAME:$USERNAME /home/$USERNAME/.bashrc
+fi
+
+log_ok "Дополнительные настройки применены"
+
+# ============================================
+# ИТОГИ
+# ============================================
+echo ""
+echo -e "${GREEN}============================================${NC}"
+echo -e "${GREEN}   ГОТОВО!${NC}"
+echo -e "${GREEN}============================================${NC}"
+echo ""
+echo -e "${CYAN}Пользователь:${NC} $USERNAME"
+echo -e "${CYAN}Пароль:${NC} $PASSWORD"
+echo -e "${CYAN}Устройство:${NC} $DEVICE_NAME"
+echo -e "${CYAN}Уровень sudo:${NC} $SUDO_LEVEL"
+echo ""
+
+case $SUDO_LEVEL in
+    0) echo -e "${YELLOW}Права:${NC} Обычный пользователь (без sudo)" ;;
+    1) echo -e "${YELLOW}Права:${NC} Sudo с паролем" ;;
+    2) echo -e "${YELLOW}Права:${NC} Sudo без пароля ⭐" ;;
+    3) echo -e "${YELLOW}Права:${NC} Максимальные привилегии" ;;
+esac
+
+echo ""
+log_ok "Пользователь $USERNAME успешно создан!"
+echo ""
+
+# Предложение протестировать
+read -p "Хотите протестировать вход? (y/n): " TEST_LOGIN
+if [[ "$TEST_LOGIN" == "y" ]] || [[ "$TEST_LOGIN" == "Y" ]] || [[ "$TEST_LOGIN" == "д" ]] || [[ "$TEST_LOGIN" == "Д" ]]; then
     echo ""
-    echo -e "${WHITE}Выберите уровень привилегий sudo:${NC}"
-    echo " 0 — Без прав sudo (обычный пользователь)"
-    echo " 1 — Sudo с запросом пароля (рекомендуется для безопасности)"
-    echo " 2 — Sudo без пароля ⭐ (по умолчанию)"
-    echo " 3 — Максимальные привилегии (без логирования, для скриптов)"
-    read -p "Введите номер [0-3] (по умолчанию 2): " INPUT_PRIV
-    
-    # Валидация ввода
-    if [[ ! "$INPUT_PRIV" =~ ^[0-3]$ ]]; then
-        INPUT_PRIV=2  # Значение по умолчанию
-        msg_in "Использован режим по умолчанию: Sudo без пароля"
-    fi
+    log_info "Тестирование входа под пользователем $USERNAME..."
+    su - "$USERNAME" -c "whoami && id"
+fi
 
-    case $DEVICE in
-        1)
-            echo -e "${GREEN}Настройка Server...${NC}"
-            create_user "$INPUT_USERNAME" "$INPUT_PASSWORD" "$INPUT_UID" "$INPUT_PRIV"
-            ;;
-        2)
-            echo -e "${GREEN}Настройка Router (Linux)...${NC}"
-            create_user "$INPUT_USERNAME" "$INPUT_PASSWORD" "$INPUT_UID" "$INPUT_PRIV"
-            ;;
-        *)
-            msg_er "Неверный выбор устройства"
-            exit 1
-            ;;
-    esac
+exit 0
