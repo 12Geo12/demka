@@ -1,10 +1,13 @@
 #!/bin/bash
+
 #===============================================================================
 # DHCP Server Setup for ALT Linux - VLAN Support
-# Версия: 3.0 - Очистка старых данных, работа с существующими VLAN
+# Версия: 3.1 - ИСПРАВЛЕНО: создание директорий
 #===============================================================================
+
 set -e
 
+# Цвета (ИСПРАВЛЕНО: убраны обратные слеши)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -25,7 +28,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 #===============================================================================
-# ОЧИСТКА СТАРОЙ КОНФИГУРАЦИИ
+# ОЧИСТКА СТАРОЙ КОНФИГУРАЦИИ (ИСПРАВЛЕНО)
 #===============================================================================
 cleanup_old_config() {
     echo -e "${YELLOW}=== Очистка старой конфигурации DHCP ===${NC}"
@@ -33,10 +36,16 @@ cleanup_old_config() {
     # Останавливаем службу
     systemctl stop dhcpd 2>/dev/null || true
     
-    # Создаем директорию если нет
+    # ✅ ГЛАВНОЕ ИСПРАВЛЕНИЕ: Создаем директорию ПЕРЕД использованием
     if [[ ! -d "/var/lib/dhcp" ]]; then
         mkdir -p /var/lib/dhcp
         log "Создана директория /var/lib/dhcp"
+    fi
+    
+    # Также создаем директорию для конфига
+    if [[ ! -d "/etc/dhcp" ]]; then
+        mkdir -p /etc/dhcp
+        log "Создана директория /etc/dhcp"
     fi
     
     # Удаляем старый конфиг
@@ -63,7 +72,6 @@ cleanup_old_config() {
 #===============================================================================
 find_vlan_interfaces() {
     echo -e "\n${CYAN}=== Найденные VLAN интерфейсы ===${NC}"
-    
     local i=1
     > /tmp/vlan_ifaces
     
@@ -73,7 +81,7 @@ find_vlan_interfaces() {
         local vlan_id=$(echo "$iface" | grep -oP '\.\K[0-9]+$')
         
         if [[ -n "$ip" ]]; then
-            printf " %2d) %-12s VLAN %s | IP: %s\n" $i "$iface" "$vlan_id" "$ip"
+            printf " %2d) %-12s VLAN %s | IP: %s\n" "$i" "$iface" "$vlan_id" "$ip"
             echo "$iface|$vlan_id|$ip" >> /tmp/vlan_ifaces
             ((i++))
         fi
@@ -85,7 +93,7 @@ find_vlan_interfaces() {
         for iface in $(ls /sys/class/net/ | grep -v lo); do
             local ip=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
             if [[ -n "$ip" ]]; then
-                printf " %2d) %-12s %s\n" $i "$iface" "$ip"
+                printf " %2d) %-12s %s\n" "$i" "$iface" "$ip"
                 echo "$iface|0|$ip" >> /tmp/vlan_ifaces
                 ((i++))
             fi
@@ -104,7 +112,7 @@ find_vlan_interfaces() {
 setup_dhcp() {
     clear
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  DHCP Server Setup v3.0 (VLAN)         ║${NC}"
+    echo -e "${CYAN}║ DHCP Server Setup v3.1 (VLAN)         ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
     
     # Очистка
@@ -166,7 +174,6 @@ setup_dhcp() {
         # Диапазон адресов
         read -p "Начало диапазона [${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.100]: " range_start
         range_start="${range_start:-${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.100}"
-        
         read -p "Конец диапазона [${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.200]: " range_end
         range_end="${range_end:-${IP_PARTS[0]}.${IP_PARTS[1]}.${IP_PARTS[2]}.200}"
         
@@ -211,8 +218,7 @@ subnet $SUBNET netmask $MASK {
     
     # 4. Создаем основной конфиг
     echo -e "\n${YELLOW}=== Генерация конфигурации ===${NC}"
-    
-    cat > "$DHCP_CONF" << EOF
+    cat > "$DHCP_CONF" <<EOF
 # DHCP Server Configuration
 # Generated: $(date)
 # Cleaned old config and leases
@@ -257,11 +263,11 @@ EOF
     # Включаем и запускаем
     systemctl enable dhcpd 2>/dev/null || true
     systemctl restart dhcpd
+    
     sleep 2
     
     # 6. Финальная проверка
     echo -e "\n${GREEN}=== ИТОГОВАЯ ПРОВЕРКА ===${NC}"
-    
     if systemctl is-active dhcpd &>/dev/null; then
         echo -e "${GREEN}✓ DHCP сервер запущен${NC}"
     else
@@ -270,7 +276,7 @@ EOF
     fi
     
     echo -e "\nНастроенные подсети:"
-    grep -E "^  subnet|^    range" "$DHCP_CONF" | sed 's/^/  /'
+    grep -E "^  subnet|^  range" "$DHCP_CONF" | sed 's/^/  /'
     
     echo -e "\n${GREEN}════════════════════════════════════${NC}"
     echo -e "${GREEN}НАСТРОЙКА ЗАВЕРШЕНА!${NC}"
@@ -279,7 +285,7 @@ EOF
     echo "Полезные команды:"
     echo "  systemctl status dhcpd"
     echo "  journalctl -u dhcpd -f"
-    echo "  cat /var/lib/dhcp/dhcpd.leases  # кто получил IP"
+    echo "  cat /var/lib/dhcp/dhcpd.leases # кто получил IP"
 }
 
 #===============================================================================
@@ -288,7 +294,7 @@ EOF
 while true; do
     clear
     echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  DHCP Server Setup v3.0                ║${NC}"
+    echo -e "${CYAN}║ DHCP Server Setup v3.1                 ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
     echo ""
     echo "1) Настроить DHCP (очистка + VLAN)"
@@ -304,7 +310,7 @@ while true; do
     
     case $choice in
         1) setup_dhcp; read -p "Нажмите Enter..." ;;
-        2) 
+        2)
             echo -e "\n${CYAN}Проверка конфига:${NC}"
             dhcpd -t -cf "$DHCP_CONF" 2>&1 || echo "Ошибка"
             echo -e "\nТекущий конфиг:"
