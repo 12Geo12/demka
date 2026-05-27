@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================
-# Скрипт создания пользователей v1.5
+# Скрипт создания пользователей v1.5 (ИСПРАВЛЕННЫЙ)
 # ============================================
 
 # Цвета
@@ -135,7 +135,7 @@ else
 fi
 
 # Устанавливаем пароль
-echo "$USERNAME:$PASSWORD" | chpasswd 2>/dev/null || echo "$USERNAME:$PASSWORD" | chpasswd
+echo "$USERNAME:$PASSWORD" | chpasswd 2>/dev/null
 if [[ $? -eq 0 ]]; then
     log_ok "Пароль установлен"
 else
@@ -165,28 +165,52 @@ case $SUDO_LEVEL in
         # Sudo без пароля
         usermod -aG sudo "$USERNAME" 2>/dev/null || usermod -aG wheel "$USERNAME"
         
-        # Добавляем в sudoers без пароля
-        if ! grep -q "$USERNAME" /etc/sudoers.d/* 2>/dev/null; then
-            echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME"
-            chmod 440 "/etc/sudoers.d/$USERNAME"
-            log_ok "Добавлен в sudoers без пароля"
-        fi
+        # ✅ ИСПРАВЛЕНО: Создаем правильный файл sudoers
+        cat > "/etc/sudoers.d/$USERNAME" << EOF
+# Sudo privileges for $USERNAME
+$USERNAME ALL=(ALL) NOPASSWD:ALL
+EOF
+        
+        chmod 440 "/etc/sudoers.d/$USERNAME"
+        log_ok "Добавлен в sudoers без пароля"
         ;;
     3)
-        # Максимальные привилегии
+        # Максимальные привилегии (без логирования)
         usermod -aG sudo "$USERNAME" 2>/dev/null || usermod -aG wheel "$USERNAME"
         
-        # Добавляем в sudoers без пароля и без логов
-        if ! grep -q "$USERNAME" /etc/sudoers.d/* 2>/dev/null; then
-            echo "$USERNAME ALL=(ALL) NOPASSWD:ALL, !logfile" > "/etc/sudoers.d/$USERNAME"
-            chmod 440 "/etc/sudoers.d/$USERNAME"
-            log_ok "Добавлены максимальные привилегии"
-        fi
+        # ✅ ИСПРАВЛЕНО: Правильный синтаксис - разделяем Defaults и правила
+        cat > "/etc/sudoers.d/$USERNAME" << EOF
+# Sudo privileges for $USERNAME (no logging)
+Defaults:$USERNAME !logfile
+Defaults:$USERNAME !syslog
+Defaults:$USERNAME !pam_login
+$USERNAME ALL=(ALL) NOPASSWD:ALL
+EOF
+        
+        chmod 440 "/etc/sudoers.d/$USERNAME"
+        log_ok "Добавлены максимальные привилегии (без логирования)"
         ;;
 esac
 
 # ============================================
-# ШАГ 7: Дополнительные настройки
+# ШАГ 7: Проверка синтаксиса sudoers
+# ============================================
+if [[ "$SUDO_LEVEL" -ge 2 ]]; then
+    log_info "Проверка синтаксиса sudoers..."
+    if visudo -c &>/dev/null; then
+        log_ok "Синтаксис sudoers верный"
+    else
+        log_err "Ошибка в синтаксисе sudoers!"
+        cat "/etc/sudoers.d/$USERNAME"
+        read -p "Продолжить? (y/n): " CONTINUE
+        if [[ "$CONTINUE" != "y" ]] && [[ "$CONTINUE" != "Y" ]]; then
+            exit 1
+        fi
+    fi
+fi
+
+# ============================================
+# ШАГ 8: Дополнительные настройки
 # ============================================
 echo ""
 log_info "Применение дополнительных настроек..."
@@ -223,7 +247,7 @@ case $SUDO_LEVEL in
     0) echo -e "${YELLOW}Права:${NC} Обычный пользователь (без sudo)" ;;
     1) echo -e "${YELLOW}Права:${NC} Sudo с паролем" ;;
     2) echo -e "${YELLOW}Права:${NC} Sudo без пароля ⭐" ;;
-    3) echo -e "${YELLOW}Права:${NC} Максимальные привилегии" ;;
+    3) echo -e "${YELLOW}Права:${NC} Максимальные привилегии (без логов)" ;;
 esac
 
 echo ""
