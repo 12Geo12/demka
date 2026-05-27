@@ -2,7 +2,7 @@
 
 # ============================================
 # Скрипт создания пользователей v1.5
-# АДАПТИВНАЯ ВЕРСИЯ ДЛЯ ЭКЗАМЕНА
+# Для ALT Linux
 # ============================================
 
 # Цвета
@@ -12,7 +12,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# Функции логирования
+# Функции
 log_ok() { echo -e "${GREEN}[OK] $1${NC}"; }
 log_err() { echo -e "${RED}[ERR] $1${NC}"; }
 log_info() { echo -e "${CYAN}[INFO] $1${NC}"; }
@@ -22,7 +22,7 @@ log_info() { echo -e "${CYAN}[INFO] $1${NC}"; }
 # ============================================
 clear
 echo -e "${CYAN}============================================${NC}"
-echo -e "${CYAN}   НАСТРОЙКА ПОЛЬЗОВАТЕЛЕЙ${NC}"
+echo -e "${CYAN}   НАСТРОЙКА ПОЛЬЗОВАТЕЛЕЙ (ALT Linux)${NC}"
 echo -e "${CYAN}============================================${NC}"
 echo ""
 
@@ -30,7 +30,6 @@ echo -e "${CYAN}Выберите устройство:${NC}"
 echo "1) Server"
 echo "2) Router (Linux)"
 
-# Читаем с проверкой
 while true; do
     read -p "Введите номер [1-2] (по умолчанию 2): " DEVICE_INPUT
     DEVICE=${DEVICE_INPUT:-2}
@@ -72,50 +71,38 @@ done
 log_info "Уровень sudo: $SUDO_LEVEL"
 
 # ============================================
-# ШАГ 3: Ввод имени пользователя (АДАПТИВНО!)
+# ШАГ 3: Имя пользователя
 # ============================================
 echo ""
 log_info "Создание нового пользователя"
-echo ""
 
 while true; do
     read -p "Введите имя пользователя: " USERNAME_RAW
-    
-    # Очищаем от спецсимволов - оставляем только буквы, цифры, _ и -
     USERNAME=$(echo "$USERNAME_RAW" | tr -cd 'a-zA-Z0-9_-')
     
-    # Проверяем пустое
     if [[ -z "$USERNAME" ]]; then
         log_err "Имя не может быть пустым!"
         continue
     fi
-    
-    # Проверяем длину
     if [[ ${#USERNAME} -lt 2 ]]; then
-        log_err "Имя слишком короткое (минимум 2 символа)"
+        log_err "Имя слишком короткое (мин. 2 символа)"
         continue
     fi
-    
-    # Проверяем начинается ли с буквы
     if [[ ! "$USERNAME" =~ ^[a-zA-Z] ]]; then
         log_err "Имя должно начинаться с буквы"
         continue
     fi
-    
-    # Проверяем существует ли
     if id "$USERNAME" &>/dev/null; then
         log_err "Пользователь '$USERNAME' уже существует!"
         continue
     fi
-    
-    # Всё ОК
     break
 done
 
 log_info "Пользователь: $USERNAME"
 
 # ============================================
-# ШАГ 4: Ввод пароля
+# ШАГ 4: Пароль
 # ============================================
 while true; do
     read -sp "Введите пароль: " PASSWORD
@@ -127,17 +114,15 @@ while true; do
         log_err "Пароли не совпадают!"
         continue
     fi
-    
     if [[ ${#PASSWORD} -lt 4 ]]; then
-        log_err "Пароль слишком короткий (минимум 4 символа)"
+        log_err "Пароль слишком короткий (мин. 4 символа)"
         continue
     fi
-    
     break
 done
 
 # ============================================
-# ШАГ 5: Создание пользователя
+# ШАГ 5: Создание пользователя (ALT Linux)
 # ============================================
 echo ""
 echo -e "${CYAN}============================================${NC}"
@@ -146,7 +131,7 @@ echo -e "${CYAN}============================================${NC}"
 
 log_info "Создание пользователя $USERNAME..."
 
-# Создаем пользователя
+# ALT Linux: используем useradd
 if useradd -m -s /bin/bash "$USERNAME" 2>/dev/null; then
     log_ok "Пользователь создан"
 else
@@ -154,7 +139,7 @@ else
     exit 1
 fi
 
-# Устанавливаем пароль
+# Устанавливаем пароль (ALT Linux)
 if echo "$USERNAME:$PASSWORD" | chpasswd 2>/dev/null; then
     log_ok "Пароль установлен"
 else
@@ -163,7 +148,7 @@ else
 fi
 
 # ============================================
-# ШАГ 6: Настройка sudo (ИСПРАВЛЕНО И АДАПТИВНО!)
+# ШАГ 6: Настройка sudo (ALT Linux - ИСПРАВЛЕНО!)
 # ============================================
 echo ""
 log_info "Настройка прав sudo..."
@@ -173,26 +158,28 @@ case $SUDO_LEVEL in
         log_info "Пользователь без прав sudo"
         ;;
     1)
-        # Sudo с паролем
-        if usermod -aG sudo "$USERNAME" 2>/dev/null; then
-            log_ok "Добавлен в группу sudo (с паролем)"
-        elif usermod -aG wheel "$USERNAME" 2>/dev/null; then
+        # ALT Linux: группа wheel
+        if usermod -aG wheel "$USERNAME" 2>/dev/null; then
             log_ok "Добавлен в группу wheel (с паролем)"
         else
-            log_err "Ошибка добавления в sudo"
+            log_err "Ошибка добавления в wheel"
         fi
         ;;
     2)
         # Sudo без пароля
-        usermod -aG sudo "$USERNAME" 2>/dev/null || usermod -aG wheel "$USERNAME" 2>/dev/null
+        usermod -aG wheel "$USERNAME" 2>/dev/null
         
         SUDOERS_FILE="/etc/sudoers.d/$USERNAME"
         
-        # Создаем файл ПРАВИЛЬНО (каждая директива на отдельной строке)
-        echo "# Sudo access for $USERNAME" > "$SUDOERS_FILE"
-        echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >> "$SUDOERS_FILE"
+        # ✅ ПРАВИЛЬНЫЙ СИНТАКСИС для ALT Linux
+        {
+            echo "# Sudo access for $USERNAME"
+            echo "$USERNAME ALL=(ALL) NOPASSWD:ALL"
+            echo ""  # Пустая строка в конце
+        } > "$SUDOERS_FILE"
         
-        chmod 440 "$SUDOERS_FILE"
+        # ✅ ВАЖНО: права 0440 для ALT Linux
+        chmod 0440 "$SUDOERS_FILE"
         
         # Проверяем синтаксис
         if visudo -c -f "$SUDOERS_FILE" &>/dev/null; then
@@ -203,19 +190,23 @@ case $SUDO_LEVEL in
         fi
         ;;
     3)
-        # Максимальные привилегии (без логирования)
-        usermod -aG sudo "$USERNAME" 2>/dev/null || usermod -aG wheel "$USERNAME" 2>/dev/null
+        # Максимальные привилегии
+        usermod -aG wheel "$USERNAME" 2>/dev/null
         
         SUDOERS_FILE="/etc/sudoers.d/$USERNAME"
         
-        # ✅ ГЛАВНОЕ ИСПРАВЛЕНИЕ: Defaults на ОТДЕЛЬНЫХ строках!
-        echo "# Sudo access for $USERNAME (no logging)" > "$SUDOERS_FILE"
-        echo "Defaults:$USERNAME !logfile" >> "$SUDOERS_FILE"
-        echo "Defaults:$USERNAME !syslog" >> "$SUDOERS_FILE"
-        echo "Defaults:$USERNAME !pam_login" >> "$SUDOERS_FILE"
-        echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >> "$SUDOERS_FILE"
+        # ✅ ПРАВИЛЬНО: Defaults на ОТДЕЛЬНЫХ строках
+        {
+            echo "# Sudo access for $USERNAME (no logging)"
+            echo "Defaults:$USERNAME !logfile"
+            echo "Defaults:$USERNAME !syslog"
+            echo "Defaults:$USERNAME !pam_login"
+            echo "$USERNAME ALL=(ALL) NOPASSWD:ALL"
+            echo ""  # Пустая строка в конце
+        } > "$SUDOERS_FILE"
         
-        chmod 440 "$SUDOERS_FILE"
+        # ✅ ВАЖНО: права 0440
+        chmod 0440 "$SUDOERS_FILE"
         
         # Проверяем синтаксис
         if visudo -c -f "$SUDOERS_FILE" &>/dev/null; then
@@ -223,9 +214,13 @@ case $SUDO_LEVEL in
         else
             log_err "Ошибка sudoers, пробую упрощенный вариант"
             
-            # Упрощенный вариант без логов
-            echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
-            chmod 440 "$SUDOERS_FILE"
+            # Упрощенный вариант
+            {
+                echo "$USERNAME ALL=(ALL) NOPASSWD:ALL"
+                echo ""
+            } > "$SUDOERS_FILE"
+            
+            chmod 0440 "$SUDOERS_FILE"
             
             if visudo -c -f "$SUDOERS_FILE" &>/dev/null; then
                 log_ok "Настроено (упрощенный вариант)"
@@ -238,7 +233,7 @@ case $SUDO_LEVEL in
 esac
 
 # ============================================
-# ШАГ 7: Дополнительные настройки
+# ШАГ 7: Дополнительные настройки (ALT Linux)
 # ============================================
 echo ""
 log_info "Дополнительные настройки..."
@@ -275,7 +270,7 @@ case $SUDO_LEVEL in
     0) echo -e "${YELLOW}Права:${NC} Без sudo" ;;
     1) echo -e "${YELLOW}Права:${NC} Sudo с паролем" ;;
     2) echo -e "${YELLOW}Права:${NC} Sudo без пароля" ;;
-    3) echo -e "${YELLOW}Права:${NC} Максимальные (без логов)" ;;
+    3) echo -e "${YELLOW}Права:${NC} Максимальные" ;;
 esac
 
 echo ""
