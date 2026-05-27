@@ -33,6 +33,12 @@ cleanup_old_config() {
     # Останавливаем службу
     systemctl stop dhcpd 2>/dev/null || true
     
+    # Создаем директорию если нет
+    if [[ ! -d "/var/lib/dhcp" ]]; then
+        mkdir -p /var/lib/dhcp
+        log "Создана директория /var/lib/dhcp"
+    fi
+    
     # Удаляем старый конфиг
     if [[ -f "$DHCP_CONF" ]]; then
         mv "$DHCP_CONF" "${DHCP_CONF}.backup.$(date +%Y%m%d_%H%M%S)"
